@@ -1,0 +1,187 @@
+@page "/plugins/adjustments/local.autoparking"
+@using ETS2LA.UI.Shared.Components
+@implements IDisposable
+
+<div class="flex flex-col w-108 m-5 ml-8 gap-6">
+    <Separator Label="Auto Parking" />
+    <p class="description">在平面地图上点选车位，插件按换挡、油门、刹车和转向把牵引车本体泊进去。本版本不支持挂车。</p>
+
+    @if (Plugin is null)
+    {
+        <p class="description">Plugin is not loaded.</p>
+    }
+    else
+    {
+        <Switch Title="Dry-run"
+                Description="Plan and display everything, but never send throttle, brake, steering or gear commands. Keep this on until the first real test in your own game."
+                Value="@Plugin.Settings.DryRun"
+                ValueChanged="@((bool value) => Plugin.HandleAction("dryRun", value))" />
+        <Switch Title="带挂车时拒绝执行"
+                Description="本版本只泊牵引车本体。检测到挂车时直接拒绝，避免挂车甩在通道上。"
+                Value="@Plugin.Settings.RefuseWithTrailer"
+                ValueChanged="@((bool value) => Plugin.HandleAction("refuseWithTrailer", value))" />
+        <Switch Title="结束后恢复辅助驾驶"
+                Description="泊车前会关掉 ACC 等辅助并把它们原值记下来，结束后恢复。若你在期间手动改过设置，则以你的值为准。"
+                Value="@Plugin.Settings.RestoreAssistsOnFinish"
+                ValueChanged="@((bool value) => Plugin.HandleAction("restoreAssists", value))" />
+
+        <Slider Title="最大接管距离 (m)"
+                Description="自车到泊车路径起点的最大距离。更长的路程请先用 ACC 把车开到车位附近。"
+                Min="5" Max="100" Step="1"
+                Value="@(Convert.ToSingle(Plugin.Settings.MaxTakeoverDistanceM))"
+                ValueChanged="@((float value) => Plugin.HandleAction("maxTakeoverDistance", value))" />
+
+        <Separator Label="可视化" />
+        <Switch Title="平面地图窗口"
+                Description="在 ETS2LA 悬浮层里显示 AutoParking Map 窗口，点选车位就在这里。点选时需要按住 RightAlt 进入交互模式。"
+                Value="@Plugin.Settings.ShowMapWindow"
+                ValueChanged="@((bool value) => Plugin.HandleAction("showMapWindow", value))" />
+        <Switch Title="AR 叠加"
+                Description="在游戏画面上画出车位框、朝向和距离。受 ETS2LA 的 AR 距离裁剪限制。"
+                Value="@Plugin.Settings.ShowArOverlay"
+                ValueChanged="@((bool value) => Plugin.HandleAction("showArOverlay", value))" />
+        <Switch Title="吸附到导航曲线"
+                Description="点选时把车位吸附到附近建筑导航曲线的方向上，避免车头朝向乱指。"
+                Value="@Plugin.Settings.SnapToNavCurve"
+                ValueChanged="@((bool value) => Plugin.HandleAction("snapToNavCurve", value))" />
+
+        <Slider Title="车身长度 (m)"
+                Description="地图上车位框和 AR 里的地面框都按这个尺寸画。用小车测试时请改小。"
+                Min="@(4f)" Max="@(12f)" Step="@(0.1f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.VehicleLengthM))"
+                ValueChanged="@((float value) => Plugin.HandleAction("vehicleLength", value))" />
+        <Slider Title="车身宽度 (m)"
+                Description="同上，只影响显示（本版本不泊挂车）。"
+                Min="@(1.8f)" Max="@(3.2f)" Step="@(0.05f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.VehicleWidthM))"
+                ValueChanged="@((float value) => Plugin.HandleAction("vehicleWidth", value))" />
+        <Slider Title="AR 地面微调 (m)"
+                Description="AR 的地面高度按车轮接地点推算（见状态表“地面基准”）。若绿色十字仍浮空或陷进地里，用它微调。"
+                Min="@(-1f)" Max="@(1f)" Step="@(0.05f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.ArGroundTrimM))"
+                ValueChanged="@((float value) => Plugin.HandleAction("arGroundTrim", value))" />
+
+        <div class="flex flex-row gap-3">
+            <button class="button button-accent w-full!" @onclick="@(() => Plugin.HandleAction("start", null))">Start</button>
+            <button class="button w-full!" @onclick="@(() => Plugin.HandleAction("stop", null))">Stop</button>
+            <button class="button w-full!" @onclick="@(() => Plugin.HandleAction("clearTarget", null))">清除车位</button>
+        </div>
+
+        @if (!string.IsNullOrEmpty(Plugin.LastActionMessage))
+        {
+            <div class="rounded-sm border p-3 @(Plugin.LastActionFailed ? "border-red-500 bg-red-500/10" : "border-green-500 bg-green-500/10")">
+                <p>@Plugin.LastActionMessage</p>
+            </div>
+        }
+
+        <Separator Label="速度与纵向控制" Class="mt-4" />
+        <Slider Title="@($"前进限速 (km/h)")" Min="@(2f)" Max="@(15f)" Step="@(0.5f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.ForwardSpeedKph))"
+                ValueChanged="@((float value) => Plugin.HandleAction("forwardSpeed", value))" />
+        <Slider Title="倒车限速 (km/h)" Min="@(1f)" Max="@(8f)" Step="@(0.5f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.ReverseSpeedKph))"
+                ValueChanged="@((float value) => Plugin.HandleAction("reverseSpeed", value))" />
+        <Slider Title="舒适减速度 (m/s²)" Min="@(0.2f)" Max="@(1.5f)" Step="@(0.05f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.ComfortDecel))"
+                ValueChanged="@((float value) => Plugin.HandleAction("comfortDecel", value))" />
+        <Slider Title="起步加速度 (m/s²)"
+                Description="克服滚动阻力所需的起步量。太小车会蠕到一半停住。"
+                Min="@(0.1f)" Max="@(1.5f)" Step="@(0.05f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.LaunchAccelMps2))"
+                ValueChanged="@((float value) => Plugin.HandleAction("launchAccel", value))" />
+        <Slider Title="PID Kp" Min="@(0.05f)" Max="@(2f)" Step="@(0.05f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.PidKp))"
+                ValueChanged="@((float value) => Plugin.HandleAction("pidKp", value))" />
+        <Slider Title="PID Ki" Min="@(0f)" Max="@(1f)" Step="@(0.01f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.PidKi))"
+                ValueChanged="@((float value) => Plugin.HandleAction("pidKi", value))" />
+        <Slider Title="PID Kd" Min="@(0f)" Max="@(1f)" Step="@(0.01f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.PidKd))"
+                ValueChanged="@((float value) => Plugin.HandleAction("pidKd", value))" />
+
+        <Separator Label="容差与安全" Class="mt-4" />
+        <Slider Title="横向偏差中止 (m)" Min="@(0.5f)" Max="@(5f)" Step="@(0.1f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.MaxCrossErrorM))"
+                ValueChanged="@((float value) => Plugin.HandleAction("maxCrossError", value))" />
+        <Slider Title="到位横向容差 (m)" Min="@(0.05f)" Max="@(1f)" Step="@(0.05f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.ToleranceLateralM))"
+                ValueChanged="@((float value) => Plugin.HandleAction("toleranceLateral", value))" />
+        <Slider Title="到位航向容差 (°)" Min="@(1f)" Max="@(15f)" Step="@(0.5f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.ToleranceHeadingDeg))"
+                ValueChanged="@((float value) => Plugin.HandleAction("toleranceHeading", value))" />
+        <Slider Title="最长允许时间 (s)" Min="@(30f)" Max="@(600f)" Step="@(10f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.MaxDurationS))"
+                ValueChanged="@((float value) => Plugin.HandleAction("maxDuration", value))" />
+        <Switch Title="完成后拉手刹"
+                Value="@Plugin.Settings.HandbrakeOnFinish"
+                ValueChanged="@((bool value) => Plugin.HandleAction("handbrakeOnFinish", value))" />
+        <Dropdown Title="倒车横向控制律"
+                  Description="默认反向 pure-pursuit（仿真 5/5 到位）。交叉误差 PD 在紧密弧线上会被航向项主导，留作对比。"
+                  Options="@Plugin.ReverseLawOptions"
+                  SelectedIndex="@(Plugin.Settings.ReverseLateral == ReverseLateralLaw.CrossTrackPd ? 1 : 0)"
+                  SelectedIndexChanged="@((int index) => Plugin.HandleAction("reverseLaw", index))" />
+
+        <Separator Label="快捷键" Class="mt-4" />
+        <p class="description">
+            页面按钮只适合调试：点 overlay 会让游戏失焦，而 SCS 的虚拟手柄在游戏失焦时不生效，所以实车操作请用热键。
+            绑定位置：左侧栏 <b>设置 → 控制</b>（路由 /settings/controls），在列表里找到下面两项，点一下再按你想要的键即可（默认未绑定）：
+        </p>
+        <p class="description">
+            <b>Auto Parking: 触发/暂停/继续</b> —— 空闲时开始泊车；运行中暂停并拉手刹；已暂停时继续。<br />
+            <b>Auto Parking: 中止泊车</b> —— 立即刹停、释放通道、交还辅助驾驶。
+        </p>
+
+        <Separator Label="几何自检" Class="mt-4" />
+        <p class="description">纯几何自检：24 组起终点对跑规划器，断言终点落位、采样连续、曲率不超最小转弯半径、障碍冲突会被拒。不需要游戏在跑。</p>
+        <button class="button button-accent w-full!" @onclick="@(() => Plugin.HandleAction("selfTest", null))">运行规划自检</button>
+
+        <Separator Label="状态" Class="mt-4" />
+        <div class="flex flex-col rounded-sm bg-control-bg-dark border border-bg-darker p-4 gap-2">
+            @foreach (var row in Plugin.StatusRows)
+            {
+                <div class="flex justify-between gap-4">
+                    <p class="text-description">@row.Key</p>
+                    <p>@row.Value</p>
+                </div>
+            }
+        </div>
+
+        <p class="description">当前进度：M3 控制层已接上。默认 Dry-run 开着，所以按 Start 只会演算、车不会动——先关掉 Dry-run 并在手边留好 Stop 再做实车测试。</p>
+    }
+</div>
+
+@code {
+    private AutoParkingPlugin? Plugin => AutoParkingPlugin.Instance;
+
+    private PeriodicTimer? _timer;
+    private CancellationTokenSource? _cts;
+
+    protected override void OnInitialized()
+    {
+        base.OnInitialized();
+        _cts = new CancellationTokenSource();
+        _ = RefreshLoop(_cts.Token);
+    }
+
+    private async Task RefreshLoop(CancellationToken token)
+    {
+        _timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
+        try
+        {
+            while (await _timer.WaitForNextTickAsync(token))
+            {
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    public void Dispose()
+    {
+        _cts?.Cancel();
+        _timer?.Dispose();
+        _cts?.Dispose();
+    }
+}

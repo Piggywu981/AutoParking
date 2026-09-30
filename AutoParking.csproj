@@ -1,0 +1,85 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>library</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>AutoParking</AssemblyName>
+    <RootNamespace>AutoParking</RootNamespace>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="ETS2LA.Shared">
+      <HintPath>..\..\ETS2LA-win-release-Portable\current\ETS2LA.Shared.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ETS2LA.Backend">
+      <HintPath>..\..\ETS2LA-win-release-Portable\current\ETS2LA.Backend.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ETS2LA.Game">
+      <HintPath>..\..\ETS2LA-win-release-Portable\current\ETS2LA.Game.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ETS2LA.Controls">
+      <HintPath>..\..\ETS2LA-win-release-Portable\current\ETS2LA.Controls.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ETS2LA.Settings">
+      <HintPath>..\..\ETS2LA-win-release-Portable\current\ETS2LA.Settings.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ETS2LA.State">
+      <HintPath>..\..\ETS2LA-win-release-Portable\current\ETS2LA.State.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ETS2LA.Logging">
+      <HintPath>..\..\ETS2LA-win-release-Portable\current\ETS2LA.Logging.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ETS2LA.Notifications">
+      <HintPath>..\..\ETS2LA-win-release-Portable\current\ETS2LA.Notifications.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ETS2LA.Overlay">
+      <HintPath>..\..\ETS2LA-win-release-Portable\current\ETS2LA.Overlay.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ETS2LA.UI">
+      <HintPath>..\..\ETS2LA-win-release-Portable\current\ETS2LA.UI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="TruckLib">
+      <HintPath>..\..\ETS2LA-win-release-Portable\current\TruckLib.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="TruckLib.Core">
+      <HintPath>..\..\ETS2LA-win-release-Portable\current\TruckLib.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="TruckLib.HashFs">
+      <HintPath>..\..\ETS2LA-win-release-Portable\current\TruckLib.HashFs.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="TruckLib.Models">
+      <HintPath>..\..\ETS2LA-win-release-Portable\current\TruckLib.Models.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Hexa.NET.ImGui">
+      <HintPath>..\..\ETS2LA-win-release-Portable\current\Hexa.NET.ImGui.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Microsoft.AspNetCore.Components">
+      <HintPath>..\..\ETS2LA-win-release-Portable\current\Microsoft.AspNetCore.Components.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Microsoft.AspNetCore.Components.Web">
+      <HintPath>..\..\ETS2LA-win-release-Portable\current\Microsoft.AspNetCore.Components.Web.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>
