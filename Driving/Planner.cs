@@ -14,6 +14,16 @@ public static class Kinematics
         double maxSteer = Math.Clamp(settings.MaxSteerDeg * Math.PI / 180.0, 0.05, 1.2);
         return Math.Clamp(settings.WheelbaseM / Math.Tan(maxSteer), 2.0, 40.0);
     }
+
+    /// <summary>
+    ///  The radius routes are planned on: the vehicle's own limit scaled up by
+    ///  <see cref="AutoParkingSettings.PlanRadiusMargin"/> so the commanded wheel angle stays
+    ///  away from saturation and the follower keeps room to correct.
+    /// </summary>
+    public static double PlanningRadius(AutoParkingSettings settings)
+    {
+        return MinTurnRadius(settings) * Math.Clamp(settings.PlanRadiusMargin, 1.0, 2.5);
+    }
 }
 
 /// <summary>
@@ -31,7 +41,7 @@ public static class Planner
 
     public static PlanResult Plan(Pose2 start, Pose2 goal, AutoParkingSettings settings, ObstacleSnapshot obstacles)
     {
-        double radius = Kinematics.MinTurnRadius(settings);
+        double radius = Kinematics.PlanningRadius(settings);
 
         double alreadyThere = Geometry.Distance(start.Position, goal.Position);
         double alreadyAligned = Math.Abs(Geometry.SmallestAngleDifference(start.HeadingRad, goal.HeadingRad));

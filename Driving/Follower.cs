@@ -8,9 +8,13 @@ namespace AutoParking;
 ///  Everything the controller needs about the vehicle, as plain values. Keeping the telemetry
 ///  types out of here is what lets the follower be driven by a simulator in the test harness.
 /// </summary>
-public readonly record struct VehicleState(DateTime Utc, Vector2 Position, double HeadingRad, double SignedSpeed, int Gear)
+public readonly record struct VehicleState(DateTime Utc, Vector2 Position, double HeadingRad, double SignedSpeed,
+                                           int Gear, int GearDashboard)
 {
     public Pose2 Pose => new(Position.X, Position.Y, HeadingRad);
+
+    /// <summary>Both gear readouts, for the status line - a shift that only one of them sees is a clue on its own.</summary>
+    public string GearText => $"{Gear}/{GearDashboard}";
 }
 
 public enum GearRequest
@@ -22,17 +26,16 @@ public enum GearRequest
 }
 
 /// <summary>
-///  What the controller wants this tick. The plugin turns it into game output channels; the
-///  simulator turns it into wheel commands. Nothing else publishes controls.
+///  What the controller wants this tick. There is deliberately no abort channel: nothing the
+///  follower observes can end the maneuver, only the hotkey can.
 /// </summary>
 public readonly record struct ControlDemand(float Steer, float Throttle, float Brake, bool HoldBrake,
-                                            GearRequest Gear, bool Finished, string? AbortReason)
+                                            GearRequest Gear, bool Finished)
 {
-    public static ControlDemand Idle => new(0f, 0f, 0f, false, GearRequest.None, false, null);
+    public static ControlDemand Hold(float brake) => new(0f, 0f, brake, true, GearRequest.None, false);
 
-    public static ControlDemand Hold(float brake) => new(0f, 0f, brake, true, GearRequest.None, false, null);
-
-    public static ControlDemand Aborted(string reason, float brake) => new(0f, 0f, brake, true, GearRequest.None, false, reason);
+    /// <summary>Service brake without the handbrake - the gear wait has to drive off again right after.</summary>
+    public static ControlDemand BrakeOnly(float brake) => new(0f, 0f, brake, false, GearRequest.None, false);
 }
 
 /// <summary>
@@ -41,7 +44,6 @@ public readonly record struct ControlDemand(float Steer, float Throttle, float B
 /// </summary>
 public sealed class Follower
 {
-    private const double OverspeedGraceS = 1.0;
     private enum Stage
     {
         SelectGear,
@@ -56,6 +58,12 @@ public sealed class Follower
     private readonly double wheelbase;
     private readonly double maxCurvature;
 
+    // A gear request is a 50 ms edge that the game may or may not take, and nothing observed can
+    // stop the maneuver - only the hotkey can. So retry a few times, then drive off in the
+    // requested direction and keep re-pulsing from the driving stage.
+    private const double GearPulseRetrySeconds = 1.0;
+    private const int GearPulseMaxAttempts = 4;
+
     private readonly List<Run> runs = new();
 
     private Stage stage = Stage.SelectGear;
@@ -63,6 +71,7 @@ public sealed class Follower
     private double progress;
     private DriveDirection wantedGear;
     private DriveDirection? confirmedGear;
+    private bool gearConfirmed;
     private DateTime gearPulseAt = DateTime.MinValue;
     private int gearAttempts;
     private DateTime startedAt = DateTime.MinValue;
@@ -72,10 +81,7 @@ public sealed class Follower
     private double integral;
     private double lastError;
     private double lastSteer;
-    private DateTime lastMovementCheckUtc = DateTime.MinValue;
-    private bool demandingMovement;
     private DateTime blockedSince = DateTime.MinValue;
-    private DateTime overspeedSince = DateTime.MinValue;
     private string status = "等待";
 
     private readonly struct Run
@@ -141,14 +147,16 @@ public sealed class Follower
     public ControlDemand Step(VehicleState vehicle, ObstacleSnapshot obstacles)
     {
         if (path.Points.Count < 2)
-            return ControlDemand.Aborted("路径为空", 0.6f);
+        {
+            status = "路径为空，保持制动";
+            return ControlDemand.Hold(0.6f);
+        }
 
         if (startedAt == DateTime.MinValue)
         {
             startedAt = vehicle.Utc;
             lastStepUtc = vehicle.Utc;
             lastStepCallUtc = vehicle.Utc;
-            lastMovementCheckUtc = vehicle.Utc;
         }
         else
         {
@@ -160,17 +168,15 @@ public sealed class Follower
             // before the gap or the watchdog and the derivative term both fire on stale data.
             if (gap > 1.0)
             {
-                lastMovementCheckUtc = vehicle.Utc;
                 integral = 0.0;
                 lastError = 0.0;
                 lastStepUtc = vehicle.Utc;
-                demandingMovement = false;
             }
         }
 
-        ControlDemand? fault = CheckFaults(vehicle);
-        if (fault != null)
-            return fault.Value;
+        ControlDemand? runaway = HandleOverspeed(vehicle);
+        if (runaway != null)
+            return runaway.Value;
 
         UpdateProgress(vehicle);
 
@@ -178,7 +184,7 @@ public sealed class Follower
         {
             stage = Stage.Finished;
             status = "到位，拉手刹";
-            return new ControlDemand(0f, 0f, 0.4f, settings.HandbrakeOnFinish, GearRequest.Neutral, true, null);
+            return new ControlDemand(0f, 0f, 0.4f, settings.HandbrakeOnFinish, GearRequest.Neutral, true);
         }
 
         switch (stage)
@@ -191,7 +197,7 @@ public sealed class Follower
                 return WaitForGear(vehicle);
 
             case Stage.Finished:
-                return new ControlDemand(0f, 0f, 0.4f, settings.HandbrakeOnFinish, GearRequest.None, true, null);
+                return new ControlDemand(0f, 0f, 0.4f, settings.HandbrakeOnFinish, GearRequest.None, true);
         }
 
         ControlDemand? blocked = HandleObstacles(vehicle, obstacles);
@@ -208,48 +214,57 @@ public sealed class Follower
         status = wasMoving ? "换挡前刹停" : "请求挡位";
 
         if (wasMoving)
-            return ControlDemand.Hold(0.5f);
+            return ControlDemand.BrakeOnly(0.5f);
 
         gearAttempts++;
-        if (gearAttempts > 3)
-        {
-            status = "换挡失败";
-            return ControlDemand.Aborted($"换挡 3 次未成功（目标 {wantedGear}）", 0.8f);
-        }
-
         gearPulseAt = vehicle.Utc;
         stage = Stage.WaitingForGear;
-        status = $"脉冲挡位 {wantedGear}（第 {gearAttempts} 次）";
+        status = $"脉冲挡位 {wantedGear}（第 {gearAttempts} 次，遥测 {vehicle.GearText}）";
 
         return new ControlDemand(0f, 0f, 0.5f, false,
                                  wantedGear == DriveDirection.Forward ? GearRequest.Drive : GearRequest.Reverse,
-                                 false, null);
+                                 false);
     }
 
     private ControlDemand WaitForGear(VehicleState vehicle)
     {
         // In DryRun the gear pulse never reaches the game, so telemetry can never confirm it.
-        // Assume it took, or the retry counter aborts the first reverse leg a few seconds in.
-        bool confirmed = settings.DryRun
-                      || (wantedGear == DriveDirection.Forward ? vehicle.Gear > 0 : vehicle.Gear < 0);
-        if (confirmed)
+        bool taken = settings.DryRun
+                  || (wantedGear == DriveDirection.Forward ? vehicle.Gear > 0 : vehicle.Gear < 0);
+        if (taken)
         {
             confirmedGear = wantedGear;
+            gearConfirmed = true;
             gearAttempts = 0;
             stage = Stage.Driving;
             integral = 0.0;
             lastError = 0.0;
             status = $"挡位已确认 {wantedGear}";
-            return ControlDemand.Hold(0.2f);
+            return ControlDemand.BrakeOnly(0.2f);
         }
 
-        if ((vehicle.Utc - gearPulseAt).TotalSeconds > 1.5)
+        if ((vehicle.Utc - gearPulseAt).TotalSeconds > GearPulseRetrySeconds)
         {
             stage = Stage.StoppingForGearChange;
-            status = "挡位未确认，重试";
+            status = $"挡位未确认（遥测 {vehicle.GearText}），重试";
+            return ControlDemand.BrakeOnly(0.5f);
         }
 
-        return ControlDemand.Hold(0.5f);
+        // Keep asking has a ceiling: if the gearbox action never lands, waiting is not a plan.
+        // Proceed with the pulse still being re-sent from Drive() so the truck moves as soon as
+        // the game takes it, and the run is not stuck on the brake with no automatic stop left.
+        if (gearAttempts >= GearPulseMaxAttempts)
+        {
+            confirmedGear = wantedGear;
+            gearConfirmed = false;
+            gearAttempts = 0;
+            stage = Stage.Driving;
+            integral = 0.0;
+            lastError = 0.0;
+            status = $"挡位遥测仍为 {vehicle.GearText}，按 {wantedGear} 继续并补发脉冲";
+        }
+
+        return ControlDemand.BrakeOnly(0.5f);
     }
 
     private ControlDemand Drive(VehicleState vehicle)
@@ -260,7 +275,7 @@ public sealed class Follower
             wantedGear = run.Travel;
             stage = Stage.SelectGear;
             status = $"即将反向，准备换 {run.Travel}";
-            return ControlDemand.Hold(0.2f);
+            return ControlDemand.BrakeOnly(0.2f);
         }
 
         bool reversing = run.Travel == DriveDirection.Reverse;
@@ -271,8 +286,7 @@ public sealed class Follower
         HeadingErrorDegrees = Geometry.SmallestAngleDifference(vehicle.HeadingRad, anchor.HeadingRad) * 180.0 / Math.PI;
 
         double steer = reversing ? ReverseSteering(vehicle, anchor) : ForwardSteering(vehicle, run);
-        steer = Math.Clamp(steer, -1f, 1f);
-        steer = Smooth(steer);
+        steer = ShapeSteer(steer);
 
         double reference = ReferenceSpeed(run, speedLimit);
         double acceleration = Longitudinal(vehicle, reference);
@@ -280,11 +294,19 @@ public sealed class Follower
         float throttle = acceleration > 0 ? (float)Math.Clamp(acceleration / settings.MaxAccel, 0.0, 1.0) : 0f;
         float brake = acceleration < 0 ? (float)Math.Clamp(-acceleration / settings.MaxBrakeDecel, 0.0, 1.0) : 0f;
 
-        demandingMovement = throttle > 0.4f;
-
         status = $"{(reversing ? "倒车" : "前进")} 剩 {RemainingDistance:0.0} m · 误差 {CrossTrackErrorMeters:0.00} m · 目标 {reference * 3.6:0.0} km/h";
 
-        return new ControlDemand((float)steer, throttle, brake, false, GearRequest.None, false, null);
+        // The gear was never seen in telemetry, so keep asking while driving - the game takes it
+        // the moment conditions allow and the truck starts moving on its own.
+        GearRequest pulse = GearRequest.None;
+        if (!gearConfirmed && (vehicle.Utc - gearPulseAt).TotalSeconds > GearPulseRetrySeconds)
+        {
+            gearPulseAt = vehicle.Utc;
+            pulse = wantedGear == DriveDirection.Forward ? GearRequest.Drive : GearRequest.Reverse;
+            status += $" · 补发 {wantedGear}（遥测 {vehicle.GearText}）";
+        }
+
+        return new ControlDemand((float)steer, throttle, brake, false, pulse, false);
     }
 
     private double ForwardSteering(VehicleState vehicle, Run run)
@@ -340,10 +362,22 @@ public sealed class Follower
         return Math.Tan(steerAngle) / Math.Tan(maxSteer);
     }
 
-    private double Smooth(double steer)
+    /// <summary>
+    ///  Shapes the geometric curvature command into a wheel angle we can actually follow:
+    ///  proportional gain, a deadband so tyre compliance does not get chased, then a slew limit
+    ///  expressed per second. The previous constant was 0.08 per tick, which at 60 Hz swings the
+    ///  wheel from centre to full lock in 0.2 s - effectively bang-bang steering that saturates
+    ///  and oscillates instead of tracking.
+    /// </summary>
+    private double ShapeSteer(double command)
     {
-        const double RateLimit = 0.08;
-        double delta = Math.Clamp(steer - lastSteer, -RateLimit, RateLimit);
+        double shaped = Math.Clamp(command * settings.SteerGain, -1.0, 1.0);
+
+        if (Math.Abs(shaped) < settings.SteerDeadband)
+            shaped = 0.0;
+
+        double limit = settings.SteerRateLimitPerSecond * stepSeconds;
+        double delta = Math.Clamp(shaped - lastSteer, -limit, limit);
         lastSteer += delta;
         return lastSteer;
     }
@@ -425,13 +459,9 @@ public sealed class Follower
         if (blockedSince == DateTime.MinValue)
             blockedSince = vehicle.Utc;
 
+        // Hold as long as it takes. The route is still valid the moment the corridor clears.
         double waited = (vehicle.Utc - blockedSince).TotalSeconds;
-        // A DryRun vehicle cannot clear a corridor by definition, so report the block without
-        // letting the wait budget turn a preview into an abort.
-        if (waited > settings.ObstacleWaitS && !settings.DryRun)
-            return ControlDemand.Aborted($"路径被挡超过 {settings.ObstacleWaitS:0} s", 0.8f);
-
-        status = $"等待障碍离开（{waited:0.0}/{settings.ObstacleWaitS:0.0} s）";
+        status = $"等待障碍离开（已等 {waited:0.0} s）";
         return ControlDemand.Hold(0.6f);
     }
 
@@ -463,68 +493,24 @@ public sealed class Follower
         };
     }
 
-    private ControlDemand? CheckFaults(VehicleState vehicle)
+    /// <summary>
+    ///  The only automatic intervention left: if the vehicle is faster than the ceiling allows,
+    ///  brake until it is not. That is speed control, not a pause - it never ends the maneuver.
+    /// </summary>
+    private ControlDemand? HandleOverspeed(VehicleState vehicle)
     {
-        // These two faults assume the vehicle responds to what we send. In DryRun nothing is
-        // published, so the truck stays put by design and both fire on a healthy preview: the
-        // stall watchdog at 3 s, and the duration cap on a route that can never advance.
-        bool needsResponse = !settings.DryRun;
-
-        double elapsed = (vehicle.Utc - startedAt).TotalSeconds;
-        if (needsResponse && elapsed > settings.MaxDurationS)
-            return ControlDemand.Aborted($"超过最长允许时间 {settings.MaxDurationS:0} s", 0.8f);
-
-        // Only armed once the vehicle has committed to the route: the very first samples of a
-        // curvy route can legitimately sit a little off the projection.
-        if (progress > 0.5 && Math.Abs(CrossTrackErrorMeters) > settings.MaxCrossErrorM && stage == Stage.Driving)
-            return ControlDemand.Aborted($"横向偏差 {CrossTrackErrorMeters:0.0} m 超过 {settings.MaxCrossErrorM:0.0} m", 0.8f);
-
         double speed = Math.Abs(vehicle.SignedSpeed);
         double cap = UnitConversions(Math.Max(settings.ForwardSpeedKph, settings.ReverseSpeedKph)) + 1.0;
 
-        // Brake first and only abort if the brake did not work. At creep speed the ceiling sits
-        // barely 1 m/s above the target, so one noisy telemetry sample or the normal overshoot as
-        // a gear takes up must not end the maneuver; a genuinely runaway vehicle stays over the
-        // line for longer than the grace window regardless.
-        if (speed > cap)
-        {
-            if (overspeedSince == DateTime.MinValue)
-                overspeedSince = vehicle.Utc;
+        if (speed <= cap)
+            return null;
 
-            if ((vehicle.Utc - overspeedSince).TotalSeconds > OverspeedGraceS)
-                return ControlDemand.Aborted($"速度 {speed * 3.6:0.0} km/h，刹了 {OverspeedGraceS:0} s 仍不降到 {cap * 3.6:0.0} km/h 以下", 1.0f);
+        status = $"超速 {speed * 3.6:0.0} km/h（上限 {cap * 3.6:0.0}），紧急制动";
 
-            status = $"超速 {speed * 3.6:0.0} km/h，紧急制动";
-            // Handbrake as well as the pedal: on the road the pedal alone has not been shown to
-            // slow the vehicle, while the parking brake demonstrably holds it at the finish.
-            return ControlDemand.Hold(1.0f);
-        }
-
-        // Hold the timer through a brief dip so repeated spikes still accumulate towards the abort.
-        if (overspeedSince != DateTime.MinValue && speed < cap - 0.3)
-            overspeedSince = DateTime.MinValue;
-
-        // Asked to move but staying still for seconds means a kerb, a locked wheel or a gear
-        // the game never actually engaged. Abort rather than keep cooking the drivetrain.
-        double speedNow = Math.Abs(vehicle.SignedSpeed);
-        if (speedNow > 0.05)
-        {
-            lastMovementCheckUtc = vehicle.Utc;
-        }
-        else if (needsResponse && demandingMovement && (vehicle.Utc - lastMovementCheckUtc).TotalSeconds > 3.0)
-        {
-            return ControlDemand.Aborted("已给油门但车辆 3 s 未移动（可能卡住或挡位未生效）", 1.0f);
-        }
-
-        return null;
+        // Handbrake as well as the pedal: on the road the pedal alone has not been shown to
+        // slow the vehicle, while the parking brake demonstrably holds it at the finish.
+        return ControlDemand.Hold(1.0f);
     }
-
-    /// <summary>
-    ///  True when the game itself is not reacting to our output: we command a pedal or the
-    ///  wheel and the game-reported input stays at zero. The plugin owns the timer because only
-    ///  it knows what was actually sent.
-    /// </summary>
-    public bool DemandingMovement => demandingMovement;
 
     private double UnitConversions(double kmPerHour) => kmPerHour / 3.6;
 

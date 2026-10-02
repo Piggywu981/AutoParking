@@ -71,8 +71,8 @@ public sealed class AutoParkingPlugin : Plugin
     private readonly ControlOutput output = new();
     private Follower? follower;
     private DateTime phaseDeadlineUtc = DateTime.MinValue;
-    private DateTime outputBlindSinceUtc = DateTime.MinValue;
     private DateTime lastBrakeProbeUtc = DateTime.MinValue;
+    private DateTime lastGearProbeUtc = DateTime.MinValue;
 
     // Restored when the maneuver ends, unless the user changed them in the meantime.
     private bool hadAssistSnapshot;
@@ -305,14 +305,14 @@ public sealed class AutoParkingPlugin : Plugin
                 }
 
                 // Hold the spot: keep re-asserting the handbrake, touch nothing else.
-                output.Apply(new ControlDemand(0f, 0f, 0f, true, GearRequest.None, false, null));
+                output.Apply(new ControlDemand(0f, 0f, 0f, true, GearRequest.None, false));
                 break;
 
             case ParkingPhase.HoldingBrake:
             case ParkingPhase.Aborted:
                 // Keep the brake applied while the deadline runs, then hand back.
                 output.Apply(new ControlDemand(0f, 0f, 0.6f, settings.HandbrakeOnFinish || current == ParkingPhase.Aborted,
-                                               GearRequest.None, false, null));
+                                               GearRequest.None, false));
                 if (DateTime.UtcNow >= phaseDeadlineUtc)
                     CompletePhase(current);
                 break;
@@ -325,9 +325,11 @@ public sealed class AutoParkingPlugin : Plugin
         if (active == null)
             return;
 
+        // Blind, or the game paused itself: hold the vehicle and wait for it to come back rather
+        // than ending the maneuver. Only the hotkey ends it.
         if (telemetryStale || !latestTelemetry.sdkActive || latestTelemetry.paused)
         {
-            Abort("遥测中断或游戏已暂停");
+            output.Apply(new ControlDemand(0f, 0f, 0.6f, true, GearRequest.None, false));
             return;
         }
 
@@ -337,22 +339,18 @@ public sealed class AutoParkingPlugin : Plugin
         output.DryRun = settings.DryRun;
         ControlDemand demand = active.Step(state, obstacles);
 
-        if (demand.AbortReason != null)
-        {
-            Abort(demand.AbortReason);
-            return;
-        }
-
         output.Apply(demand);
         ProbeBrakeChannel(demand, state);
-        CheckOutputIsEffective(demand, state);
+        ProbeGearChannel(demand, state);
 
         lock (sync)
         {
             if (phase == ParkingPhase.Engaging)
                 phase = ParkingPhase.Following;
 
-            if (demand.Gear != GearRequest.None)
+            // A pulse that goes out on its own is the gearbox stage; one sent while driving is
+            // only a repeat and must not change what the banner says.
+            if (demand.Gear != GearRequest.None && demand.Throttle == 0f)
                 phase = ParkingPhase.GearHold;
             else if (phase == ParkingPhase.GearHold)
                 phase = ParkingPhase.Following;
@@ -408,9 +406,9 @@ public sealed class AutoParkingPlugin : Plugin
         lastRawUserInputs = $"user=({data.truckFloat.userSteer:0.00},{data.truckFloat.userThrottle:0.00},{data.truckFloat.userBrake:0.00}) " +
                             $"sent=({output.LastSteer:0.00},{output.LastThrottle:0.00},{output.LastBrake:0.00}) " +
                             $"game=({data.truckFloat.gameSteer:0.00},{data.truckFloat.gameThrottle:0.00},{data.truckFloat.gameBrake:0.00}) " +
-                            $"v={speed * 3.6:0.0}km/h gear={gear}";
+                            $"v={speed * 3.6:0.0}km/h gear={gear}/{data.truckInt.gearDashboard} shifter={data.configString.shifterType}";
 
-        return new VehicleState(now, position, heading, signedSpeed, gear);
+        return new VehicleState(now, position, heading, signedSpeed, gear, data.truckInt.gearDashboard);
     }
 
     /// <summary>
@@ -446,48 +444,39 @@ public sealed class AutoParkingPlugin : Plugin
         // stays zero no matter how hard we brake. Air pressure is the physical tell - it falls
         // only when the brake is actually applied at the wheels.
         Logger.Info($"AutoParking: 制动探针 v={Math.Abs(state.SignedSpeed) * 3.6:0.0} km/h " +
-                    $"sent_brake={demand.Brake:0.00} user_brake={userBrake:0.00} user_throttle={userThrottle:0.00} " +
+                    $"sent_accel={output.LastAcceleration:0.00} (brake={demand.Brake:0.00} throttle={demand.Throttle:0.00}) " +
+                    $"user_brake={userBrake:0.00} user_throttle={userThrottle:0.00} " +
                     $"air={airPressure:0.00} brake_temp={brakeTemp:0.0} hand={parkingBrake} gear={gear}");
     }
 
     /// <summary>
-    ///  Fails loudly when nothing we send reaches the vehicle. The echo has to be read from
-    ///  truckFloat.user*, not game*: the SCS virtual controller is injected as a player device, so
-    ///  game* stays at zero even when we are driving perfectly - which meant this watchdog could
-    ///  never fire and a dead output surfaced as the unrelated "gear failed to engage" abort.
-    ///  The usual cause is focus: the virtual controller drops input while the game window is in
-    ///  the background, which is exactly why the maneuver must be started from a hotkey.
+    ///  Samples the gearbox action every time a pulse goes out. Pedals are analog axes and are
+    ///  known to reach the game; shifting is a boolean action on the same table, so this is the
+    ///  one line that says whether the host can drive actions at all. shifter_type also decides
+    ///  whether gear_drive / gear_reverse exist: a sequential or H-manual box has to be shifted
+    ///  with gear_up / gear_down instead, and no amount of waiting on the telemetry confirms it.
     /// </summary>
-    private void CheckOutputIsEffective(ControlDemand demand, VehicleState state)
+    private void ProbeGearChannel(ControlDemand demand, VehicleState state)
     {
-        if (settings.DryRun)
-        {
-            outputBlindSinceUtc = DateTime.MinValue;
+        if (demand.Gear == GearRequest.None || settings.DryRun)
             return;
-        }
 
-        bool demanding = demand.Throttle > 0.25f || demand.Brake > 0.25f
-                      || Math.Abs(demand.Steer) > 0.25f || demand.HoldBrake;
-
-        bool echoed = latestTelemetry.truckFloat.userThrottle > 0.05f
-                   || latestTelemetry.truckFloat.userBrake > 0.05f
-                   || Math.Abs(latestTelemetry.truckFloat.userSteer) > 0.05f
-                   || latestTelemetry.truckBool.parkingBrake;
-
-        if (!demanding || echoed)
-        {
-            outputBlindSinceUtc = state.Utc;
+        if ((state.Utc - lastGearProbeUtc).TotalSeconds < 0.25)
             return;
-        }
 
-        if (outputBlindSinceUtc == DateTime.MinValue)
-            outputBlindSinceUtc = state.Utc;
+        lastGearProbeUtc = state.Utc;
 
-        if ((state.Utc - outputBlindSinceUtc).TotalSeconds > 2.0)
+        GameTelemetryData data;
+        lock (sync)
         {
-            outputBlindSinceUtc = DateTime.MinValue;
-            Abort("指令没有进入游戏（user* 全为 0）：游戏窗口失焦或 ETS2LA SDK 插件未生效。请用热键启动，别点窗口按钮");
+            data = latestTelemetry;
         }
+
+
+        Logger.Info($"AutoParking: 挡位探针 请求={demand.Gear} → gear={data.truckInt.gear} " +
+                    $"dash={data.truckInt.gearDashboard} slot={data.truckUI.shifterSlot} " +
+                    $"shifter_type={data.configString.shifterType} rpm={data.truckFloat.engineRpm:0} " +
+                    $"hand={data.truckBool.parkingBrake} v={Math.Abs(state.SignedSpeed) * 3.6:0.0} km/h");
     }
 
     private void CompletePhase(ParkingPhase from)
@@ -843,10 +832,6 @@ public sealed class AutoParkingPlugin : Plugin
                     settings.PidKd = ToDouble(value, settings.PidKd);
                     changed = true;
                     break;
-                case "maxCrossError":
-                    settings.MaxCrossErrorM = ToDouble(value, settings.MaxCrossErrorM);
-                    changed = true;
-                    break;
                 case "toleranceLateral":
                     settings.ToleranceLateralM = ToDouble(value, settings.ToleranceLateralM);
                     changed = true;
@@ -855,12 +840,32 @@ public sealed class AutoParkingPlugin : Plugin
                     settings.ToleranceHeadingDeg = ToDouble(value, settings.ToleranceHeadingDeg);
                     changed = true;
                     break;
-                case "maxDuration":
-                    settings.MaxDurationS = ToDouble(value, settings.MaxDurationS);
-                    changed = true;
-                    break;
                 case "handbrakeOnFinish":
                     settings.HandbrakeOnFinish = ToBool(value, settings.HandbrakeOnFinish);
+                    changed = true;
+                    break;
+                case "planRadiusMargin":
+                    settings.PlanRadiusMargin = ToDouble(value, settings.PlanRadiusMargin);
+                    changed = true;
+                    break;
+                case "steerGain":
+                    settings.SteerGain = ToDouble(value, settings.SteerGain);
+                    changed = true;
+                    break;
+                case "steerDeadband":
+                    settings.SteerDeadband = ToDouble(value, settings.SteerDeadband);
+                    changed = true;
+                    break;
+                case "steerRateLimit":
+                    settings.SteerRateLimitPerSecond = ToDouble(value, settings.SteerRateLimitPerSecond);
+                    changed = true;
+                    break;
+                case "lookaheadBase":
+                    settings.LookaheadBaseM = ToDouble(value, settings.LookaheadBaseM);
+                    changed = true;
+                    break;
+                case "lookaheadGain":
+                    settings.LookaheadGainMps = ToDouble(value, settings.LookaheadGainMps);
                     changed = true;
                     break;
                 case "reverseLaw":
@@ -898,9 +903,50 @@ public sealed class AutoParkingPlugin : Plugin
             case "selfTest":
                 RunSelfTest();
                 break;
+            case "testGearDrive":
+            case "testGearReverse":
+                TestGearPulse(actionId == "testGearDrive" ? GearRequest.Drive : GearRequest.Reverse);
+                break;
         }
 
         ApplyOverlayVisibility();
+    }
+
+    /// <summary>
+    ///  Fires a single gearbox action while nothing is driving, so the answer to "can boolean
+    ///  actions reach the game at all?" comes from the gear readout in the status table instead
+    ///  of from a whole maneuver. Pedals are analog axes and are known to work; shifting is not
+    ///  the same code path in the host, and the whole gear state machine depends on it.
+    /// </summary>
+    private void TestGearPulse(GearRequest request)
+    {
+        GameTelemetryData data;
+        bool allowed;
+        lock (sync)
+        {
+            allowed = follower == null && phase == ParkingPhase.Idle && !settings.DryRun;
+            data = latestTelemetry;
+            if (allowed)
+            {
+                lastActionFailed = false;
+                lastActionMessage = $"已发出 {request}，看下面状态表的 gear 是否变号";
+            }
+            else
+            {
+                lastActionFailed = true;
+                lastActionMessage = "换挡自检只能在未启用车库、且关掉 Dry-run 时按";
+            }
+        }
+
+        if (!allowed)
+            return;
+
+        output.DryRun = settings.DryRun;
+        output.PulseGear(request);
+
+        Logger.Info($"AutoParking: 换挡自检 {request}：按下前 gear={data.truckInt.gear}/{data.truckInt.gearDashboard} " +
+                    $"shifter_type={data.configString.shifterType} v={Math.Abs(data.truckFloat.speed) * 3.6:0.0} km/h，" +
+                    $"1 秒后看状态表的 gear 是否变成 {(request == GearRequest.Reverse ? "负数" : "正数")}");
     }
 
     private void ApplyOverlayVisibility()
@@ -1014,7 +1060,7 @@ public sealed class AutoParkingPlugin : Plugin
         }
 
         output.Release();
-        output.Apply(new ControlDemand(0f, 0f, 0f, true, GearRequest.None, false, null));
+        output.Apply(new ControlDemand(0f, 0f, 0f, true, GearRequest.None, false));
         Logger.Info("AutoParking: paused by hotkey");
     }
 
@@ -1034,7 +1080,7 @@ public sealed class AutoParkingPlugin : Plugin
             lastActionMessage = "已继续泊车";
         }
 
-        output.Apply(new ControlDemand(0f, 0f, 0f, false, GearRequest.None, false, null));
+        output.Apply(new ControlDemand(0f, 0f, 0f, false, GearRequest.None, false));
         Logger.Info("AutoParking: resumed by hotkey");
     }
 

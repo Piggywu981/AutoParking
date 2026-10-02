@@ -117,8 +117,10 @@ public static class PlannerSelfTest
         // that loops the full circle where a short arc belongs. Legitimate wide maneuvers cost at
         // most about one extra circle over the straight line, so bound it that way - per-case
         // magic numbers here would just be flaky.
+        // Measured against the radius the planner actually drives on, not the vehicle's own
+        // limit: planning with a margin deliberately makes routes longer.
         double straightLine = Geometry.Distance(testCase.Start.Position, testCase.Goal.Position);
-        double loopBound = straightLine + Geometry.TwoPi * Kinematics.MinTurnRadius(cfg) * 1.05;
+        double loopBound = straightLine + Geometry.TwoPi * Kinematics.PlanningRadius(cfg) * 1.05;
         if (path.Length > loopBound)
             return $"路径 {path.Length:0.0} m 比直线 {straightLine:0.0} m 多绕了超过一圈（上限 {loopBound:0.0} m）";
 

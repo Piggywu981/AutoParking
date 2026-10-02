@@ -99,19 +99,39 @@
                 Value="@(Convert.ToSingle(Plugin.Settings.PidKd))"
                 ValueChanged="@((float value) => Plugin.HandleAction("pidKd", value))" />
 
-        <Separator Label="容差与安全" Class="mt-4" />
-        <Slider Title="横向偏差中止 (m)" Min="@(0.5f)" Max="@(5f)" Step="@(0.1f)"
-                Value="@(Convert.ToSingle(Plugin.Settings.MaxCrossErrorM))"
-                ValueChanged="@((float value) => Plugin.HandleAction("maxCrossError", value))" />
+        <Separator Label="转向与规划余量" Class="mt-4" />
+        <Slider Title="规划半径余量"
+                Description="路径按「最小转弯半径 × 此系数」来规划。1.0 时每段弧都要满舵，方向盘没有修正余量；调大路径更长但可控。"
+                Min="@(1.0f)" Max="@(2.5f)" Step="@(0.05f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.PlanRadiusMargin))"
+                ValueChanged="@((float value) => Plugin.HandleAction("planRadiusMargin", value))" />
+        <Slider Title="转向比例增益" Min="@(0.2f)" Max="@(3.0f)" Step="@(0.05f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.SteerGain))"
+                ValueChanged="@((float value) => Plugin.HandleAction("steerGain", value))" />
+        <Slider Title="转向死区"
+                Description="小于此值的方向盘指令归零，避免追着轮胎弹性抖动。"
+                Min="@(0f)" Max="@(0.2f)" Step="@(0.005f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.SteerDeadband))"
+                ValueChanged="@((float value) => Plugin.HandleAction("steerDeadband", value))" />
+        <Slider Title="方向盘速率限制 (每秒)"
+                Description="从 0 到满舵所需秒数的倒数。旧版硬编码 0.08/帧（60 Hz 下约 4.8/s），等于 bang-bang。"
+                Min="@(0.2f)" Max="@(6.0f)" Step="@(0.1f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.SteerRateLimitPerSecond))"
+                ValueChanged="@((float value) => Plugin.HandleAction("steerRateLimit", value))" />
+        <Slider Title="前瞻距离基数 (m)" Min="@(0.5f)" Max="@(4.0f)" Step="@(0.1f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.LookaheadBaseM))"
+                ValueChanged="@((float value) => Plugin.HandleAction("lookaheadBase", value))" />
+        <Slider Title="前瞻随速度增益 (m per m/s)" Min="@(0f)" Max="@(2.0f)" Step="@(0.05f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.LookaheadGainMps))"
+                ValueChanged="@((float value) => Plugin.HandleAction("lookaheadGain", value))" />
+
+        <Separator Label="容差" Class="mt-4" />
         <Slider Title="到位横向容差 (m)" Min="@(0.05f)" Max="@(1f)" Step="@(0.05f)"
                 Value="@(Convert.ToSingle(Plugin.Settings.ToleranceLateralM))"
                 ValueChanged="@((float value) => Plugin.HandleAction("toleranceLateral", value))" />
         <Slider Title="到位航向容差 (°)" Min="@(1f)" Max="@(15f)" Step="@(0.5f)"
                 Value="@(Convert.ToSingle(Plugin.Settings.ToleranceHeadingDeg))"
                 ValueChanged="@((float value) => Plugin.HandleAction("toleranceHeading", value))" />
-        <Slider Title="最长允许时间 (s)" Min="@(30f)" Max="@(600f)" Step="@(10f)"
-                Value="@(Convert.ToSingle(Plugin.Settings.MaxDurationS))"
-                ValueChanged="@((float value) => Plugin.HandleAction("maxDuration", value))" />
         <Switch Title="完成后拉手刹"
                 Value="@Plugin.Settings.HandbrakeOnFinish"
                 ValueChanged="@((bool value) => Plugin.HandleAction("handbrakeOnFinish", value))" />
@@ -134,6 +154,17 @@
         <Separator Label="几何自检" Class="mt-4" />
         <p class="description">纯几何自检：24 组起终点对跑规划器，断言终点落位、采样连续、曲率不超最小转弯半径、障碍冲突会被拒。不需要游戏在跑。</p>
         <button class="button button-accent w-full!" @onclick="@(() => Plugin.HandleAction("selfTest", null))">运行规划自检</button>
+
+        <Separator Label="指令通路自检" Class="mt-4" />
+        <p class="description">
+            踩油门/刹车走的是模拟轴，挂挡与手刹走的是另一个代码路径。这两个按钮在未启动车库时按下，
+            然后看下面状态表的「人工输入」行里 gear 有没有变成正/负数：变了说明挡位指令进得去游戏，
+            没变说明宿主的布尔动作对这辆车无效，得改用升降挡序列。
+        </p>
+        <div class="flex gap-2">
+            <button class="button button-accent flex-1!" @onclick="@(() => Plugin.HandleAction("testGearDrive", null))">测试挂 D</button>
+            <button class="button button-accent flex-1!" @onclick="@(() => Plugin.HandleAction("testGearReverse", null))">测试挂 R</button>
+        </div>
 
         <Separator Label="状态" Class="mt-4" />
         <div class="flex flex-col rounded-sm bg-control-bg-dark border border-bg-darker p-4 gap-2">

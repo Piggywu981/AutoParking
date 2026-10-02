@@ -35,6 +35,9 @@ public sealed class ControlOutput
     public float LastBrake { get; private set; }
     public bool LastHandbrake { get; private set; }
 
+    /// <summary>The signed acceleration actually published: positive throttle, negative brake.</summary>
+    public float LastAcceleration { get; private set; }
+
     public void Apply(ControlDemand demand)
     {
         LastSteer = demand.Steer;
@@ -47,14 +50,25 @@ public sealed class ControlOutput
         PublishGear(demand.Gear);
     }
 
+    /// <summary>One gearbox action, for the settings-page self-check.</summary>
+    public void PulseGear(GearRequest request) => PublishGear(request);
+
     private void PublishDrive(ControlDemand demand)
     {
-        ControlVariables variables = new()
-        {
-            steering = Math.Clamp(demand.Steer, -1f, 1f),
-            aforward = Math.Clamp(demand.Throttle, 0f, 1f),
-            abackward = Math.Clamp(demand.Brake, 0f, 1f)
-        };
+        float acceleration = Math.Clamp(demand.Throttle - demand.Brake, -1f, 1f);
+        LastAcceleration = acceleration;
+
+        ControlVariables variables = new() { steering = Math.Clamp(demand.Steer, -1f, 1f) };
+
+        // GameOutput folds aforward and abackward into one "acceleration" bucket and averages
+        // every contribution in it, then writes the pedal by sign: positive to aforward,
+        // negative to abackward (negated). Publishing both fields therefore halves the demand
+        // and flips braking into throttle - exactly what a real run showed, where commanding
+        // abackward=1.0 produced a steady user_throttle=0.5 and 50 km/h. Send one signed field.
+        if (acceleration >= 0.0f)
+            variables.aforward = acceleration;
+        else
+            variables.abackward = acceleration;
 
         Publish(driveChannel, new ControlProperties { BooleanType = ControlBooleanType.Direct, Weight = Weight }, variables);
     }
@@ -80,19 +94,25 @@ public sealed class ControlOutput
         }
     }
 
+    /// <summary>
+    ///  One event per pulse. The host re-fires a TrueToToggle on every refresh of the channel,
+    ///  so republishing this from a 60 Hz loop would hammer the gearbox action.
+    /// </summary>
     private void PublishGear(GearRequest request)
     {
         if (request == GearRequest.None)
             return;
 
-        ControlVariables variables = new()
+        ControlVariables variables = request switch
         {
-            geardrive = request == GearRequest.Drive,
-            gearreverse = request == GearRequest.Reverse,
-            gear0 = request == GearRequest.Neutral
+            GearRequest.Drive => new ControlVariables { geardrive = true },
+            GearRequest.Reverse => new ControlVariables { gearreverse = true },
+            GearRequest.Neutral => new ControlVariables { gear0 = true },
+            _ => new ControlVariables()
         };
 
-        Publish(gearChannel, new ControlProperties { BooleanType = ControlBooleanType.TrueToToggle, Weight = Weight }, variables);
+        Publish(gearChannel, new ControlProperties { BooleanType = ControlBooleanType.TrueToToggle, Weight = Weight },
+                variables);
     }
 
     /// <summary>
@@ -112,6 +132,7 @@ public sealed class ControlOutput
         ReleaseChannel(holdChannel);
 
         LastSteer = 0f;
+        LastAcceleration = 0f;
         LastThrottle = 0f;
         LastBrake = 0f;
         LastHandbrake = false;

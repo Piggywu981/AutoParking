@@ -47,21 +47,31 @@ public sealed class AutoParkingSettings
     public double ReverseKhHeading { get; set; } = 1.2;
     public double LookaheadBaseM { get; set; } = 1.5;
     public double LookaheadGainMps { get; set; } = 0.6;
+
+    // Steering shaping: the geometric curvature command is scaled, deadbanded and then slew
+    // limited so the wheel tracks proportionally instead of snapping to full lock.
+    public double SteerGain { get; set; } = 1.0;
+    public double SteerDeadband { get; set; } = 0.02;
+    public double SteerRateLimitPerSecond { get; set; } = 1.5;
     public ReverseLateralLaw ReverseLateral { get; set; } = ReverseLateralLaw.ReversePurePursuit;
 
     // Planning
     public double GearSwitchPenaltyM { get; set; } = 6.0;
+
+    /// <summary>
+    ///  Plans on a circle larger than the vehicle's own minimum turning circle. Planning at the
+    ///  limit makes every arc demand full steering lock, which leaves the controller no authority
+    ///  to correct anything - a saturated actuator is no longer a linear one.
+    /// </summary>
+    public double PlanRadiusMargin { get; set; } = 1.35;
     public double PathSampleM { get; set; } = 0.25;
 
     // Obstacles
     public double ObstacleMarginM { get; set; } = 0.5;
-    public double ObstacleWaitS { get; set; } = 8.0;
 
     // Tolerances and aborts
-    public double MaxCrossErrorM { get; set; } = 2.0;
     public double ToleranceLateralM { get; set; } = 0.20;
     public double ToleranceHeadingDeg { get; set; } = 4.0;
-    public double MaxDurationS { get; set; } = 180.0;
 
     // Finish behaviour
     public bool HandbrakeOnFinish { get; set; } = true;
@@ -123,17 +133,18 @@ public sealed class AutoParkingSettings
         ReverseKhHeading = Math.Clamp(ReverseKhHeading, 0.2, 4.0);
         LookaheadBaseM = Math.Clamp(LookaheadBaseM, 0.5, 4.0);
         LookaheadGainMps = Math.Clamp(LookaheadGainMps, 0.0, 2.0);
+        SteerGain = Math.Clamp(SteerGain, 0.1, 3.0);
+        SteerDeadband = Math.Clamp(SteerDeadband, 0.0, 0.2);
+        SteerRateLimitPerSecond = Math.Clamp(SteerRateLimitPerSecond, 0.2, 6.0);
 
         GearSwitchPenaltyM = Math.Clamp(GearSwitchPenaltyM, 0.0, 20.0);
+        PlanRadiusMargin = Math.Clamp(PlanRadiusMargin, 1.0, 2.5);
         PathSampleM = Math.Clamp(PathSampleM, 0.1, 1.0);
 
         ObstacleMarginM = Math.Clamp(ObstacleMarginM, 0.2, 1.5);
-        ObstacleWaitS = Math.Clamp(ObstacleWaitS, 2.0, 30.0);
 
-        MaxCrossErrorM = Math.Clamp(MaxCrossErrorM, 0.5, 5.0);
         ToleranceLateralM = Math.Clamp(ToleranceLateralM, 0.05, 1.0);
         ToleranceHeadingDeg = Math.Clamp(ToleranceHeadingDeg, 1.0, 15.0);
-        MaxDurationS = Math.Clamp(MaxDurationS, 30.0, 600.0);
 
         MapScalePxPerM = Math.Clamp(MapScalePxPerM, 0.5, 3.0);
         MapZoom = Math.Clamp(MapZoom, 1.0, 4.0);

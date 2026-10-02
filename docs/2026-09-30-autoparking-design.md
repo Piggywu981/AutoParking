@@ -49,7 +49,7 @@
 | 唯一出口是事件总线：`Events.Current.Publish(GameOutput.Current.EventString, new ControlEvent{...})`，`EventString = "ETS2LA.Game.Output.ControlEvent"`；没有可直接调用的方法 | `ETS2LA.Game\Output\Output.cs:13-14,107` |
 | `ControlEvent`：`required ControlChannelDefinition ChannelDefinition` / `ControlProperties Properties` / `ControlVariables Variables`；`ControlChannelDefinition{required string Id; float Timeout = 0.2f}`；`ControlProperties{ControlBooleanType BooleanType; float Weight = 1.0f}` | `Output\Classes.cs:287-330` |
 | **同名字段跨通道按 Weight 加权平均**，不是抢占：`(Σwᵢvᵢ)/Σwᵢ` 后 clamp(-1,1) | `Output.cs:284-291` |
-| `aforward`/`abackward` 被折叠为同一 `acceleration` 通道：加权值 >0 写 `aforward`，<0 写 `abackward`。**没有独立 brake 浮点通道，制动 = 负的 acceleration** | `Output.cs:217-223,299-318` |
+| `aforward`/`abackward` 被折叠为同一 `acceleration` 通道：所有贡献做**加权平均**，结果 >0 写 `aforward`，<0 写 `abackward = -值`。**没有独立 brake 浮点通道，制动 = 负的 acceleration，且只能发一个字段**：同时发 `aforward=0, abackward=1.0` 会被平均成 +0.5 ⇒ 变成油门（实车已复现，见 §17） | `Output.cs:217-223,299-318` |
 | **Windows 路径分叉**：`steering` 只写 modern（`Local\ETS2LAPluginInput`，offset 0/4/5）；`acceleration` 与其余浮点、全部 bool 只写 legacy（`Local\SCSControls`）。⇒ 两套共享内存必须同时可打开，否则表现为"只有一半能控制" | `Output.cs:26,293-323` |
 | 通道超时未重发即被移除（默认 0.2 s）⇒ 控制必须以 ≥20 Hz 重发，本插件用 60 Hz | `Output.cs:273-277` |
 | 释放通道：发一条 `Variables`/`Properties` 为空的 `ControlEvent`；`Channels` 空时 `GameOutput` 会把所有输出复位 | `Output.cs:118-121,131-169,256-263` |
@@ -200,7 +200,7 @@ Idle ──选点/规划──▶ Planned ──Start(校验通过)──▶ Eng
 ### 6.1 运动学模型
 自行车模型，`R_min = wheelbase / tan(maxSteerRad)`。默认 `Wheelbase=4.0 m`、`MaxSteerDeg=33°` ⇒ `R_min≈6.16 m`。
 
-自动标定（`AutoCalibrateRadius=true`）：在直行/匀速行驶中用 `yawRate = (Δheading)/Δt` 与 `v` 反解瞬时半径 `R_inst = v / yawRate`，只在 `|v|>1.0 m/s`、`|steer|>0.15`、`|Δsteer|<0.02/tick` 时采样，取 20 个样本的中位数再按 `R_min_observed = R_inst / |steer_norm|` 折算；结果限幅 `4–20 m`，滑动保留最近 300 s。标定值只影响规划，设置页可"清零回退默认"。
+自动标定（`AutoCalibrateRadius=true`，**这一条只有设计、没有实现**：全仓库只有 `Settings.cs` 里那个开关，没有任何消费者；下面描述的是当初的打算）：在直行/匀速行驶中用 `yawRate = (Δheading)/Δt` 与 `v` 反解瞬时半径 `R_inst = v / yawRate`，只在 `|v|>1.0 m/s`、`|steer|>0.15`、`|Δsteer|<0.02/tick` 时采样，取 20 个样本的中位数再按 `R_min_observed = R_inst / |steer_norm|` 折算；结果限幅 `4–20 m`，滑动保留最近 300 s。标定值只影响规划，设置页可"清零回退默认"。
 
 航向与前向约定（与 V2 一致）：`yawDeg = rotation.X*360`，归一到 `(-180,180]`；`forward = (-sin yaw, 0, -cos yaw)`；横向左手系用 `left = Cross(UnitY, forward)`（OvertakeAssistant 已验证的注释）。
 
@@ -632,3 +632,100 @@ overlay（ETS2LA 窗口）和游戏是**两个应用**，点 overlay 上的按�
 判读：挡位脉冲 3 次无效、手刹没拉起、**气压还在往上涨**（真正施加制动时气压会掉）、`user*` 全 0 ⇒ 我们发出的每一条指令都没到达车辆。§M3 留的未验证项"油门/挡位走 legacy 内存、steering 走 modern 内存，双通道是否都通"有了部分答案：**踏板与挡位这一路没通**。最可能原因就是本文件早就记过的那条——游戏失焦时 SCS 虚拟手柄不接收输入（用 overlay 上的 `Start` 按钮启动必然踩坑，所以才有"必须用热键"的约定）。
 **顺带修掉一个自伤 bug**：`CheckOutputIsEffective` 原本用 `game*` 判断输出是否生效，但我们的注入回显在 `user*` ⇒ 这个看门狗**永远不可能触发**，"输出全废"于是被伪装成不相干的"换挡 3 次未成功"。现在改读 `userThrottle/userBrake/userSteer/truckBool.parkingBrake`，窗口从 4 s 缩到 2 s（抢在 4.5 s 的挡位重试之前给出正确结论），中止文案直接点名"失焦或 SDK 未生效"。
 **推翻第 6 项的结论**：那次"超速 8.9→10.3 km/h 且刹车无效"不能作为刹车通道失效的证据——同一批通道数据显示输出根本没进游戏，当时车速变化更可能是自行蠕行/倒溜。超速与制动 authority 的判断，等输出真的通了、`user*` 能跟上 `sent` 之后重测再说。
+
+
+### 自动中止逻辑整体删除（2026-10-02，用户要求："删除所有自动暂停逻辑，除非按下热键"）
+
+**触发这件事的直接原因**：实车正常倒车过程中被自动中止，文案是"指令没有进入游戏（user* 全为 0）"。
+
+**同时推翻了一个前提**：此前（§17 第 5、7 项）我们认定"我们注入的输入会回显进 `truckFloat.user*`"。这次车上正在正常倒车（输出显然是通的），而看门狗读到 `user*` 全 0 ⇒ **`user*` 是纯玩家设备输入，我们注入的量只体现在 `game*`**。那条把看门狗从 `game*` 改到 `user*` 的修正方向是错的，它在一切正常时每 2 s 误报一次。
+
+**删除内容**（`Driving\Follower.cs`、`AutoParkingPlugin.cs`）：
+| 原自动中止 | 现在的行为 |
+|---|---|
+| 挡位 3 次未确认 | 无限次继续请求挡位，状态行显示第几次 |
+| 障碍等待超时（`ObstacleWaitS`） | 一直保压等待，走廊一空就走，不设时限 |
+| 总时长超 `MaxDurationS` | 删除该设置 |
+| 横向偏差超 `MaxCrossErrorM` | 删除该设置，横向误差仍显示在状态表 |
+| 遥测中断 / `!sdkActive` / 游戏暂停 | 保压 + 手刹等待恢复，不再中止 |
+| 输出 2 s 无回显（`CheckOutputIsEffective`） | 整个方法删除（误报源，且读的是错字段） |
+| 失速看门狗（给油门 3 s 不动） | 删除 |
+| `ControlDemand.AbortReason` 通道 | 从 record 里删除，`Aborted()` 工厂删除 |
+
+**唯一保留的自动干预**：超速时 `HandleOverspeed` 踩下踏板 + 手刹，**降到上限以下自动恢复跟踪**。它是速度控制而不是暂停——永远不会结束机动。若这条也要删，说一声。
+
+**删除后的安全边界（必须知道）**：交还控制的途径只剩 `local.autoparking.Abort` 热键，以及 `Toggle` 热键（暂停并拉手刹）。踩刹车、打方向、遥测丢失、挡位卡死、被车挡住——**都不会**再自动结束机动，车会一直等在原地。所以：**绑好 Abort 热键之前不要动车**。
+
+**验证**：`dotnet build -c Release` 通过；离线 harness 自检 24/24、闭环 5/5 到位（harness 已去掉对 `AbortReason` 的断言，并显式 `DryRun=false`）。
+
+
+### 转向线性化（2026-10-02）
+
+**先记录一次被数据推翻的假设**。我以为满舵振荡来自 `Smooth()` 里硬编码的 `0.08/tick`（60 Hz 下 4.8/s，0.21 s 打满舵，等于 bang-bang），于是加了比例增益 / 死区 / **按秒**计算的速率限制，并在 harness 里加了转向质量指标（满舵时长、方向盘换向次数、方向盘总行程）做 A/B。
+
+结果：旧参数 vs 新参数，满舵时长 **95.6 s → 96.8 s**，几乎没变。假设错了。
+
+**真正的原因在规划器**：`R_min = 轴距/tan(最大转角) = 6.16 m`，Reeds-Shepp 用**恰好等于极限**的半径出弧，于是每段弧的曲率都是 `1/R_min`，映射到方向盘正好 = 1.0。**执行器长期饱和 ⇒ 回路不再线性 ⇒ 控制器没有任何修正余量**（这也正是之前倒车段发散、误差单调增长的根因）。
+
+**修法**：规划时用一个放大后的半径 `PlanningRadius = MinTurnRadius × PlanRadiusMargin`（新增设置，默认 **1.35**，范围 1.0–2.5），`Follower` 的曲率上限仍按车辆真实极限，把方向盘余量留给修正。
+
+**效果（同一批 5 条闭环用例）**：
+| 指标 | 余量 1.0（旧） | 余量 1.35（新） |
+|---|---|---|
+| 满舵时长（左侧垂直库） | 95.6 s | **0.0 s** |
+| 满舵时长（左后斜入库） | 66.6 s | **0.0 s** |
+| 横向到位误差 | 0.00–0.07 m | **0.00–0.02 m** |
+| 自检 / 闭环 | 24/24 · 5/5 | 24/24 · 5/5 |
+
+**代价**：路径变长（紧密位姿从 39–45 m 涨到 51–60 m）。这是有意的取舍——长但可控，优于短但饱和。要更短的路线就调小 `PlanRadiusMargin`，代价是方向盘余量。
+
+**顺带修了一条断言的尺子**：§M2 加的"路径不许多绕一整圈（2πR）"用的是 `MinTurnRadius`，加了余量之后必然误判（自检一度掉到 17/24）。改成按 `PlanningRadius` 衡量——比较基准必须跟实际规划用的半径一致。
+
+**新增设置项**：`PlanRadiusMargin`(1.35)、`SteerGain`(1.0)、`SteerDeadband`(0.02)、`SteerRateLimitPerSecond`(1.5)、`LookaheadBaseM`(1.5)、`LookaheadGainMps`(0.6)，全部在设置页「转向与规划余量」一节。
+
+
+### 严重 bug：刹车指令被宿主换算成油门（2026-10-02，实车日志确认）
+
+**现象**：`engaged: RS RSL · 36.5 m`，随后车速从 0 一路涨到 **50.3 km/h**，而状态一直是 `sent_brake=1.00`（我们在全程踩刹车），最后靠人工按暂停热键才停下。
+
+**对应关系是决定性的**：`sent_brake=0.50 → user_throttle=0.24`、`0.72 → 0.32`、`1.00 → 0.50`。永远是"一半"。
+
+**根因**：`GameOutput` 把 `aforward` 与 `abackward` 折进同一个 `acceleration` 桶做**加权平均**，再按符号分派：正→`aforward=值`，负→`abackward=-值`（`Output.cs:284-318`）。我们两个字段都发（`aforward=0`、`abackward=1.0`）⇒ 平均 = +0.5 ⇒ 宿主写的是 **`aforward=0.5`**，即半油门。越"踩刹车"越加速。
+
+**修法**（`Driving\ControlOutput.cs`）：算出带符号的 `acceleration = throttle - brake`，**只发一个字段**——非负发 `aforward`，负值发 `abackward`（宿主自己取反）。这样与 ACC 等其它通道混算也正确：ACC `aforward=0.3`(w=1) 与我们 `abackward=-1`(w=5) 平均 = -0.78 ⇒ 刹车 0.78。
+
+**顺带纠正本文档先前两条错误结论**：
+- §17 第 6 项"超速且刹车无效、刹车 authority 不足"——不是 authority 问题，是符号问题，刹车根本没生效过。
+- §17 第 7 项"指令根本没进游戏（`user_brake=0`、气压还在涨）"——指令进了，只是变成了油门；`user_brake=0` 是必然的，因为宿主写的是 `aforward`。当时据此删掉的那批自动中止，其前提部分失效。
+- 探针也补了 `sent_accel`（带符号实际发布值），下次一眼能验证映射方向。
+
+**遗留安全事实**：这轮失控能冲到 50 km/h 而不停，是因为上一轮按要求删除了全部自动中止（含超速中止），最后靠人工热键救场。目前唯一的自动干预是 `HandleOverspeed` 的"踏板+手刹"，但它当时发的是被换算成油门的方向——修好符号后它才真正具备减速能力，是否再给它一个兜底中止由用户决定。
+
+
+### 符号修好之后"不动了"：卡在等挡位（2026-10-03，实车日志确认）
+
+**日志**（`current\ets2la.log`，00:01–00:05 两轮）：
+
+```
+制动探针 v=0.0 km/h sent_accel=-0.50 (brake=0.50 throttle=0.00) user_brake=0.50 user_throttle=0.00 air=114→123 hand=False gear=0
+```
+
+**好消息**：上一节的符号修正是对的。`sent_accel=-0.50 → user_brake=0.50、user_throttle=0.00`——刹车终于作为刹车进了游戏，不再变成半油门。
+
+**坏消息**：这条探针连续出现 60+ 次、`gear` 始终 0，中间只有 `paused/resumed by hotkey`。也就是说追踪器一直停在换挡状态机里踩着刹车等 `truckInt.gear` 变负数，而挡位从来没变过。"不动"不是纵向控制的问题，是**挡位确认永远不成立**。
+
+**先排除掉一个我怀疑过的原因**：会不会是布尔动作在共享内存里偏移错位（`legacyShmOffsets` 按 `ControlVariables` 声明顺序累加，bool 只算 1 字节）。核对办法是把 `scs_sdk_controller.dll` 里的动作名表抽出来与 `SourceCode\ETS2LA.Game\Output\Classes.cs` 的字段顺序逐个比对：**276 个字段，顺序完全一致，0 处不符**。偏移不是问题。（顺带：`steering/aforward/abackward` 是第 71–73 个字段，`parkingbrake` 第 118，`gear0/geardrive/gearreverse` 第 202–204； pedal 能生效本身就说明前面 70 个字段的累加是对的。）
+
+**剩下的三个候选，按代价排序**：
+1. **换挡脉冲写法与可用的参考实现不一致**。官方示例 `SequentialAutoShift\PulseShift()` 每个脉冲只写 `gearup=up, geardown=!up`（两个字段，一真一假）。我们写 `geardrive=false, gearreverse=true, gear0=false`——三个字段里两个 false 写在同一次事件里。false 落在别的偏移上，理论上无害，但这是与"已知能用"的实现唯一的差别，所以先改成同样只带一个动作字段的形式（`ControlOutput.PublishGear`）。
+2. **等挡位期间手刹是拉着的**。`ControlDemand.Hold()` 第四个参数是 `HoldBrake=true`，而换挡等待用的正是 `Hold(0.5)`——即"行车制动+驻车制动"。若 ETS2 在驻车制动生效时拒绝接合 D/R，就永远确认不了。（注意 `hand=False`：驻车制动的布尔写入也没在遥测里体现，这本身是另一条待查线索。）新增 `ControlDemand.BrakeOnly()`，换挡等待只踩行车踏板。
+3. **这辆车可能根本不认 `gear_drive/gear_reverse`**。该动作只对 H 挡自动箱存在；顺序箱/手动箱要靠 `gearup/geardown`。现在 `shifter_type` 进了状态表和探针日志，一眼可见。
+
+**把"等不到"从死路改成降级**（`Driving\Follower.cs`）：脉冲每秒重发一次，最多 4 次；之后**按请求方向继续行驶**，并在行驶段每 1 s 补发一次，直到遥测真的出现对应符号。理由：上一轮按要求删掉了全部自动中止，"永远在等"等于把插件变成一个只能靠热键解除的刹车——这不可接受。继续补发是无害的：游戏什么时候接合，车就什么时候动。
+
+**新增证据通道**：
+- `挡位探针`（每次发脉冲记一行）：`请求 → gear/dash/slot/shifter_type/rpm/hand/v`。
+- 状态表「人工输入」行尾部改成 `gear=实际/仪表 shifter=变速箱类型`。
+- 设置页新增「指令通路自检」两个按钮：**测试挂 D / 测试挂 R**（未启用车库且非 Dry-run 时可按）。油门刹车走模拟轴、换挡手刹走布尔动作，是两条不同代码路径；这两个按钮能在 2 秒内回答"布尔动作到底进不进得去游戏"，不必跑完整个泊车位。
+
+**离线回归**：`scratch\PlannerHarness` 加了 `gearboxDeaf` 仿真（脉冲永远不接合）。结果：自检 24/24、闭环 5/5 不变；失聪挡箱用例换挡脉冲 296 次、正常进入行驶段（不再是踩着刹车等到超时）。构建 0 错误，DLL 已更新到 `current\Plugins\AutoParking.dll`（00:26），**需要重启 ETS2LA 才生效**。
