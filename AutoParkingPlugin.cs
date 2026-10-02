@@ -19,14 +19,11 @@ public enum ParkingPhase
 {
     Idle,
     Selecting,
-    Planned,
     Engaging,
     Following,
     GearHold,
-    Aligning,
     HoldingBrake,
     Paused,
-    Done,
     Aborted
 }
 
@@ -75,6 +72,7 @@ public sealed class AutoParkingPlugin : Plugin
     private Follower? follower;
     private DateTime phaseDeadlineUtc = DateTime.MinValue;
     private DateTime outputBlindSinceUtc = DateTime.MinValue;
+    private DateTime lastBrakeProbeUtc = DateTime.MinValue;
 
     // Restored when the maneuver ends, unless the user changed them in the meantime.
     private bool hadAssistSnapshot;
@@ -293,11 +291,19 @@ public sealed class AutoParkingPlugin : Plugin
             case ParkingPhase.Engaging:
             case ParkingPhase.Following:
             case ParkingPhase.GearHold:
-            case ParkingPhase.Aligning:
                 StepManeuver();
                 break;
 
             case ParkingPhase.Paused:
+                // Paused still holds the vehicle, so it must not go blind: without telemetry we
+                // cannot tell a parked truck from a rolled-away one, and re-asserting the brake
+                // into a dead SDK would never end.
+                if (telemetryStale || !latestTelemetry.sdkActive || latestTelemetry.paused)
+                {
+                    Abort("遥测中断或游戏已暂停");
+                    break;
+                }
+
                 // Hold the spot: keep re-asserting the handbrake, touch nothing else.
                 output.Apply(new ControlDemand(0f, 0f, 0f, true, GearRequest.None, false, null));
                 break;
@@ -338,6 +344,7 @@ public sealed class AutoParkingPlugin : Plugin
         }
 
         output.Apply(demand);
+        ProbeBrakeChannel(demand, state);
         CheckOutputIsEffective(demand, state);
 
         lock (sync)
@@ -361,14 +368,23 @@ public sealed class AutoParkingPlugin : Plugin
     private VehicleState ReadVehicleState()
     {
         GameTelemetryData data;
-        lock (sync) data = latestTelemetry;
+        DateTime sampleUtc;
+        lock (sync)
+        {
+            data = latestTelemetry;
+            sampleUtc = lastTelemetryUtc;
+        }
 
         Vector2 position = new((float)data.truckPlacement.coordinate.X, (float)data.truckPlacement.coordinate.Z);
         double heading = Geometry.HeadingFromRotationComponent(data.truckPlacement.rotation.X);
         int gear = data.truckInt.gear;
         double speed = Math.Abs(data.truckFloat.speed);
 
-        DateTime now = DateTime.UtcNow;
+        // Timestamp the sample, not the tick. The tick runs at 60 Hz while telemetry arrives far
+        // slower, so feeding one sample into the PID repeatedly inflated the integral and the
+        // derivative by the ratio between the two rates - a throttle kick whenever the measured
+        // speed dipped, which then overshot straight into the overspeed abort.
+        DateTime now = sampleUtc;
         double signedSpeed = speed * Math.Sign(gear);
 
         if (gear == 0)
@@ -386,25 +402,61 @@ public sealed class AutoParkingPlugin : Plugin
         lastPosition = position;
         lastPositionUtc = now;
 
-        // The SCS virtual controller is injected as a player device, so our own throttle, brake
-        // and steering come straight back in truckFloat.user*. Comparing those against a fixed
-        // threshold made the plugin abort the moment it started driving, blaming the human.
-        // Only the part the player adds on top of what we sent counts as a takeover.
-        double humanSteer = Math.Abs(data.truckFloat.userSteer - output.LastSteer);
-        double humanThrottle = Math.Max(0.0, data.truckFloat.userThrottle - output.LastThrottle);
-        double humanBrake = Math.Max(0.0, data.truckFloat.userBrake - output.LastBrake);
-
+        // Human takeover is no longer an abort condition, but keep showing the raw player inputs
+        // next to what we sent: it is the only way to see on screen who is actually moving the
+        // truck when the game is being driven from two places at once.
         lastRawUserInputs = $"user=({data.truckFloat.userSteer:0.00},{data.truckFloat.userThrottle:0.00},{data.truckFloat.userBrake:0.00}) " +
-                            $"sent=({output.LastSteer:0.00},{output.LastThrottle:0.00},{output.LastBrake:0.00})";
+                            $"sent=({output.LastSteer:0.00},{output.LastThrottle:0.00},{output.LastBrake:0.00}) " +
+                            $"game=({data.truckFloat.gameSteer:0.00},{data.truckFloat.gameThrottle:0.00},{data.truckFloat.gameBrake:0.00}) " +
+                            $"v={speed * 3.6:0.0}km/h gear={gear}";
 
-        return new VehicleState(now, position, heading, signedSpeed, gear, humanSteer, humanThrottle, humanBrake);
+        return new VehicleState(now, position, heading, signedSpeed, gear);
     }
 
     /// <summary>
-    ///  On Windows the steering channel and the pedal/gear channels are written to two different
-    ///  shared-memory regions, so a half-installed SDK shows up as "the truck just sits there".
-    ///  If we have been commanding movement and the game reports no input at all, fail loudly
-    ///  instead of quietly creeping along.
+    ///  Samples the brake path while we are asking for full braking. A demand that does not slow
+    ///  the vehicle is the one failure the status table cannot show after the fact - the maneuver
+    ///  is over by then - so it goes to the log as it happens. sent_brake high with game_brake
+    ///  near zero means the abackward axis is not the brake pedal.
+    /// </summary>
+    private void ProbeBrakeChannel(ControlDemand demand, VehicleState state)
+    {
+        if (demand.Brake < 0.5f || settings.DryRun)
+            return;
+
+        if ((state.Utc - lastBrakeProbeUtc).TotalSeconds < 0.25)
+            return;
+
+        lastBrakeProbeUtc = state.Utc;
+
+        float userBrake, userThrottle, airPressure, brakeTemp;
+        bool parkingBrake;
+        int gear;
+        lock (sync)
+        {
+            userBrake = latestTelemetry.truckFloat.userBrake;
+            userThrottle = latestTelemetry.truckFloat.userThrottle;
+            airPressure = latestTelemetry.truckFloat.airPressure;
+            brakeTemp = latestTelemetry.truckFloat.brakeTemperature;
+            parkingBrake = latestTelemetry.truckBool.parkingBrake;
+            gear = latestTelemetry.truckInt.gear;
+        }
+
+        // user*, not game*: the SCS virtual controller arrives as a player device, so game_brake
+        // stays zero no matter how hard we brake. Air pressure is the physical tell - it falls
+        // only when the brake is actually applied at the wheels.
+        Logger.Info($"AutoParking: 制动探针 v={Math.Abs(state.SignedSpeed) * 3.6:0.0} km/h " +
+                    $"sent_brake={demand.Brake:0.00} user_brake={userBrake:0.00} user_throttle={userThrottle:0.00} " +
+                    $"air={airPressure:0.00} brake_temp={brakeTemp:0.0} hand={parkingBrake} gear={gear}");
+    }
+
+    /// <summary>
+    ///  Fails loudly when nothing we send reaches the vehicle. The echo has to be read from
+    ///  truckFloat.user*, not game*: the SCS virtual controller is injected as a player device, so
+    ///  game* stays at zero even when we are driving perfectly - which meant this watchdog could
+    ///  never fire and a dead output surfaced as the unrelated "gear failed to engage" abort.
+    ///  The usual cause is focus: the virtual controller drops input while the game window is in
+    ///  the background, which is exactly why the maneuver must be started from a hotkey.
     /// </summary>
     private void CheckOutputIsEffective(ControlDemand demand, VehicleState state)
     {
@@ -414,12 +466,15 @@ public sealed class AutoParkingPlugin : Plugin
             return;
         }
 
-        bool demanding = demand.Throttle > 0.25f || demand.Brake > 0.25f || Math.Abs(demand.Steer) > 0.25f;
-        bool gameResponded = latestTelemetry.truckFloat.gameThrottle > 0.05f
-                          || latestTelemetry.truckFloat.gameBrake > 0.05f
-                          || Math.Abs(latestTelemetry.truckFloat.gameSteer) > 0.05f;
+        bool demanding = demand.Throttle > 0.25f || demand.Brake > 0.25f
+                      || Math.Abs(demand.Steer) > 0.25f || demand.HoldBrake;
 
-        if (!demanding || gameResponded)
+        bool echoed = latestTelemetry.truckFloat.userThrottle > 0.05f
+                   || latestTelemetry.truckFloat.userBrake > 0.05f
+                   || Math.Abs(latestTelemetry.truckFloat.userSteer) > 0.05f
+                   || latestTelemetry.truckBool.parkingBrake;
+
+        if (!demanding || echoed)
         {
             outputBlindSinceUtc = state.Utc;
             return;
@@ -428,10 +483,10 @@ public sealed class AutoParkingPlugin : Plugin
         if (outputBlindSinceUtc == DateTime.MinValue)
             outputBlindSinceUtc = state.Utc;
 
-        if ((state.Utc - outputBlindSinceUtc).TotalSeconds > 4.0)
+        if ((state.Utc - outputBlindSinceUtc).TotalSeconds > 2.0)
         {
             outputBlindSinceUtc = DateTime.MinValue;
-            Abort("发出的指令在游戏侧毫无体现：请检查或重装 ETS2LA SDK 插件");
+            Abort("指令没有进入游戏（user* 全为 0）：游戏窗口失焦或 ETS2LA SDK 插件未生效。请用热键启动，别点窗口按钮");
         }
     }
 
@@ -907,8 +962,10 @@ public sealed class AutoParkingPlugin : Plugin
             }
 
             lastActionFailed = false;
+            // Progress comes from the real vehicle position, so a Dry-run engagement shows the
+            // demands for the current sample and then holds there; it does not walk the route.
             lastActionMessage = settings.DryRun
-                ? $"已开始（Dry-run）：{planResult!.Summary} —— 只演算，车不会动，看控制器行确认在推进"
+                ? $"已开始（Dry-run）：{planResult!.Summary} —— 不发控制，车不动，路径进度停在起点，看控制器行确认拟发数值"
                 : $"已开始：{planResult!.Summary}";
         }
 
@@ -938,7 +995,6 @@ public sealed class AutoParkingPlugin : Plugin
             case ParkingPhase.Engaging:
             case ParkingPhase.Following:
             case ParkingPhase.GearHold:
-            case ParkingPhase.Aligning:
                 Pause();
                 return;
 
@@ -987,8 +1043,7 @@ public sealed class AutoParkingPlugin : Plugin
         lock (sync)
         {
             if (phase != ParkingPhase.Engaging && phase != ParkingPhase.Following
-                && phase != ParkingPhase.GearHold && phase != ParkingPhase.Aligning
-                && phase != ParkingPhase.Paused)
+                && phase != ParkingPhase.GearHold && phase != ParkingPhase.Paused)
             {
                 lastActionFailed = false;
                 lastActionMessage = "当前没有在跑的泊车任务，无需中止";

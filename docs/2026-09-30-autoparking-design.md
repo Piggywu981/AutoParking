@@ -282,7 +282,7 @@ V2 到点减速公式作为兜底叠加：`a_stop = -v²/(2*max(s_left-0.5, 0.2)
 | # | 条件 | 检测来源 | 动作 |
 |---|---|---|---|
 | 1 | 遥测过期 >0.5 s / `!sdkActive` / `paused` / `!IsGameRunning` | snapshot timestamp | 立即刹停 + Abort |
-| 2 | 人类接管 | `userSteer>0.15`、`userThrottle>0.1`、`userBrake>0.05`（阈值可调，`UserOverrideEnabled` 默认 true） | Abort（3 s 制动后交还） |
+| 2 | ~~人类接管~~ | — | **整条已删除（2026-10-02，见 §17）**：方向盘、油门、刹车三个通道都不再触发中止 |
 | 3 | 横向偏差 `|e_ct| > MaxCrossError`(2.0 m) | Follower | Abort |
 | 4 | 超速 `|v| > 段限速 + 1.0 m/s`（下坡失控等） | signedSpeed | 紧急制动 `abackward=1.0`，1 s 后仍超速 → Abort |
 | 5 | 速度未按预期变化（发了 >0.4 油门 2 s 而 `|v|<0.05`） | Follower | Abort("被卡住/无动力") |
@@ -331,7 +331,7 @@ V2 到点减速公式作为兜底叠加：`a_stop = -v²/(2*max(s_left-0.5, 0.2)
 | `MapViewRadiusM` | 120 | 20–200 | Slider（地图数据抓取半径，取它与可视范围的较大者） |
 | `SnapToNavCurve` | true | — | Switch（选点时吸附最近建筑导航曲线方向） |
 | `RestoreAssistsOnFinish` | true | — | Switch |
-| `UserOverrideEnabled` + 3 个阈值 | true / 0.15 / 0.1 / 0.05 | — | Switch+Sliders |
+| ~~`UserOverrideEnabled` + 3 个阈值~~ | — | — | 随"人类接管"中止条件一起删除（§17） |
 | `StartKeybindId` / `AbortKeybindId` | 固定 Id，默认无键 | — | 在 ETS2LA 控制页绑定 |
 
 `HandleAction(string id, object? value)` 统一分派（照抄 `SpeedLimitUnlocker\Plugin.cs:145-179` 的写法：改值 → `settingsHandler.Save` → 必要时重算），`RegisterListener` 处理外部改文件的热更新并 clamp。
@@ -577,3 +577,58 @@ overlay（ETS2LA 窗口）和游戏是**两个应用**，点 overlay 上的按�
 2. **日志里不能用裸方括号**：`ETS2LA.Logging` 用 Spectre.Console 标记语法，`"[AutoParking] ..."` 会被当成 markup 标签**静默吞掉**，排查时一度误以为"没有日志"。改用 `AutoParking: ` 前缀。
 
 另外删掉了设置页里与插件管理重复的 `Enabled` 总开关（两处"启用"是真实误会来源），插件管理成为唯一开关。
+
+### 中止逻辑走查与修复（2026-10-02，`dotnet build -c Release` 通过）
+
+**1. DryRun 与"依赖游戏回应"的判定互相冲突（真 bug）**
+`ControlOutput` 在 DryRun 下屏蔽发布 ⇒ 车必然不动，而 Follower 的中止条件是按"车应该会动"写的。结果：倒车段第一步就撞挡位重试上限（约 4 s），即使有前进段也是 3 s 触发失速看门狗、8 s 触发障碍等待超时、180 s 触发总时长。
+已按"该判定是否依赖车辆真实响应"逐条门控（`Driving\Follower.cs`）：
+- `WaitForGear`：DryRun 下挡位视为已确认。不门控的话任何含倒车段的计划在 `Stage.WaitingForGear` 就死了，这是最早触发的一条。
+- `CheckFaults`：引入 `needsResponse = !settings.DryRun`，门控失速看门狗与 `MaxDurationS` 两条（同一处还门控过人工接管，该分支后来整体删除，见第 5 条）。
+- `HandleObstacles`：仍显示"路径被挡"并保压，但 DryRun 下不消耗等待预算、不中止。
+横向偏差与速度失控两条未门控——车不动时它们本来就不会触发。
+**同时**：`StartParking` 的 Dry-run 提示语原来写"看控制器行确认在推进"，是错的。`UpdateProgress` 用真实车位投影，DryRun 下进度停在起点，预览只显示"当前采样点该发什么"。§M3 设想的"虚拟车沿路径推进的假设位姿"**没有实现**，要真演算整条路径仍需离线 harness。
+**注意**：Follower 持有的是 `StartParking` 时的 settings 实例，而 `OnSettingsChanged` 会整体替换插件的字段 ⇒ 机动途中改参数对 Follower 无效（`output.DryRun` 却是每 tick 刷新）。这是既有行为，本次未动，但它意味着中止阈值的调整只对下一次启动生效。
+
+**2. 暂停态不监遥测**
+`ParkingPhase.Paused` 分支原先只重申手刹、不看遥测，暂停中拔 SDK/关游戏会永远重申一个死通道。已补 `telemetryStale || !sdkActive || paused` → `Abort("遥测中断或游戏已暂停")`（`AutoParkingPlugin.cs` `StepControlLoop`）。`Abort` 的相位守卫本来就允许从 `Paused` 触发，所以 M5 的"暂停 + 拔 SDK"注入现在能走通。
+
+**3. 死枚举与文件清单偏差**
+`ParkingPhase.Planned / Aligning / Done` 从未被赋值（只出现在 switch 分支里），已删除，同步清掉 `StepControlLoop`、`HandleToggle`、`Abort` 守卫里的三处分支。
+§11 计划独立的 `Safety.cs` 没有落盘：中止条件实际分散在 `Driving\Follower.cs`（`CheckFaults`、挡位重试、障碍等待）和 `AutoParkingPlugin.cs`（`StepManeuver` 遥测守卫、`CheckOutputIsEffective` 输出生效诊断、`Abort`/`CompletePhase` 时序）。当前规模下两处内聚度够，不再为它拆文件——§11 的预估行数本就与实际不符。
+
+**4. 本地验证方式失效**
+§M2 记的 `E:\ETS2LA\V3-C#\scratch\PlannerHarness\` 在 `D:` 工作树里不存在（顶层只有 `ETS2LA-win-release-Portable`、`SourceCode`、`ThirdPartyPlugin`）。重跑闭环仿真需要重建该 harness，并且**必须显式 `DryRun=false`**，否则上面那批门控会把中止条件全部跳过，等于没测。
+
+**5. "人类接管"中止条件整体删除（2026-10-02，用户要求：先删方向盘，再删油门/刹车）**
+`Follower.CheckFaults` 里整个 `UserOverrideEnabled` 分支移除，三个通道（`userSteer` / `userThrottle` / `userBrake`）都不再触发中止。连带清理：
+- `VehicleState` 从 7 个字段缩到 5 个（`Utc, Position, HeadingRad, SignedSpeed, Gear`），`UserSteer/UserThrottle/UserBrake` 及其在 `ReadVehicleState` 里的"减掉我们发出去的量"残差计算一起删除。
+- `AutoParkingSettings` 删掉 `UserOverrideEnabled`、`UserSteerThreshold`、`UserThrottleThreshold`、`UserBrakeThreshold` 四个属性及其 clamp（它们本来就没有设置页控件，也没有 `HandleAction` 分支）。
+- 保留：状态表的「原始输入」行仍然打印 `user=(...)  sent=(...)`。这是唯一能在实车上看出"是谁在动车"的窗口，删掉判定不等于删掉观测。
+- §10 条件矩阵第 2 行、§9 参数行已标为删除。
+
+**删除后的安全边界（重要）**：人类介入不再自动中止机动。现在交还控制的途径只剩三条 —— `local.autoparking.Abort` 热键、`Toggle` 热键（暂停并拉手刹）、以及遥测/输出生效两类守卫（`StepManeuver` 的 stale/`!sdkActive`/`paused`、`CheckOutputIsEffective` 的 4 s 无反馈）。也就是说：**踩刹车不再是退出手段**，实车测试时必须先绑定 Abort 热键再动车；宿主侧的加权通道抢占（§16）能不能在人类打方向时压过我们，仍未在实车上验证过。
+残留的 `UserSteerThreshold` 等键会在下一次保存 `AutoParking.json` 时自然消失（`System.Text.Json` 默认忽略未知属性），无需手工清理。
+
+**6. 实车现象"速度失控"（2026-10-02）**
+先核对单位：`truckFloat.speed` 是 **m/s**，证据是同目录 `OvertakeAssistant\OvertakeAssistantPlugin.cs:25` 的 `MinimumSpeed = 55f / 3.6f` 直接与它比较。所以失控线 `max(ForwardSpeedKph, ReverseSpeedKph)/3.6 + 1.0` 在默认 6 km/h 下等于 2.67 m/s = **9.6 km/h**，离目标速度只有 3.6 km/h 余量——"轻微超速"就是这么来的。
+
+**根因 A：控制律的 dt 取错。** `ReadVehicleState` 拿 `DateTime.UtcNow` 当时间戳，而 Tick 是 60 Hz、遥测到达慢得多 ⇒ 同一帧数据被反复喂进 PID，积分与微分都按 `60Hz/采样率` 的比例放大。车速一掉，微分项就顶出大油门，随后冲过失控线。
+修正：`VehicleState.Utc` 改用遥测到达时刻（`lastTelemetryUtc`）；`Longitudinal` 的 dt 上限从 0.05 放宽到 0.25——dt 现在是真实采样间隔，10 Hz 进料不该被折半。重复采样时 dt=0，由 `Math.Clamp` 的 0.005 下限兜住。
+
+**根因 B：判定与 §10 设计不符。** 条件矩阵第 4 行原本要求"超速 → `abackward=1.0` 紧急制动，1 s 后仍超速才 Abort"，M3 落地时写成了**单帧立即中止**，没有防抖。现在补回：`CheckFaults` 在超速时先返回 brake=1.0（不拉手刹）并跳过本帧路径跟踪，持续超过 `OverspeedGraceS`(1 s) 才中止，文案改为"速度 X km/h，刹了 1 s 仍不降到 Y km/h 以下"；回落到 `cap - 0.3` 以下才清零计时，避免尖峰反复重置。宽限期内状态表显示"超速 X km/h，紧急制动"。
+
+**仍需实车确认**：修掉 dt 后过冲到底还剩多少；`MaxBrakeDecel=1.2 m/s²` 映射成的 `abackward=1.0` 能否在 1 s 内把 9.6 km/h 拉回线内。若还在触发，先试 `PidKd=0` 和降 `ForwardSpeedKph`，**不要**继续放宽失控线——那条线是最后的兜底。
+
+**第二轮实车日志（2026-10-02）**：`sent_brake` 从 0.52 一路涨到 1.00 期间，`v` 反而从 8.9 涨到 10.3 km/h（gear=-1），`game_brake` 恒为 0.00。
+先纠正探针自己的错误：反射 `ETS2LA.Game.dll` 得到 `ETS2LA.Game.Output.ControlVariables` 就是虚拟控制动作表（`steering / aforward / abackward / clutch / parkingbrake / motorbrake / engbrake* / …`），所以 **`abackward` 字段名没取错**，它就是刹车踏板轴。而 `TruckFloat` 同时有 `user*` 和 `game*` 两套回显——按本文件 M3 的记录，我们注入的量回显在 `user*`，因此 `game_brake=0.00` **不能**证明通道失效，是第一版探针读错了字段。
+仍未分辨的是两种可能：(a) 踏板指令根本没到轮端；(b) 到了但authority不足（坡道/空挡滑行/游戏刹车曲线）。为此改了两处：
+- 探针改读 `user_brake / user_throttle / airPressure / brakeTemperature / parkingBrake`。气压是"轮端确实施加了制动"的物理证据，比任何回显字段都硬。
+- 紧急制动从"只踩踏板"改成 `ControlDemand.Hold(1.0f)`，即**踏板 + 手刹一起**。理由：手刹在泊车完成时已证明能真正停住车，而踏板这一路还没有任何一次实车证据表明它会减速。
+一次性反射探针放在 `scratch\ChannelProbe\`（插件目录之外，不进 depth-1 批量构建），要再查宿主字段直接 `dotnet run`。
+
+**7. 第三轮实车：指令根本没进游戏（2026-10-02）**
+日志：`sent_brake=0.50 user_brake=0.00 user_throttle=0.00 air=114.18→116.01 hand=False gear=0` 连续 8 条 → `aborted: 换挡 3 次未成功（目标 Forward）`。
+判读：挡位脉冲 3 次无效、手刹没拉起、**气压还在往上涨**（真正施加制动时气压会掉）、`user*` 全 0 ⇒ 我们发出的每一条指令都没到达车辆。§M3 留的未验证项"油门/挡位走 legacy 内存、steering 走 modern 内存，双通道是否都通"有了部分答案：**踏板与挡位这一路没通**。最可能原因就是本文件早就记过的那条——游戏失焦时 SCS 虚拟手柄不接收输入（用 overlay 上的 `Start` 按钮启动必然踩坑，所以才有"必须用热键"的约定）。
+**顺带修掉一个自伤 bug**：`CheckOutputIsEffective` 原本用 `game*` 判断输出是否生效，但我们的注入回显在 `user*` ⇒ 这个看门狗**永远不可能触发**，"输出全废"于是被伪装成不相干的"换挡 3 次未成功"。现在改读 `userThrottle/userBrake/userSteer/truckBool.parkingBrake`，窗口从 4 s 缩到 2 s（抢在 4.5 s 的挡位重试之前给出正确结论），中止文案直接点名"失焦或 SDK 未生效"。
+**推翻第 6 项的结论**：那次"超速 8.9→10.3 km/h 且刹车无效"不能作为刹车通道失效的证据——同一批通道数据显示输出根本没进游戏，当时车速变化更可能是自行蠕行/倒溜。超速与制动 authority 的判断，等输出真的通了、`user*` 能跟上 `sent` 之后重测再说。

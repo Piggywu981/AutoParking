@@ -8,8 +8,7 @@ namespace AutoParking;
 ///  Everything the controller needs about the vehicle, as plain values. Keeping the telemetry
 ///  types out of here is what lets the follower be driven by a simulator in the test harness.
 /// </summary>
-public readonly record struct VehicleState(DateTime Utc, Vector2 Position, double HeadingRad, double SignedSpeed,
-                                           int Gear, double UserSteer, double UserThrottle, double UserBrake)
+public readonly record struct VehicleState(DateTime Utc, Vector2 Position, double HeadingRad, double SignedSpeed, int Gear)
 {
     public Pose2 Pose => new(Position.X, Position.Y, HeadingRad);
 }
@@ -42,6 +41,7 @@ public readonly record struct ControlDemand(float Steer, float Throttle, float B
 /// </summary>
 public sealed class Follower
 {
+    private const double OverspeedGraceS = 1.0;
     private enum Stage
     {
         SelectGear,
@@ -75,6 +75,7 @@ public sealed class Follower
     private DateTime lastMovementCheckUtc = DateTime.MinValue;
     private bool demandingMovement;
     private DateTime blockedSince = DateTime.MinValue;
+    private DateTime overspeedSince = DateTime.MinValue;
     private string status = "等待";
 
     private readonly struct Run
@@ -227,7 +228,10 @@ public sealed class Follower
 
     private ControlDemand WaitForGear(VehicleState vehicle)
     {
-        bool confirmed = wantedGear == DriveDirection.Forward ? vehicle.Gear > 0 : vehicle.Gear < 0;
+        // In DryRun the gear pulse never reaches the game, so telemetry can never confirm it.
+        // Assume it took, or the retry counter aborts the first reverse leg a few seconds in.
+        bool confirmed = settings.DryRun
+                      || (wantedGear == DriveDirection.Forward ? vehicle.Gear > 0 : vehicle.Gear < 0);
         if (confirmed)
         {
             confirmedGear = wantedGear;
@@ -357,7 +361,9 @@ public sealed class Follower
 
     private double Longitudinal(VehicleState vehicle, double reference)
     {
-        double dt = Math.Clamp((vehicle.Utc - lastStepUtc).TotalSeconds, 0.005, 0.05);
+        // dt is the telemetry sample interval now that the state carries the sample timestamp, so
+        // the ceiling has to cover a slow feed (10 Hz) instead of silently halving it.
+        double dt = Math.Clamp((vehicle.Utc - lastStepUtc).TotalSeconds, 0.005, 0.25);
         lastStepUtc = vehicle.Utc;
 
         double speed = Math.Abs(vehicle.SignedSpeed);
@@ -420,7 +426,9 @@ public sealed class Follower
             blockedSince = vehicle.Utc;
 
         double waited = (vehicle.Utc - blockedSince).TotalSeconds;
-        if (waited > settings.ObstacleWaitS)
+        // A DryRun vehicle cannot clear a corridor by definition, so report the block without
+        // letting the wait budget turn a preview into an abort.
+        if (waited > settings.ObstacleWaitS && !settings.DryRun)
             return ControlDemand.Aborted($"路径被挡超过 {settings.ObstacleWaitS:0} s", 0.8f);
 
         status = $"等待障碍离开（{waited:0.0}/{settings.ObstacleWaitS:0.0} s）";
@@ -457,8 +465,13 @@ public sealed class Follower
 
     private ControlDemand? CheckFaults(VehicleState vehicle)
     {
+        // These two faults assume the vehicle responds to what we send. In DryRun nothing is
+        // published, so the truck stays put by design and both fire on a healthy preview: the
+        // stall watchdog at 3 s, and the duration cap on a route that can never advance.
+        bool needsResponse = !settings.DryRun;
+
         double elapsed = (vehicle.Utc - startedAt).TotalSeconds;
-        if (elapsed > settings.MaxDurationS)
+        if (needsResponse && elapsed > settings.MaxDurationS)
             return ControlDemand.Aborted($"超过最长允许时间 {settings.MaxDurationS:0} s", 0.8f);
 
         // Only armed once the vehicle has committed to the route: the very first samples of a
@@ -468,20 +481,28 @@ public sealed class Follower
 
         double speed = Math.Abs(vehicle.SignedSpeed);
         double cap = UnitConversions(Math.Max(settings.ForwardSpeedKph, settings.ReverseSpeedKph)) + 1.0;
-        if (speed > cap)
-            return ControlDemand.Aborted($"速度 {speed * 3.6:0.0} km/h 失控", 1.0f);
 
-        // Give the drivetrain a moment after engaging: pedals settling and the first gear pulse
-        // can otherwise look like a takeover before the route is even being followed.
-        if (settings.UserOverrideEnabled && (vehicle.Utc - startedAt).TotalSeconds > 1.0)
+        // Brake first and only abort if the brake did not work. At creep speed the ceiling sits
+        // barely 1 m/s above the target, so one noisy telemetry sample or the normal overshoot as
+        // a gear takes up must not end the maneuver; a genuinely runaway vehicle stays over the
+        // line for longer than the grace window regardless.
+        if (speed > cap)
         {
-            if (Math.Abs(vehicle.UserSteer) > settings.UserSteerThreshold)
-                return ControlDemand.Aborted($"人类动了方向盘（{vehicle.UserSteer:0.00}）", 0.6f);
-            if (vehicle.UserThrottle > settings.UserThrottleThreshold)
-                return ControlDemand.Aborted($"人类踩了油门（{vehicle.UserThrottle:0.00}）", 0.6f);
-            if (vehicle.UserBrake > settings.UserBrakeThreshold)
-                return ControlDemand.Aborted($"人类踩了刹车（{vehicle.UserBrake:0.00}）", 0.6f);
+            if (overspeedSince == DateTime.MinValue)
+                overspeedSince = vehicle.Utc;
+
+            if ((vehicle.Utc - overspeedSince).TotalSeconds > OverspeedGraceS)
+                return ControlDemand.Aborted($"速度 {speed * 3.6:0.0} km/h，刹了 {OverspeedGraceS:0} s 仍不降到 {cap * 3.6:0.0} km/h 以下", 1.0f);
+
+            status = $"超速 {speed * 3.6:0.0} km/h，紧急制动";
+            // Handbrake as well as the pedal: on the road the pedal alone has not been shown to
+            // slow the vehicle, while the parking brake demonstrably holds it at the finish.
+            return ControlDemand.Hold(1.0f);
         }
+
+        // Hold the timer through a brief dip so repeated spikes still accumulate towards the abort.
+        if (overspeedSince != DateTime.MinValue && speed < cap - 0.3)
+            overspeedSince = DateTime.MinValue;
 
         // Asked to move but staying still for seconds means a kerb, a locked wheel or a gear
         // the game never actually engaged. Abort rather than keep cooking the drivetrain.
@@ -490,7 +511,7 @@ public sealed class Follower
         {
             lastMovementCheckUtc = vehicle.Utc;
         }
-        else if (demandingMovement && (vehicle.Utc - lastMovementCheckUtc).TotalSeconds > 3.0)
+        else if (needsResponse && demandingMovement && (vehicle.Utc - lastMovementCheckUtc).TotalSeconds > 3.0)
         {
             return ControlDemand.Aborted("已给油门但车辆 3 s 未移动（可能卡住或挡位未生效）", 1.0f);
         }

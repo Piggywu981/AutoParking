@@ -63,11 +63,6 @@ public sealed class AutoParkingSettings
     public double ToleranceHeadingDeg { get; set; } = 4.0;
     public double MaxDurationS { get; set; } = 180.0;
 
-    public bool UserOverrideEnabled { get; set; } = true;
-    public double UserSteerThreshold { get; set; } = 0.15;
-    public double UserThrottleThreshold { get; set; } = 0.10;
-    public double UserBrakeThreshold { get; set; } = 0.05;
-
     // Finish behaviour
     public bool HandbrakeOnFinish { get; set; } = true;
     public bool HazardOnFinish { get; set; } = false;
@@ -139,10 +134,6 @@ public sealed class AutoParkingSettings
         ToleranceLateralM = Math.Clamp(ToleranceLateralM, 0.05, 1.0);
         ToleranceHeadingDeg = Math.Clamp(ToleranceHeadingDeg, 1.0, 15.0);
         MaxDurationS = Math.Clamp(MaxDurationS, 30.0, 600.0);
-
-        UserSteerThreshold = Math.Clamp(UserSteerThreshold, 0.05, 0.5);
-        UserThrottleThreshold = Math.Clamp(UserThrottleThreshold, 0.05, 0.5);
-        UserBrakeThreshold = Math.Clamp(UserBrakeThreshold, 0.02, 0.5);
 
         MapScalePxPerM = Math.Clamp(MapScalePxPerM, 0.5, 3.0);
         MapZoom = Math.Clamp(MapZoom, 1.0, 4.0);
