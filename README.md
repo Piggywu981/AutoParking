@@ -29,12 +29,15 @@ Pick a parking spot on a **flat (2D) map**, and the plugin draws it onto the gam
 **AR overlay**, then automatically performs **forward / reverse / gear shifting (automatic
 transmission) / braking / steering** to back the tractor into the spot.
 
-> **Current status: M4 — closed-loop tuning on the real truck.** The planner and controller have
-> been verified offline (see "Self-Test Tools" below). Gear-shift actions are confirmed to reach
-> the game; what still stops a real end-to-end park is **longitudinal authority** (the truck
-> creeps at ~0.5 km/h on long reverse legs, so long maneuvers run out of time) and **another
-> control channel holding throttle during the maneuver**, which overrides our brake and drains the
-> air reservoirs. See "Troubleshooting" for how both are read out of the log.
+> **Current status: M4 — closed-loop verification on the real truck.** The planner and controller have
+> been verified offline (see "Self-Test Tools" below), and gear-shift actions are confirmed to reach the
+> game. The pedal problem was **transport, not tuning**: our throttle/brake values are dispatched through
+> whichever path the host is configured for, and on a build with **Settings → Experiments → Enable Memory
+> Output for Pedals** switched on they land (driver-reported; the log line now says which path ran, so the
+> next run settles whether the ~0.5 km/h creep on long reverse legs was the same cause). What is still
+> open: the echo field that proves a pedal command landed on that path — `user_brake` was measured on the
+> old one — and the identity of the competing channel that averages against our brake and drains the air
+> reservoirs. See "Troubleshooting".
 >
 > **Tractor only — trailers are not supported** (startup is refused by default when a trailer
 > is attached).
@@ -56,11 +59,18 @@ transmission) / braking / steering** to back the tractor into the spot.
    `.csproj` HintPaths point at: `..\..\ETS2LA-win-release-Portable\current\Plugins\` relative to
    this repo root (see `AGENTS.md`).
 3. **Restart ETS2LA** (plugins are shadow-copy loaded; hot reload is unreliable).
+4. **Turn on `Settings → Experiments → Enable Memory Output for Pedals`** in ETS2LA before running a
+   maneuver. Without it the host writes our throttle/brake values into the legacy virtual-gamepad
+   surface, which is where our pedal commands were being lost; the plugin's status table and log line
+   report which path is actually in use (`transport=memory|legacy`). The host documents this toggle as
+   not working on every system, and it may need a game restart to take effect.
 
 Dependencies: the plugin references `ETS2LA.*.dll`, `TruckLib*.dll`, and `Hexa.NET.ImGui.dll`
 under `current\` directly, so it **must live in the same install tree as the ETS2LA host**.
 These references are `Private=false` in the `.csproj`, so host DLLs are not copied into the
-plugin directory.
+plugin directory. The pedal-transport readout calls into `ETS2LA.Game.GameSettings`, so it needs a
+host build from the 2026-09-29 `5299cc9` commit onwards; an older host loads the plugin but throws
+when that row or probe is rendered.
 
 ## 2. Settings Page and Map
 
@@ -86,11 +96,19 @@ are mandatory:
 Where to bind: **Settings → Controls** (the plugin registers controls in `Init()`, so they
 appear in the list right after startup — no need to enable the plugin first).
 
+Note the asymmetry: that focus rule is about **input**, and no host setting changes it. **Output**
+is the other half — with `Enable Memory Output for Pedals` on, our pedal commands keep landing even
+while the game is unfocused. That removes an accidental safety net: clicking away to the map window
+used to cut our pedal authority mid-maneuver, and now it does not. Keep `Abort` bound and reachable.
+
 ## 4. Usage Flow
 
 1. Drive the truck near the parking spot (path length cap: see `MaxTakeoverDistanceM`).
 2. Click/adjust the target pose on the flat map, or use "Saved spot" to recall the last one.
-   The AR overlay draws the spot simultaneously so you can verify that map coordinates line up
+   The click places the spot and takes the truck's current heading; **drag out of the circle that
+   appears to point the nose** (inside ~12 px the direction is ignored — the pivot is under your
+   cursor, so a one-pixel jitter would otherwise pick the heading). The AR overlay draws the spot
+   simultaneously so you can verify that map coordinates line up
    with the actual in-game position.
 3. To preview first, keep **Dry-run on**: all control values are computed and displayed but
    never sent to the game.
@@ -221,13 +239,20 @@ Meaning of a few log lines:
 |---|---|
 | `engaged: … · shift N · conflicts 0, dry-run=…` | Task accepted, following started |
 | `start rejected: …` | Which rule from §4 refused the start |
-| `brake probe sent_accel=-0.50 … user_brake=0.50` | Actual signed value sent + game's echo. When `sent_accel` is negative you should see `user_brake` rise and `user_throttle` stay 0 |
+| `brake probe transport=memory sent_accel=-0.50 … user_brake=0.50` | Which pedal transport the host used, the signed value we sent, and the game's echo. On the `legacy` transport a negative `sent_accel` reliably shows up as `user_brake` rising with `user_throttle` at 0; **that mapping has not been re-measured under `memory`**, so trust `air=` (transport-independent) first |
 | `gear probe request=Reverse → gear=0 dash=-1 … shifter_type=…` | One line per gear pulse, with the stage that asked. `shifter_type` decides whether this truck accepts `gear_drive/gear_reverse`. **`gear=0` with `dash=-1` is normal**: an automatic falls back to neutral at every standstill, so confirmation reads either signal — a pulse storm here means that latch is failing |
 | `controls registered (…Toggle / .Abort)` | One line at startup; missing means `Init()` never ran |
 
-Four field observations that each turned out to be a real bug, with the tell that found it —
-all recorded with evidence in `docs\2026-09-30-autoparking-design.md` §17–§22:
+Six field observations that each turned out to be a real bug or a real constraint, with the tell
+that found it — all recorded with evidence in
+`docs\2026-09-30-autoparking-design.md` §17–§25:
 
+- **Pedals do nothing (or stop the moment you click the overlay)** → read `transport=` on the brake
+  probe / the **pedal transport** status row. `legacy` means the host routes our throttle and brake
+  through the virtual-gamepad surface, where unfocused input is dropped entirely; `memory` means they
+  are written straight to memory and survive focus loss. Turn on
+  **Settings → Experiments → Enable Memory Output for Pedals** — that is what cleared our pedal
+  problem, and it was never a PID issue. It does not work on every system.
 - **Braking does nothing, the truck keeps rolling** → read `air=` and `brake_temp=`. ETS2's service
   brake works through the air circuit: at `air≈0` the pedal value is physically inert. Sustained
   braking against a competing throttle drains it, which is why the status table has a
@@ -240,6 +265,15 @@ all recorded with evidence in `docs\2026-09-30-autoparking-design.md` §17–§2
 - **The wheel does not move** during a leg → first check whether that leg is a straight. `steer=0`
   on a straight reverse-in is correct output; only treat it as a fault when `cross` is also
   nonzero (which means the stale-anchor case above).
+- **The spot ends up facing a random way** → the orientation is whatever the drag says *once you are
+  outside the dead-zone circle*, because the click puts the pivot under your cursor; a drag of one or
+  two pixels used to be enough to pick an arbitrary angle. Resizing the map panel is now disabled
+  (`NoResize`): pressing near the map edge used to grab ImGui's resize border instead, and since the
+  projection is recomputed every frame, the spot slid out from under the drag. **You can still move
+  the panel by its title bar** — that can never collide with a pick, because the title bar sits above
+  the canvas rectangle and the projection is latched when the button goes down. The
+  `选位开始 / 选位结束` log lines carry the drag radius, how far the map slid in between and whether the
+  canvas moved, so a single run says which of the three is still wrong.
 - **Gear pulses repeat at ~1 Hz** → the automatic dropping to neutral at standstill is normal;
   confirmation must accept the dashboard reading. A pulse storm means it does not.
 
@@ -250,10 +284,15 @@ Two older pitfalls, still the first things to suspect:
    fields ⇒ they average into half throttle. The correct approach is to send **one signed
    field**.
 2. **`user_*` is the virtual gamepad's echo**: values injected via the SDK show up in `user_*`
-   as "player input". Do not use them to judge "is a human driving" — it will misfire.
+   as "player input". Do not use them to judge "is a human driving" — it will misfire. Note that
+   this echo is where we *proved* braking worked back on the `legacy` transport; under `memory`
+   output the commands go in through a different surface, so which echo field corresponds has not
+   been re-measured. `air=` is the transport-independent tell.
 
 Settings file: `%APPDATA%\ETS2LA\AutoParking.json` (includes the last selected spot; survives
-plugin reloads). Logging uses Spectre.Console markup — **bare `[Tag]` in messages is silently
+plugin reloads). The host's pedal-transport switch is a sibling file in the same folder,
+`GameSettings.json` (`EnableModernOutputForPedals`) — it is not one of our settings.
+Logging uses Spectre.Console markup — **bare `[Tag]` in messages is silently
 swallowed**.
 
 ## 9. References

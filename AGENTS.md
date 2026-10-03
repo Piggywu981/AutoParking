@@ -2,7 +2,7 @@
 
 Working notes for anyone (human or agent) editing this plugin. Every rule below exists because
 breaking it caused a real bug or a lost day; full provenance in
-`docs\2026-09-30-autoparking-design.md` §17–§23.
+`docs\2026-09-30-autoparking-design.md` §17–§25.
 
 ## Commands
 
@@ -59,13 +59,19 @@ plugin's own tolerances, which is how it catches regressions the game would stil
 - **`README.md` and `README.zh-CN.md` are mirrors.** Edit both in the same change; the English one
   is the source.
 
-## Two host behaviors that have each cost a debugging session
+## Three host behaviors that have each cost a debugging session
 
 - `aforward` and `abackward` are folded into a **single `acceleration` bucket that is
   weighted-averaged across every publishing channel**, then split by sign. Writing both fields
   turns a brake demand into half throttle; a low `ControlWeight` means another plugin's request
   wins. Send one signed value. And read `air=` before concluding a brake did nothing — the service
   brake is air-circuit based, so at 0 bar the pedal value is physically inert.
+- **The averaging happens before the transport branch, the echoes happen after.** Where our pedals
+  physically go depends on the host's `EnableModernOutputForPedals` (Experiments page): off = the
+  legacy virtual-gamepad surface, on = written straight to memory, which also keeps working while
+  the game is unfocused. So `user_brake` proving a command landed is a **legacy-transport**
+  measurement, not a universal law — which is why the brake probe prints `transport=memory|legacy`.
+  Gear and handbrake pulses always take the legacy path. See design doc §24.
 - `truckFloat.user_*` is the virtual gamepad's echo: SDK-injected commands show up there as
   "player input". Never use `user_*` to decide whether a human is driving. Also, `ETS2LA.Logging`
   renders Spectre.Console markup, so a bare `[Tag]` inside a message is silently swallowed —

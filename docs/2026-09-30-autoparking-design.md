@@ -464,6 +464,11 @@ V2 到点减速公式作为兜底叠加：`a_stop = -v²/(2*max(s_left-0.5, 0.2)
 
 留接口不留实现：`Planner` 的输入是"位姿 + 运动学模型"抽象（`IKinematicModel`），v2 可插入铰接模型（前向用倒车等价变换、`trailerHeading` 由 `trailers[0].comDouble.worldRotation` 得到）；`Safety` 的挡位/挂车校验已按可扩展点组织。自动摘挂依赖游戏侧 `quickpark` 或视觉对位，届时单独设计。
 
+两条来自 ETS2LA Discord（2026-09-28，delilevente 的自动泊车帖）的备忘，等做挂车时再取用：
+
+- **目标位姿不必让用户在地图上点**：接任务时游戏已经把车位写进存档——`player_job.selected_target`（0 easy / 1 medium / 2 hard / 3 rigid）选出四组 `target_placement_*` 字段中的哪一组持有坐标与朝向。他声称在 12 个存档上零错配，并在两处货场与地图数据对上了（sarajevo hard 167.9° 精确到小数、bordeaux medium 误差 0.0 m）。**代价先记清楚**：`SourceCode` 里没有任何读 `game.sii` 的代码（`game.sii` / `player_job` / `selected_target` / `target_placement` 四个词全库零命中），所以这条要自带存档定位与解析，而且要处理"读到的可能是上一次落盘的旧值"。
+- **验收判据用游戏自己的信号，别自己造容差**：挂车到位时游戏会往 HUD 通知队列里塞 `@@unload_load@@`，是活的（非事后）状态且语言无关（拿到的是未解析模板而不是译文）。他另外追过 detach 按钮的完整代码路径：**里面根本没有泊车检查**，只有速度门 + 两个 map trigger flag + 状态机。也就是说"歪多少就不认"这件事是队列信号决定的，不是我们设的 `ToleranceLateralM` / `ToleranceHeadingDeg` 决定的——那两个数现在是我拍的，届时应当换成实测阈值。
+
 ---
 
 ## 16. 决策记录（本仓库内已定）
@@ -970,3 +975,69 @@ user_brake=0.00 user_throttle=0.60 恒定；我们发 brake=0.50~0.82
 | `git check-ignore` | `Tools\**\bin`、`Tools\**\obj` 已被既有的 `bin/`、`obj/` 规则覆盖，`.gitignore` 不用改 |
 
 **遗留**：旧目录 `..\..\scratch\PlannerHarness\` 只剩 `bin\`、`obj\` 两份生成物，源码已搬空；自动模式下对工作区外的删除被拦，需要手动删。
+
+---
+
+## 24. 踏板走的是哪条通路：宿主实验开关的身份与影响（2026-10-03）
+
+**背景**：§21/§22 之后一直挂着"纵向权限不足"。其中**踏板这一半的原因不在我们的 PID 里**（长倒库爬行是否同一因，见文末待测）。ETS2LA 在 2026-09-29 18:06 加了提交 `5299cc9 "Add option to enable memory output for pedals"`，用户于 2026-10-02 22:47 打开后踏板问题消失（**这条是用户实车反馈，不是我测的**）。
+
+**开关**：设置 → Experiments → **Enable Memory Output for Pedals**，落盘在 `%APPDATA%\ETS2LA\GameSettings.json` 的 `EnableModernOutputForPedals`（默认 false），UI 自己提示"改完可能要重启游戏"。Tumppi066 在 Discord（2026-09-29 17:20）解释过为什么默认关闭：*"Our memory implementation (the same one we use for steering) doesn't work for everyone, so it's not enabled."*；同一天 23:00 他又说明失焦时*"the game doesn't allow any inputs if you're tabbed out"*，而 memory 写入绕开这一层。
+
+**分发代码事实**（`ETS2LA.Game\Output\Output.cs`，宿主最新版）：
+
+- `:217-218` 把 `aforward`/`abackward` 折叠成同一个 `acceleration` 桶，**不取反**；
+- `:289-291` 跨通道**加权平均**发生在传输分支**之前**；
+- `:301-306` 开关打开时，带符号的 `weightedValue` 原样写进 modern 面 offset 13（另 17=bool、18=时间戳）；
+- `:309-318` 关闭时才按符号拆回 legacy 的 `aforward`/`abackward` 两个字段；
+- 布尔动作（挡位、手刹）**始终** legacy（`:207`、`:209`），不受这个开关影响。
+
+**对我们三件事：**
+
+1. **代码一行都不用改**："只发一个有符号字段"的约定在两条通路上同时成立（§17 那次符号修复没有白做，反而在 memory 通路上更直）。上面第 2 条也说明 §21 的权重结论与传输层无关，**不收窄、不推翻**。
+2. **但观测面变了**：`truckFloat.userBrake/userThrottle` 是 legacy 虚拟手柄面的回声。踏板改走 modern 面之后，"`user_brake=0.50` 就证明指令进了游戏"这条推理**不再自动成立**，需要重测才知道哪个回声字段对应哪条通路。气压 `air=` 是物理量、与通路无关，仍然是最硬的那条证据。
+3. **多了一个看不见的前提**：memory 通路失焦也生效。热键仍必须（那是**输入**侧，SCS SDK 失焦不吃输入，与本开关无关），但以前"人一切走踏板就失效"其实是游戏替我们兜了一层底——现在这层底没了。§18 的"只在停着时重算"、"永不自动中止"这类约束因此更需要 `Abort` 手不离键。
+
+**已做**：`制动探针` 每行前面加 `transport=memory|legacy`，状态表加"踏板通路"一行。取值来自 `ETS2LA.Game.GameSettings.Current.EnableModernOutputForPedals`（public static，我们本来就引用 `ETS2LA.Game.dll`，**没有修改宿主**）。这样任何一条历史 trace 从此自带通路信息，不必再靠日期去猜当时是哪条路。构建 0 错误、警告数不变（13）。
+
+**待测**：长倒库段 0.5 km/h 爬行是否随开关消失（若已消失，README 状态栏那句"纵向权限不足"就该删）；memory 通路下 `user_*` 与 `game_*` 谁在回声我们的指令；≈14 那个对手通道的身份仍未定。
+
+---
+
+## 25. 地图选位：朝向由第一像素抖动决定，而拖动期间参考系在动（2026-10-03，用户报"B：在地图里拖动，整个窗口跟着走"）
+
+**用户观察**：覆盖层窗口一动，就只能选到大致位置，**车头朝向是随机的**。
+
+**代码能直接证明的缺陷（不需要复现）**：`MapOverlay.HandleMouse` 按下时把车位放在光标底下，随后用
+`delta = mouse − ToCanvas(target)` 算朝向。按下那一帧两者**重合**，`delta` 恰为 0，唯一的守卫是
+`delta.X != 0 || delta.Y != 0`——于是真正决定朝向的是**按下后第一像素的抖动方向**，`atan2` 对一个 1 px
+矢量的角度毫无意义。harness 里加了一条判据先让它失败（`选位拖动死区`：1 px 抖动被忽略=False），
+再实现 `Geometry.TryHeadingFromDrag` 的最小死区（12 px）使其通过；`Geometry.cs` 属于 harness 链接的纯数学子集，
+所以这条能离线钉住。
+
+**为什么拖动期间参考系不可信（两条机制，同一修法）**：
+
+1. **窗口边框是 ImGui 的缩放手柄。** 我们没有设 `Flags`，宿主就按 `ImGuiWindowFlags.None` 开窗口
+   （`Overlay.cs:385`），于是窗口可移动可缩放；而地图画布只离窗边 `Padding = 8 px`，落在缩放抓取区内。
+   按在画布边缘 = 同时在按窗边：拖左边/上边框会**连窗口原点一起移动**，看起来就是"窗口跟着鼠标走"。
+   宿主在 `Overlay.cs:367` 明写了 *"Use ImGuiWindowFlags to disallow movement"*，我们没采纳。
+2. **投影每帧重算，而图是跟着车滚的。** 地图中心是 `truck.Position`，`canvasCenter` 又来自
+   `ImGui.GetWindowPos()`；拖动过程中车在动（M4 现成的爬行）或窗口在动，车位就会从光标底下滑走，
+   `delta` 跟着跳——朝向追的是车/窗口，不是手。
+
+**修法（一次改完，都指向"这次手势的参考系必须钉住"）**：
+
+- 窗口 `Flags = ImGuiWindowFlags.NoResize`；
+- 按下时**锁存** `canvasCenter / truckPlane / scale / canvasMin`，整次拖动都用这套投影，中途窗口或车位姿变化不再影响手势；
+- `Geometry.TryHeadingFromDrag(pivot, cursor, 12 px)` 死区，短于死区保持点击时的朝向（吸附导航线或车头方向）；
+- 拖动时画出**死区圈 + 车位到光标的指示线**，让"我正在划哪个方向"看得见，而不是松手才发现歪了。
+
+**一次回退（记下来免得后人以为 NoMove 是被否决的方案）**：第一版是 `NoResize | NoMove`，用户实测确认"窗口的确移动不了了"，随后要求**保留可拖动、同时选位正常**。最终只留 `NoResize`：ImGui 只在标题栏移动窗口，而标题栏在画布矩形之外，永远不会被当成选位按下——两个手势在空间上不相交；吃掉按下的是**边框缩放手柄**，那才是必须禁的那个。窗口被挪动对选位也不再有影响，因为投影在按下那一刻锁存。窗口的初始位置仍是 `X=24, Y=180`，宿主按 `ImGuiCond.Once` 只在首次打开时施加（`Overlay.cs:389-397`），所以本次会话里拖到哪就停在哪；跨启动能不能记住取决于宿主的 ImGui ini，我没有验证过。
+
+**证据**：选位开始/结束各一行日志——世界坐标、是否吸附、比例、画布左上角、拖动半径、以及
+`期间地图滑动=? px`、`画布位移=? px`。后两个数就是判别器：如果下次还乱，`画布位移>0` 说明窗口仍在被拖
+（flags 没生效或被宿主覆盖），`地图滑动>0` 说明是车在动导致的投影漂移，两个都是 0 而朝向仍不对才是手势逻辑本身的问题。
+
+**仍未修的已知缺口**：`HandleMouse` 读的是**全局**鼠标状态（`IsMouseClicked` 没带窗口作用域的 flags，
+ImGui 1.92 支持），只靠"鼠标落在画布矩形内"过滤。所以按住 RightAlt 时点在别的窗口上、只要落点在我们的
+矩形内，仍会重放车位。这条我没顺手改，因为它与"窗口跟着走"不是同一个根因，要单独验证。

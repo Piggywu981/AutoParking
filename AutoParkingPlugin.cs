@@ -91,6 +91,14 @@ public sealed class AutoParkingPlugin : Plugin
         return latestTelemetry.truckFloat.airPressure > (emergency > 0.0f ? emergency : 20.0f);
     }
 
+    /// <summary>
+    ///  Which transport the host used for our pedals during this run. The two are different memory
+    ///  surfaces, so the same log line means something different depending on this: on `legacy` our
+    ///  value lands on the virtual gamepad and reads back through `user_*`, on `memory` it goes into
+    ///  the SDK analog slot. Gear and handbrake pulses always take the legacy path.
+    /// </summary>
+    private static string PedalTransport => ETS2LA.Game.GameSettings.Current.EnableModernOutputForPedals ? "memory" : "legacy";
+
     // Restored when the maneuver ends, unless the user changed them in the meantime.
     private bool hadAssistSnapshot;
     private bool savedEnableAssists;
@@ -482,10 +490,12 @@ public sealed class AutoParkingPlugin : Plugin
             gear = latestTelemetry.truckInt.gear;
         }
 
-        // user*, not game*: the SCS virtual controller arrives as a player device, so game_brake
-        // stays zero no matter how hard we brake. Air pressure is the physical tell - it falls
-        // only when the brake is actually applied at the wheels.
-        Logger.Info($"AutoParking: 制动探针 v={Math.Abs(state.SignedSpeed) * 3.6:0.0} km/h " +
+        // Measured on the legacy transport: the SCS virtual controller arrives as a player device, so
+        // game_brake stayed zero no matter how hard we braked and user_brake was the echo to read.
+        // Under `memory` output that has not been re-measured, which is why the transport is printed
+        // here. Air pressure is transport-independent - it falls only when the brake is actually
+        // applied at the wheels, so it stays the hardest evidence of the three.
+        Logger.Info($"AutoParking: 制动探针 transport={PedalTransport} v={Math.Abs(state.SignedSpeed) * 3.6:0.0} km/h " +
                     $"sent_accel={output.LastAcceleration:0.00} (brake={demand.Brake:0.00} throttle={demand.Throttle:0.00}) " +
                     $"steer={output.LastSteer:0.00} 剩={active.RemainingDistance:0.0} 横={active.CrossTrackErrorMeters:0.00} " +
                     $"航向差={active.HeadingErrorDegrees:0.0} " +
@@ -1330,6 +1340,7 @@ public sealed class AutoParkingPlugin : Plugin
                     { "人工输入", lastRawUserInputs },
                     { "制动能力", $"{latestTelemetry.truckFloat.airPressure:0.0} bar（应急 {latestTelemetry.configFloat.airPressureEmergency:0.0}）" +
                                 (HasBrakeAir() ? "" : " · 行车制动无效") },
+                    { "踏板通路", $"{PedalTransport}（memory=直写内存，失焦仍生效；legacy=虚拟手柄，失焦即失效；挡位/手刹恒走 legacy）" },
                     { "最小转弯半径", $"{Kinematics.MinTurnRadius(settings):0.00} m" },
                     { "地面基准", $"{GroundContactOffsetNoLock:0.00} m（+微调 {settings.ArGroundTrimM:0.00}）" },
                     { "地图数据", mapStatus },

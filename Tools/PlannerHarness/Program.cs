@@ -105,8 +105,19 @@ ClosedLoop.Outcome overshot = ClosedLoop.Run("刹不住冲过预热点", new Pos
 bool unwinds = overshot.FullLockSeconds < 60.0;
 Console.WriteLine($"  {(unwinds ? "✓" : "✗")} {overshot.Name}: 满舵 {overshot.FullLockSeconds:0.0} s（判据 < 60 s，不能钉死）· {overshot.Status}");
 
+// 选位拖动：按下那一刻车位就落在光标底下，所以"划方向"的起点与终点重合，
+// 第一个像素的抖动就决定了车头朝向。判据：短于死区的拖动不得改朝向，
+// 超过死区的拖动必须等于朝那个方向。
+bool jitterIgnored = !Geometry.TryHeadingFromDrag(new Vector2(100, 100), new Vector2(101, 100), 12.0, out _);
+bool deliberate = Geometry.TryHeadingFromDrag(new Vector2(100, 100), new Vector2(140, 100), 12.0, out double dragged);
+double dragErrorDeg = deliberate
+    ? Math.Abs(Geometry.SmallestAngleDifference(dragged, Geometry.HeadingFromForward(new Vector2(1, 0)))) * 180.0 / Math.PI
+    : double.PositiveInfinity;
+bool pickDragOk = jitterIgnored && deliberate && dragErrorDeg < 1e-6;
+Console.WriteLine($"  {(pickDragOk ? "✓" : "✗")} 选位拖动死区：1 px 抖动被忽略={jitterIgnored} · 40 px 生效={deliberate} · 与正东夹角 {dragErrorDeg:0.000}°");
+
 return report.Failures.Count == 0 && simPassed == 5 && keptGoing && stagedLeg.Reached
-    && replanWorks && autoNeutralOk && unwinds && watchdogWorks ? 0 : 1;
+    && replanWorks && autoNeutralOk && unwinds && watchdogWorks && pickDragOk ? 0 : 1;
 
 // The recession watchdog needs states that make the distance grow. Nothing in the closed loop does
 // that any more - the window fix removed the pinning that used to - so it is fed synthetic ones:

@@ -59,6 +59,22 @@ public static class Geometry
     }
 
     /// <summary>
+    ///  The orientation a pick-drag is asking for. The pivot sits under the cursor at press time, so
+    ///  the first frames of every drag have a one-pixel delta - and the angle of a one-pixel vector is
+    ///  noise. Below `minPixels` the gesture has not expressed an orientation yet and the caller must
+    ///  keep the previous heading rather than take this one.
+    /// </summary>
+    public static bool TryHeadingFromDrag(Vector2 pivot, Vector2 cursor, double minPixels, out double headingRad)
+    {
+        headingRad = 0.0;
+        if (Distance(pivot, cursor) < minPixels)
+            return false;
+
+        headingRad = HeadingFromForward(cursor - pivot);
+        return true;
+    }
+
+    /// <summary>
     ///  Unit left normal of a heading. With forward = (-sin h, -cos h) the left direction is
     ///  (-cos h, sin h), which is also Cross(UnitY, forward) in the game's XZ plane.
     /// </summary>

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using ETS2LA.Logging;
 using ETS2LA.Overlay;
 using Hexa.NET.ImGui;
 
@@ -18,6 +19,13 @@ internal sealed class MapOverlay
     public const int WindowWidth = 560;
     public const int WindowHeight = 560;
     private const float Padding = 8f;
+
+    /// <summary>
+    ///  How far the cursor has to leave the spot before a drag counts as "this orientation". The
+    ///  pivot is under the cursor when the button goes down, so without a dead zone the first pixel
+    ///  of jitter picks the heading - see Geometry.TryHeadingFromDrag.
+    /// </summary>
+    private const double HeadingDeadZonePx = 12.0;
 
     // Packed the same way Dear ImGui's IM_COL32 does (r | g<<8 | b<<16 | a<<24) so these
     // constants are safe to compute before the ImGui context exists.
@@ -49,6 +57,14 @@ internal sealed class MapOverlay
     private bool registered;
     private bool draggingHeading;
 
+    // The projection latched when the pick-drag started. The map is drawn centred on the truck and
+    // the truck moves, so a drag measured against the live projection is a race: the spot slides
+    // under the cursor and the gesture's angle follows the truck instead of the hand.
+    private Vector2 dragCanvasCenter;
+    private Vector2 dragTruckPlane;
+    private float dragScale;
+    private Vector2 dragCanvasMin;
+
     public MapOverlay(AutoParkingPlugin plugin)
     {
         this.plugin = plugin;
@@ -62,6 +78,12 @@ internal sealed class MapOverlay
         definition = new WindowDefinition
         {
             Title = WindowTitle,
+            // NoResize only. The whole window border is an ImGui resize grab and the canvas reaches
+            // to within Padding of it, so a press meant for the map edge was grabbing the border
+            // instead - and the window rect, which the projection reads every frame, moved under the
+            // drag. Moving the panel stays allowed: ImGui drags a window from its title bar only,
+            // which is above the canvas rectangle and therefore never read as a pick.
+            Flags = ImGuiWindowFlags.NoResize,
             Width = WindowWidth,
             Height = WindowHeight,
             X = 24,
@@ -287,11 +309,22 @@ internal sealed class MapOverlay
             double reference = plugin.CurrentPose.HeadingRad;
             Pose2 pose = new(world.X, world.Y, reference);
 
+            bool snappedToCurve = false;
             if (settings.SnapToNavCurve && geometry.TrySnapToCurve(world, 3.0, reference, out Pose2 snapped))
+            {
                 pose = snapped;
+                snappedToCurve = true;
+            }
 
             plugin.SetTarget(pose);
             draggingHeading = true;
+            dragCanvasCenter = canvasCenter;
+            dragTruckPlane = truckPlane;
+            dragScale = scale;
+            dragCanvasMin = canvasMin;
+
+            Logger.Info($"AutoParking: 选位开始 世界=({pose.X:0.00}, {pose.Z:0.00}) 吸附导航线={snappedToCurve} " +
+                        $"朝向={pose.YawDegrees:0.0}° 画布左上=({canvasMin.X:0}, {canvasMin.Y:0}) 比例={scale:0.00}px/m");
             return;
         }
 
@@ -304,16 +337,30 @@ internal sealed class MapOverlay
                 return;
             }
 
-            Vector2 targetCanvas = ToCanvas(current.Value.Position, canvasCenter, truckPlane, scale);
-            Vector2 delta = mouse - targetCanvas;
-            if (delta.X != 0f || delta.Y != 0f)
-                plugin.SetTargetTransient(current.Value.WithHeading(Geometry.HeadingFromForward(delta)));
+            // Measured against the latched projection: whatever the truck or the window does between
+            // these two frames, the pivot stays put under the cursor.
+            Vector2 pivot = ToCanvas(current.Value.Position, dragCanvasCenter, dragTruckPlane, dragScale);
+            if (Geometry.TryHeadingFromDrag(pivot, mouse, HeadingDeadZonePx, out double heading))
+                plugin.SetTargetTransient(current.Value.WithHeading(heading));
+
+            ImDrawListPtr canvas = ImGui.GetWindowDrawList();
+            canvas.AddCircle(pivot, (float)HeadingDeadZonePx, ColorGrid, 0, 1f);
+            canvas.AddLine(pivot, mouse, ColorTarget, 1.5f);
         }
 
         if (ImGui.IsMouseReleased(ImGuiMouseButton.Left))
         {
-            if (draggingHeading && plugin.TargetPose != null)
-                plugin.SetTarget(plugin.TargetPose.Value);   // persist once, on release
+            if (draggingHeading && plugin.TargetPose.HasValue)
+            {
+                Pose2 released = plugin.TargetPose.Value;
+                Vector2 pivot = ToCanvas(released.Position, dragCanvasCenter, dragTruckPlane, dragScale);
+                double radius = Geometry.Distance(pivot, mouse);
+                double mapSlid = Geometry.Distance(dragTruckPlane, truckPlane) * dragScale;
+                double rectMoved = Geometry.Distance(dragCanvasMin, canvasMin);
+                Logger.Info($"AutoParking: 选位结束 朝向={released.YawDegrees:0.0}° 拖动={radius:0} px（死区 {HeadingDeadZonePx:0}）" +
+                            $" 期间地图滑动={mapSlid:0} px 画布位移={rectMoved:0} px");
+                plugin.SetTarget(released);   // persist once, on release
+            }
 
             draggingHeading = false;
         }
