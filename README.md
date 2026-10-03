@@ -5,10 +5,11 @@ Pick a parking spot on a **flat (2D) map**, and the plugin draws it onto the gam
 transmission) / braking / steering** to back the tractor into the spot.
 
 > **Current status: M4 — closed-loop tuning on the real truck.** The planner and controller have
-> been verified offline (see "Self-Test Tools" below), but one issue remains unresolved on the
-> real vehicle: **gear-shift commands (boolean actions) are not being engaged by the game**, so
-> the truck stalls waiting for the gear. The "Troubleshooting" section of this document records
-> how to narrow it down step by step.
+> been verified offline (see "Self-Test Tools" below). Gear-shift actions are confirmed to reach
+> the game; what still stops a real end-to-end park is **longitudinal authority** (the truck
+> creeps at ~0.5 km/h on long reverse legs, so long maneuvers run out of time) and **another
+> control channel holding throttle during the maneuver**, which overrides our brake and drains the
+> air reservoirs. See "Troubleshooting" for how both are read out of the log.
 >
 > **Tractor only — trailers are not supported** (startup is refused by default when a trailer
 > is attached).
@@ -97,7 +98,7 @@ path unsolvable or blocked by an obstacle / path too long.
 | Tolerance | `ToleranceLateralM` / `ToleranceHeadingDeg` | 0.20 / 4.0 | What counts as "in place" |
 | | `ObstacleMarginM` | 0.5 | Vehicle footprint outward expansion |
 | | `ObstacleLookaheadM` | 4.0 | Only conflicts this far ahead stop the truck. Note the swept footprint is ~8 m long, so a blocker registers about 7.5 m out regardless of this number |
-| Re-planning | `ReplanWhileStopped` | true | Re-solve the route **only while the vehicle is stopped** — at a gear change, or after 2 s held by a blocker. Never mid-drive: a new route shares the pose but not the arc length, and the progress estimator cannot tell the two references apart |
+| Re-planning | `ReplanWhileStopped` | true | Re-solve the route **only while the vehicle is stopped** — at a gear change, after 2 s held by a blocker, or when the distance to the spot starts growing instead of shrinking (a second-segment correction). Never mid-drive: a new route shares the pose but not the arc length, and the progress estimator cannot tell the two references apart |
 | | `MaxReplans` | 3 | Cap on swaps; after it the route is frozen again. Hitting the cap does **not** abort — only the hotkey ends the maneuver |
 | Finish | `HandbrakeOnFinish` / `RestoreAssistsOnFinish` | true | Apply handbrake and restore driver assists on completion |
 | Visualization | `MapScalePxPerM` / `MapZoom` / `MapViewRadiusM` / `SnapToNavCurve` | 1.25 / 1.0 / 120 / true | |
@@ -131,11 +132,15 @@ whole parking maneuver.
 ### 6.3 Offline Closed-Loop Simulation (outside the repo, `scratch\PlannerHarness`)
 A bicycle model drives the real `Follower`, reporting lateral/heading error, gear-pulse
 counts, and steering quality metrics (full-lock duration, steering reversals, total steering
-wheel travel). There is also a **deaf gearbox** case (gear pulses never engage) verifying that
-"waiting for the gear" degrades to "keep driving and re-send pulses" instead of waiting
-forever, and a **blocker appears mid-maneuver** case that runs the same geometry twice: with
-re-planning off the truck holds until the budget runs out, with it on the truck re-solves from
-where it is standing and reaches the spot.
+wheel travel. Named cases, each one added to pin down a bug that was only visible in a trace:
+**deaf gearbox** (pulses never engage — must degrade to "keep driving and re-send" instead of
+waiting forever), **blocker appears mid-maneuver** (re-planning off holds until the budget runs
+out, on reaches the spot), **automatic that drops to neutral at a standstill** (gear confirmation
+must accept the dashboard reading, or one shift costs 110 pulses), **two-segment shuttle** (the
+only multi-leg route; it used to drive through the target with `remaining` frozen), **unstopppable
+overshoot** (must not pin the wheel chasing an aim point that ended up behind the truck), and a
+synthetic **recession** sequence that feeds states where the distance to the spot grows, so the
+"stop and re-solve a correction" watchdog is actually exercised.
 It lives outside the plugin directory because the plugin `.csproj` uses default globbing —
 any `.cs` file would be compiled into the DLL.
 
@@ -183,8 +188,25 @@ Meaning of a few log lines:
 | `gear probe request=Reverse → gear=0 dash=-1 … shifter_type=…` | One line per gear pulse, with the stage that asked. `shifter_type` decides whether this truck accepts `gear_drive/gear_reverse`. **`gear=0` with `dash=-1` is normal**: an automatic falls back to neutral at every standstill, so confirmation reads either signal — a pulse storm here means that latch is failing |
 | `controls registered (…Toggle / .Abort)` | One line at startup; missing means `Init()` never ran |
 
-Two pitfalls already hit — documented in `docs\2026-09-30-autoparking-design.md` §17; check
-them first when you see similar symptoms:
+Four field observations that each turned out to be a real bug, with the tell that found it —
+all recorded with evidence in `docs\2026-09-30-autoparking-design.md` §17–§22:
+
+- **Braking does nothing, the truck keeps rolling** → read `air=` and `brake_temp=`. ETS2's service
+  brake works through the air circuit: at `air≈0` the pedal value is physically inert. Sustained
+  braking against a competing throttle drains it, which is why the status table has a
+  **braking capability** row and why the parking brake (a different circuit) takes over inside the
+  last 2 m of the route.
+- **`remaining` stops shrinking** (or the truck drives through the spot while the display still
+  reads 12 m) → the arc-length projection has pinned. Check `remaining` / `cross` / `heading err`
+  in the brake probe: if the errors stay near zero while the truck visibly leaves the line, the
+  anchor is stale, not the steering law.
+- **The wheel does not move** during a leg → first check whether that leg is a straight. `steer=0`
+  on a straight reverse-in is correct output; only treat it as a fault when `cross` is also
+  nonzero (which means the stale-anchor case above).
+- **Gear pulses repeat at ~1 Hz** → the automatic dropping to neutral at standstill is normal;
+  confirmation must accept the dashboard reading. A pulse storm means it does not.
+
+Two older pitfalls, still the first things to suspect:
 
 1. **Brake becomes throttle**: the host folds `aforward`/`abackward` into a single
    `acceleration` bucket with a weighted average, then dispatches by sign. Sending both
