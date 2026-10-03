@@ -53,10 +53,17 @@ public sealed class Follower
         Finished
     }
 
-    private readonly ParkingPath path;
+    private ParkingPath path;
     private readonly AutoParkingSettings settings;
     private readonly double wheelbase;
     private readonly double maxCurvature;
+    private readonly Pose2 goal;
+
+    /// <summary>
+    ///  Asks for a fresh route from a pose we are standing at. Null means "nothing better". The
+    ///  follower never solves anything itself - it only decides when to ask and whether to accept.
+    /// </summary>
+    private readonly Func<Pose2, ObstacleSnapshot, ParkingPath?>? replanner;
 
     // A gear request is a 50 ms edge that the game may or may not take, and nothing observed can
     // stop the maneuver - only the hotkey can. So retry a few times, then drive off in the
@@ -64,15 +71,37 @@ public sealed class Follower
     private const double GearPulseRetrySeconds = 1.0;
     private const int GearPulseMaxAttempts = 4;
 
+    // How long to insist on a full stop before the shift is asked for anyway.
+    private const double GearStopPatienceSeconds = 4.0;
+
+        // How far outside the leg being driven the nearest-point projection may reach. The lower
+        // edge gets no slack: with a metre of it, a route whose reverse leg lies on top of the
+        // approach leaves the projection sitting on an approach sample, and the per-tick advance
+        // limit is smaller than the gap to the next leg's first sample - so progress freezes for
+        // good while the truck drives the leg correctly and straight through the target.
+        private const double LegWindowM = 1.0;
+
+    // A blocked route is worth re-solving once we have waited long enough that it is not a car
+    // momentarily creeping past. At a gear boundary, adopt a new route only if it is meaningfully
+    // shorter - otherwise two near-equal maneuvers alternate and the driver sees the plan flip.
+    private const double BlockedReplanSeconds = 2.0;
+    private const double BlockedForgetSeconds = 2.0;
+    private const double ReplanImprovementMarginM = 0.5;
+
+    // How much the distance to the spot may grow before we call it a lost reference.
+    private const double RecessionM = 0.6;
+
     private readonly List<Run> runs = new();
 
     private Stage stage = Stage.SelectGear;
     private int index;
+    private int runIndex;
     private double progress;
     private DriveDirection wantedGear;
     private DriveDirection? confirmedGear;
     private bool gearConfirmed;
     private DateTime gearPulseAt = DateTime.MinValue;
+    private DateTime gearStopSinceUtc = DateTime.MinValue;
     private int gearAttempts;
     private DateTime startedAt = DateTime.MinValue;
     private DateTime lastStepUtc = DateTime.MinValue;
@@ -82,6 +111,10 @@ public sealed class Follower
     private double lastError;
     private double lastSteer;
     private DateTime blockedSince = DateTime.MinValue;
+    private DateTime lastBlockedUtc = DateTime.MinValue;
+    private DateTime nextReplanUtc = DateTime.MinValue;
+    private double bestRemaining = double.MaxValue;
+    private bool recovering;
     private string status = "等待";
 
     private readonly struct Run
@@ -98,18 +131,26 @@ public sealed class Follower
         public double End { get; }
     }
 
-    public Follower(ParkingPath path, AutoParkingSettings settings, double wheelbase)
+    public Follower(ParkingPath path, AutoParkingSettings settings, double wheelbase,
+                    Func<Pose2, ObstacleSnapshot, ParkingPath?>? replanner = null)
     {
         this.path = path;
         this.settings = settings;
         this.wheelbase = wheelbase;
+        this.replanner = replanner;
         maxCurvature = 1.0 / Math.Max(0.5, Kinematics.MinTurnRadius(settings));
+
+        PathPoint end = path.Points.Count > 0 ? path.Points[^1] : default;
+        goal = new Pose2(end.Position.X, end.Position.Y, end.HeadingRad);
 
         BuildRuns();
         wantedGear = runs.Count > 0 ? runs[0].Travel : DriveDirection.Forward;
     }
 
     public string Status => status;
+
+    /// <summary>How many times the route has been swapped mid-maneuver.</summary>
+    public int Replans { get; private set; }
 
     public double RemainingDistance => Math.Max(0.0, path.Length - progress);
 
@@ -121,6 +162,7 @@ public sealed class Follower
 
     private void BuildRuns()
     {
+        runs.Clear();
         IReadOnlyList<PathPoint> points = path.Points;
         if (points.Count == 0)
         {
@@ -136,9 +178,14 @@ public sealed class Follower
             if (points[i].Travel == current)
                 continue;
 
-            runs.Add(new Run(current, start, points[i].DistanceAlong));
+            // The boundary is the last sample the vehicle can actually reach while still travelling
+            // in the current direction. The next leg's first sample is already a step into the bay,
+            // so claiming the boundary for it leaves a gap the projection can never cross - and the
+            // change of direction is then never requested.
+            double boundary = points[i - 1].DistanceAlong;
+            runs.Add(new Run(current, start, boundary));
             current = points[i].Travel;
-            start = points[i].DistanceAlong;
+            start = boundary;
         }
 
         runs.Add(new Run(current, start, points[^1].DistanceAlong));
@@ -180,6 +227,31 @@ public sealed class Follower
 
         UpdateProgress(vehicle);
 
+        // The user's rule, and the only defence against a reference that has silently detached from
+        // the truck: while driving towards the spot, the distance to it may shrink or hold, never
+        // grow. When it grows by more than a car length's worth of slack, stop and re-solve from
+        // where we actually are - a second-stage correction - instead of backing through the spot.
+        double remaining = RemainingDistance;
+        if (remaining < bestRemaining)
+            bestRemaining = remaining;
+        else if (stage == Stage.Driving && remaining > bestRemaining + RecessionM)
+        {
+            bestRemaining = remaining;
+            recovering = true;
+            status = $"距终点不再缩短（{remaining:0.0} m），停车准备二段修正";
+        }
+
+        if (recovering)
+        {
+            if (Math.Abs(vehicle.SignedSpeed) > 0.1)
+                return ControlDemand.BrakeOnly(0.6f);
+
+            recovering = false;
+
+            if (TryReplan(vehicle, obstacles, 0.0, "二段修正"))
+                return ControlDemand.BrakeOnly(0.2f);
+        }
+
         if (RemainingDistance <= Math.Max(0.25, settings.ToleranceLateralM) && Math.Abs(vehicle.SignedSpeed) < 0.12)
         {
             stage = Stage.Finished;
@@ -204,16 +276,29 @@ public sealed class Follower
         if (blocked != null)
             return blocked.Value;
 
-        return Drive(vehicle);
+        return Drive(vehicle, obstacles);
     }
 
     private ControlDemand StopAndRequestGear(VehicleState vehicle)
     {
         bool wasMoving = Math.Abs(vehicle.SignedSpeed) > 0.15;
-        stage = Stage.StoppingForGearChange;
-        status = wasMoving ? "换挡前刹停" : "请求挡位";
 
-        if (wasMoving)
+        if (stage != Stage.StoppingForGearChange)
+            gearStopSinceUtc = vehicle.Utc;
+
+        stage = Stage.StoppingForGearChange;
+
+        // Braking to a standstill first is the polite order, but it can be unwinnable: another
+        // channel holding the throttle, or a grade, keeps the truck rolling and the wait has no
+        // end. Past the patience window the shift is requested anyway - the game ignores a gear
+        // action while rolling, so the cost of asking early is nothing, and the alternative is
+        // standing on the brake forever with nothing able to finish the maneuver but the hotkey.
+        double stopWaited = (vehicle.Utc - gearStopSinceUtc).TotalSeconds;
+        bool patient = stopWaited <= GearStopPatienceSeconds;
+
+        status = wasMoving ? (patient ? "换挡前刹停" : $"刹停无望（{stopWaited:0.0} s），边发挡边等") : "请求挡位";
+
+        if (wasMoving && patient)
             return ControlDemand.BrakeOnly(0.5f);
 
         gearAttempts++;
@@ -226,11 +311,23 @@ public sealed class Follower
                                  false);
     }
 
+    /// <summary>
+    ///  Did the gearbox take the request? The engaged ratio is the wrong thing to watch: an
+    ///  automatic falls back to neutral for exactly the reason we asked for the shift - the truck
+    ///  stopping - so a confirmation read off it disappears the moment it succeeds. The dashboard
+    ///  keeps the selected position, and either readout agreeing is proof the action landed.
+    /// </summary>
+    private static bool GearSelected(VehicleState vehicle, DriveDirection direction)
+    {
+        return direction == DriveDirection.Forward
+            ? vehicle.Gear > 0 || vehicle.GearDashboard > 0
+            : vehicle.Gear < 0 || vehicle.GearDashboard < 0;
+    }
+
     private ControlDemand WaitForGear(VehicleState vehicle)
     {
         // In DryRun the gear pulse never reaches the game, so telemetry can never confirm it.
-        bool taken = settings.DryRun
-                  || (wantedGear == DriveDirection.Forward ? vehicle.Gear > 0 : vehicle.Gear < 0);
+        bool taken = settings.DryRun || GearSelected(vehicle, wantedGear);
         if (taken)
         {
             confirmedGear = wantedGear;
@@ -267,9 +364,19 @@ public sealed class Follower
         return ControlDemand.BrakeOnly(0.5f);
     }
 
-    private ControlDemand Drive(VehicleState vehicle)
+    private ControlDemand Drive(VehicleState vehicle, ObstacleSnapshot obstacles)
     {
-        Run run = RunAt(progress);
+        Run run = CurrentRun();
+        if (run.Travel != confirmedGear)
+        {
+            // A gear change means the vehicle is stopped, so it is a free decision point: re-solve
+            // from here and take the new route only if it is clearly better.
+            if (TryReplan(vehicle, obstacles, ReplanImprovementMarginM, "换挡边界"))
+                return ControlDemand.BrakeOnly(0.2f);
+
+            run = CurrentRun();
+        }
+
         if (run.Travel != confirmedGear)
         {
             wantedGear = run.Travel;
@@ -309,21 +416,76 @@ public sealed class Follower
         return new ControlDemand((float)steer, throttle, brake, false, pulse, false);
     }
 
+    /// <summary>
+    ///  Pure pursuit is only defined for an aim point ahead of the direction of travel. When the
+    ///  vehicle has driven past the point it is meant to be reversing from - guaranteed whenever it
+    ///  could not stop in time - the projection pins at the leg start, the aim ends up behind us,
+    ///  and the angle sits next to 180 degrees where its sine flips sign: the command saturates and
+    ///  the wheel stops where it is. The tangent law has no such singularity and converges back
+    ///  onto the line from wherever the overshoot left us.
+    /// </summary>
+    private static bool AimPointAhead(Vector2 delta, Vector2 travelDirection)
+        => delta.X * travelDirection.X + delta.Y * travelDirection.Y > 0.0;
+
+    /// <summary>
+    ///  Tangent tracking: bend back onto the route from the cross-track offset and the heading
+    ///  error against the anchor's tangent. Has no view of where the route goes next, which is why
+    ///  pursuit is preferred - but it has no singularity either, so it is what we fall back to when
+    ///  the aim point is no longer ahead of us.
+    /// </summary>
+    private double PathTangentControl(bool reversing)
+    {
+        double headingErrorRad = HeadingErrorDegrees * Math.PI / 180.0;
+        double curvature = settings.ReverseKxCross * CrossTrackErrorMeters + settings.ReverseKhHeading * headingErrorRad;
+
+        // Reversing travels towards larger arc length with the nose pointing the other way, so the
+        // heading rate answers the wheel command inverted - the same flip the pursuit branch makes.
+        return CurvatureToSteer(reversing ? curvature : -curvature);
+    }
+
     private double ForwardSteering(VehicleState vehicle, Run run)
     {
         double lookahead = Math.Clamp(settings.LookaheadBaseM + settings.LookaheadGainMps * Math.Abs(vehicle.SignedSpeed), 1.0, 6.0);
-        double targetDistance = Math.Min(progress + lookahead, run.End);
+        double aimDistance = progress + lookahead;
 
-        if (!path.TryPointAt(targetDistance, out PathPoint target))
+        if (!path.TryPointAt(Math.Min(aimDistance, run.End), out PathPoint target))
             return 0.0;
+
+        target = BeyondEnd(target, aimDistance - run.End);
 
         Vector2 delta = target.Position - vehicle.Position;
         if (delta.LengthSquared() < 1e-4f)
             return 0.0;
 
+        if (!AimPointAhead(delta, Geometry.ForwardFromHeading(vehicle.HeadingRad)))
+            return PathTangentControl(false);
+
         double alpha = Geometry.SmallestAngleDifference(Geometry.HeadingFromForward(delta), vehicle.HeadingRad);
         double curvature = 2.0 * Math.Sin(alpha) / lookahead;
         return CurvatureToSteer(curvature);
+    }
+
+    /// <summary>
+    ///  Projects the aim point straight on past the end of the route. Clamping it to the final
+    ///  sample makes the vehicle chase a point that is sitting on the finish line, so it cuts in
+    ///  diagonally and arrives turned - and it divides an angle measured over a short distance by
+    ///  the long lookahead it was designed with, which inflates the command exactly where the
+    ///  wheels should be coming back to centre.
+    /// </summary>
+    private static PathPoint BeyondEnd(PathPoint point, double beyond)
+    {
+        if (beyond <= 0.0)
+            return point;
+
+        Vector2 travel = point.Travel == DriveDirection.Forward
+            ? Geometry.ForwardFromHeading(point.HeadingRad)
+            : -Geometry.ForwardFromHeading(point.HeadingRad);
+
+        return point with
+        {
+            Position = point.Position + travel * (float)beyond,
+            DistanceAlong = point.DistanceAlong + beyond
+        };
     }
 
     private double ReverseSteering(VehicleState vehicle, PathPoint anchor)
@@ -334,14 +496,20 @@ public sealed class Follower
 
             // The car travels towards larger arc length while its nose points the other way, so
             // the aim point is ahead along the route but the angle is measured from the tail.
-            if (!path.TryPointAt(Math.Min(progress + lookahead, path.Length), out PathPoint target))
+            double aimDistance = progress + lookahead;
+            if (!path.TryPointAt(Math.Min(aimDistance, path.Length), out PathPoint target))
                 return 0.0;
+
+            target = BeyondEnd(target, aimDistance - path.Length);
 
             Vector2 delta = target.Position - vehicle.Position;
             if (delta.LengthSquared() < 1e-4f)
                 return 0.0;
 
             double tailHeading = Geometry.NormalizeRadians(vehicle.HeadingRad + Math.PI);
+            if (!AimPointAhead(delta, Geometry.ForwardFromHeading(tailHeading)))
+                return PathTangentControl(true);
+
             double alpha = Geometry.SmallestAngleDifference(Geometry.HeadingFromForward(delta), tailHeading);
 
             // Heading rate is v*tan(steer)/L, and v is negative in reverse, so the wheel command
@@ -349,9 +517,7 @@ public sealed class Follower
             return CurvatureToSteer(-2.0 * Math.Sin(alpha) / lookahead);
         }
 
-        double headingErrorRad = HeadingErrorDegrees * Math.PI / 180.0;
-        double curvature = -(settings.ReverseKxCross * CrossTrackErrorMeters + settings.ReverseKhHeading * headingErrorRad);
-        return CurvatureToSteer(curvature);
+        return PathTangentControl(true);
     }
 
     private double CurvatureToSteer(double curvature)
@@ -448,33 +614,53 @@ public sealed class Follower
             return null;
         }
 
-        ParkingPath remainder = SliceFrom(progress);
-        int conflicts = Planner.CountCorridorConflicts(remainder, settings, obstacles);
+        // Only the near field stops us. The old check looked at the entire remaining corridor, so
+        // a blocker 30 m ahead held the vehicle at the start of the maneuver - and since the
+        // re-decision points are all downstream of that, it also made re-planning unreachable.
+        // No start grace here: at the vehicle's own pose an overlap is a real contact, not the
+        // footprint-of-the-start-point artefact the planner's grace exists for.
+        ParkingPath horizon = Slice(progress, progress + settings.ObstacleLookaheadM);
+        int conflicts = Planner.CountCorridorConflicts(horizon, settings, obstacles, startGraceM: 0.0);
         if (conflicts == 0)
         {
-            blockedSince = DateTime.MinValue;
+            // Sticky: the swept footprint is longer than the vehicle, so the conflict count
+            // flickers as the projection breathes by a sample step. Forgetting the wait every time
+            // it dips made the status read "waited 0.3 s" forever.
+            if (blockedSince != DateTime.MinValue && (vehicle.Utc - lastBlockedUtc).TotalSeconds > BlockedForgetSeconds)
+                blockedSince = DateTime.MinValue;
+
             return null;
         }
+
+        lastBlockedUtc = vehicle.Utc;
 
         if (blockedSince == DateTime.MinValue)
             blockedSince = vehicle.Utc;
 
-        // Hold as long as it takes. The route is still valid the moment the corridor clears.
         double waited = (vehicle.Utc - blockedSince).TotalSeconds;
-        status = $"等待障碍离开（已等 {waited:0.0} s）";
+
+        if (waited > BlockedReplanSeconds && vehicle.Utc >= nextReplanUtc)
+        {
+            nextReplanUtc = vehicle.Utc.AddSeconds(BlockedReplanSeconds);
+
+            if (TryReplan(vehicle, obstacles, 0.0, $"前方 {conflicts} 处挡住"))
+                return ControlDemand.BrakeOnly(0.4f);
+        }
+
+        status = $"等待障碍离开（已等 {waited:0.0} s，重规划 {Replans}/{settings.MaxReplans}）";
         return ControlDemand.Hold(0.6f);
     }
 
     /// <summary>
-    ///  The not-yet-driven part of the route, re-based at zero so the corridor check can reuse
-    ///  the same code as the planner.
+    ///  The part of the route between two arc lengths, re-based at zero so the corridor check can
+    ///  reuse the same code as the planner.
     /// </summary>
-    private ParkingPath SliceFrom(double from)
+    private ParkingPath Slice(double from, double to)
     {
         List<PathPoint> points = new();
         foreach (PathPoint p in path.Points)
         {
-            if (p.DistanceAlong + 0.05 < from)
+            if (p.DistanceAlong + 0.05 < from || p.DistanceAlong > to)
                 continue;
 
             points.Add(p with { DistanceAlong = p.DistanceAlong - from });
@@ -491,6 +677,61 @@ public sealed class Follower
             Description = path.Description,
             GearSwitches = path.GearSwitches
         };
+    }
+
+    private double CostOf(ParkingPath route)
+        => route.Length + settings.GearSwitchPenaltyM * route.GearSwitches;
+
+    /// <summary>
+    ///  Asks for a new route from the pose we are standing at and swaps it in when it is worth
+    ///  having. Both call sites are stopped states, and that is the point: a route re-solved while
+    ///  rolling shares the pose but not the arc length, and the nearest-point projection cannot
+    ///  tell the two references apart. <paramref name="improvementM"/> is how much better the
+    ///  alternative has to be; zero takes anything usable, which is what a blocked route wants.
+    /// </summary>
+    private bool TryReplan(VehicleState vehicle, ObstacleSnapshot obstacles, double improvementM, string reason)
+    {
+        if (replanner == null || !settings.ReplanWhileStopped || Replans >= settings.MaxReplans)
+            return false;
+
+        Pose2 from = new(vehicle.Position.X, vehicle.Position.Y, vehicle.HeadingRad);
+        ParkingPath? next = replanner.Invoke(from, obstacles);
+        if (next == null || next.Points.Count < 2)
+            return false;
+
+        if (improvementM > 0.0 && CostOf(next) > CostOf(Slice(progress, path.Length)) - improvementM)
+            return false;
+
+        status = $"重规划 #{Replans + 1}（{reason}）→ {next.Description} {next.Length:0.0} m";
+        Replans++;
+        Adopt(next);
+        return true;
+    }
+
+    private void Adopt(ParkingPath next)
+    {
+        path = next;
+        BuildRuns();
+
+        // The new route starts where we are standing, so the estimator restarts at zero and the
+        // gearbox is confirmed again from scratch. The wheel is deliberately left alone: it has not
+        // been commanded anywhere, and restarting the slew limiter from centre would throw a
+        // steering jerk into the first tick of the new leg.
+        index = 0;
+        progress = 0.0;
+        runIndex = 0;
+        bestRemaining = double.MaxValue;
+        recovering = false;
+        integral = 0.0;
+        lastError = 0.0;
+        blockedSince = DateTime.MinValue;
+        lastBlockedUtc = DateTime.MinValue;
+        nextReplanUtc = DateTime.MinValue;
+        confirmedGear = null;
+        gearConfirmed = false;
+        gearAttempts = 0;
+        wantedGear = runs.Count > 0 ? runs[0].Travel : DriveDirection.Forward;
+        stage = Stage.SelectGear;
     }
 
     /// <summary>
@@ -514,20 +755,32 @@ public sealed class Follower
 
     private double UnitConversions(double kmPerHour) => kmPerHour / 3.6;
 
-    private Run RunAt(double distance)
+    /// <summary>
+    ///  The leg being driven. Runs share their boundary and the boundary belongs to the later one,
+    ///  so the change of direction is requested as soon as the projection can reach it - and the
+    ///  index only ever moves forward, because the projection jitters by a sample step around that
+    ///  boundary: a direction that flickers leaves the truck standing on the spot changing gear
+    ///  until it runs out of time.
+    /// </summary>
+    private Run CurrentRun()
     {
-        for (int i = 0; i < runs.Count; i++)
-        {
-            if (distance <= runs[i].End + 1e-6)
-                return runs[i];
-        }
+        while (runIndex + 1 < runs.Count && progress >= runs[runIndex].End - 1e-6)
+            runIndex++;
 
-        return runs[^1];
+        return runs[runIndex];
     }
 
     private void UpdateProgress(VehicleState vehicle)
     {
         IReadOnlyList<PathPoint> points = path.Points;
+
+        // Routes cross themselves by design: the reverse leg of a two-leg maneuver lies right on
+        // top of the approach it came in along. Confining the projection to the leg being driven
+        // is what keeps reversing into the spot from walking progress back over the approach
+        // samples, which made the remaining distance grow the further in the truck got.
+        Run leg = CurrentRun();
+        double windowLow = leg.Start;
+        double windowHigh = leg.End + LegWindowM;
 
         // Progress may only advance about as fast as the vehicle physically moves. Without this
         // a route that passes close to itself (tight arcs) lets the nearest-point projection hop
@@ -542,7 +795,7 @@ public sealed class Follower
 
         for (int i = index + 1; i <= high; i++)
         {
-            if (points[i].DistanceAlong - progress > maxAdvance)
+            if (points[i].DistanceAlong - progress > maxAdvance || points[i].DistanceAlong > windowHigh)
                 break;
 
             double distance = Geometry.Distance(points[i].Position, vehicle.Position);
@@ -555,7 +808,7 @@ public sealed class Follower
 
         for (int i = low; i < index; i++)
         {
-            if (progress - points[i].DistanceAlong > 2.0)
+            if (progress - points[i].DistanceAlong > 2.0 || points[i].DistanceAlong < windowLow)
                 continue;
 
             double distance = Geometry.Distance(points[i].Position, vehicle.Position);

@@ -15,7 +15,9 @@ namespace AutoParking;
 public sealed class ControlOutput
 {
     private const string ChannelPrefix = "local.autoparking.";
-    private const float Weight = 5.0f;
+
+    /// <summary>Set from the settings page every tick; see <c>AutoParkingSettings.ControlWeight</c>.</summary>
+    public float Weight = 20.0f;
 
     private readonly ControlChannelDefinition driveChannel = new() { Id = ChannelPrefix + "drive", Timeout = 0.3f };
     private readonly ControlChannelDefinition gearChannel = new() { Id = ChannelPrefix + "gear", Timeout = 0.5f };

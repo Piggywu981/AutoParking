@@ -68,6 +68,7 @@
 |---|---|---|---|
 | 总开关 | `DryRun` | true | 只算不发指令 |
 | | `RefuseWithTrailer` | true | 带挂车时拒绝启动 |
+| | `ControlWeight` | 20 | 宿主把写同一字段的所有通道按权重平均，所以权重低不是让位，而是被覆盖。实测对手≈14 时我们的刹车请求被换算成正油门，并把气压耗光。与 ACC/超车插件同时使用时调到高于对方 |
 | 车身 | `WheelbaseM` / `MaxSteerDeg` | 4.0 / 33 | 决定最小转弯半径，是最要紧的两个几何参数 |
 | | `VehicleLengthM` / `VehicleWidthM` | 6.5 / 2.6 | 障碍冲突检测用的矩形 footprint |
 | 速度 | `ForwardSpeedKph` / `ReverseSpeedKph` | 6 / 3 | 爬行速度上限 |
@@ -79,9 +80,13 @@
 | | `ReverseLateral` | 反向 Pure Pursuit | 倒车横向律，可切换成交叉误差 PD |
 | 规划 | `PlanRadiusMargin` | 1.35 | **在比车辆自身最小转弯半径更大的圆上规划**，否则每段圆弧都要满舵，执行器饱和后控制器就没有修正能力 |
 | | `GearSwitchPenaltyM` | 6.0 | 每多一次换挡的代价 |
+| | `TerminalStraightM` | 1.5 | 入库前最后一段直线。圆弧的航向只有在弧的终点才正好对上，早停 0.35 m 就会带着角度出库 |
 | | `PathSampleM` | 0.25 | 路径采样步长 |
 | 容差 | `ToleranceLateralM` / `ToleranceHeadingDeg` | 0.20 / 4.0 | 判定"到位" |
 | | `ObstacleMarginM` | 0.5 | 车身矩形外扩 |
+| | `ObstacleLookaheadM` | 4.0 | 只有这个距离以内的冲突才停车。注意扫掠矩形本身约 8 m 长，所以障碍在 7.5 m 外就会登记 |
+| 重规划 | `ReplanWhileStopped` | true | **只在车停着时**重新求解路径——换挡边界，或被挡停等 2 秒后。行进中不重算：新路径与旧路径只在当前点相切、弧长不重合，投影分不清两个参考 |
+| | `MaxReplans` | 3 | 换路径次数上限，用完退回定死。到顶**不会中止**——只有热键能结束动作 |
 | 结束 | `HandbrakeOnFinish` / `RestoreAssistsOnFinish` | true | 到位拉手刹、交还辅助驾驶 |
 | 可视化 | `MapScalePxPerM` / `MapZoom` / `MapViewRadiusM` / `SnapToNavCurve` | 1.25 / 1.0 / 120 / true | |
 | | `ArGroundTrimM` | 0.0 | AR 地面微调（车轮接触点估算之外的手工偏移） |
@@ -109,7 +114,8 @@
 ### 6.3 离线闭环仿真（仓库外，`scratch\PlannerHarness`）
 自行车模型驱动真实的 `Follower`，输出横向/航向误差、换挡脉冲数，以及转向质量指标
 （满舵时长、方向盘换向次数、方向盘总行程）。另有一个**挡箱失聪**用例（换挡脉冲永不接合），
-用来验证"等不到挡位"会降级为"继续行驶并补发脉冲"，而不是死等。
+用来验证"等不到挡位"会降级为"继续行驶并补发脉冲"，而不是死等。另有一个**中途冒出障碍**用例，
+同一几何跑两遍：关掉重规划会停等到超时，打开则从当前位姿重算并到位。
 之所以放在插件目录之外：插件 `.csproj` 用的是默认 globbing，任何 `.cs` 都会被编译进 DLL。
 
 ## 7. 架构一览
@@ -151,7 +157,7 @@ docs\                  设计文档 + 逐条实现记录（含被实测推翻的
 | `engaged: … · 换挡 N · 冲突 0, dry-run=…` | 已接受任务并开始跟随 |
 | `start rejected: …` | 被 §4 的哪一条拒绝 |
 | `制动探针 sent_accel=-0.50 … user_brake=0.50` | 带符号的实际发布值 + 游戏回执。`sent_accel` 为负时应当看到 `user_brake` 上升、`user_throttle` 为 0 |
-| `挡位探针 请求=Reverse → gear=0 … shifter_type=…` | 每次发换挡脉冲记一行。`shifter_type` 决定这辆车认不认 `gear_drive/gear_reverse` |
+| `挡位探针 请求=Reverse → gear=0 dash=-1 … shifter_type=…` | 每次发换挡脉冲记一行，带发出请求的阶段。`shifter_type` 决定这辆车认不认 `gear_drive/gear_reverse`。**`gear=0` 而 `dash=-1` 是正常现象**：自动箱每次停稳都会退回空挡，所以确认两个读数任一符合即算成功；这里出现脉冲风暴说明该锁存失效 |
 | `控件已注册（…Toggle / .Abort）` | 启动时一行；没有它就说明 `Init()` 没跑到 |
 
 两个已经踩过的坑，记录在 `docs\2026-09-30-autoparking-design.md` §17，遇到同类现象先看它们：

@@ -73,6 +73,23 @@ public sealed class AutoParkingPlugin : Plugin
     private DateTime phaseDeadlineUtc = DateTime.MinValue;
     private DateTime lastBrakeProbeUtc = DateTime.MinValue;
     private DateTime lastGearProbeUtc = DateTime.MinValue;
+    private int lastReplanCount;
+    private bool warnedNoAir;
+
+    // Reverse distance inside which the parking brake may be used to stop the truck.
+    private const double ParkingBrakeStopDistanceM = 2.0;
+
+    /// <summary>
+    ///  Is there enough air for the service brake to do anything? The emergency threshold comes
+    ///  from the truck config; when it has not been read (zero) a low fixed floor is used, because
+    ///  "no braking at all" is the one failure that must not be masked by a missing config value.
+    /// </summary>
+    private bool HasBrakeAir()
+    {
+        float emergency = latestTelemetry.configFloat.airPressureEmergency;
+
+        return latestTelemetry.truckFloat.airPressure > (emergency > 0.0f ? emergency : 20.0f);
+    }
 
     // Restored when the maneuver ends, unless the user changed them in the meantime.
     private bool hadAssistSnapshot;
@@ -337,11 +354,33 @@ public sealed class AutoParkingPlugin : Plugin
         ObstacleSnapshot obstacles = MapGeometrySnapshot?.Obstacles ?? new ObstacleSnapshot();
 
         output.DryRun = settings.DryRun;
+        output.Weight = (float)settings.ControlWeight;
         ControlDemand demand = active.Step(state, obstacles);
 
+        // Below the emergency threshold the service brake has nothing to act on - the pedal is
+        // published, the pads do nothing, and the truck coasts. The parking brake works on a
+        // different circuit, so near the end of the route it is the only thing that can still
+        // stop us. Only near the end: yanking it at speed would lock the rear wheels.
+        if (demand.Brake > 0.1f && !HasBrakeAir() && active.RemainingDistance < ParkingBrakeStopDistanceM)
+        {
+            if (!warnedNoAir)
+            {
+                warnedNoAir = true;
+                Logger.Warn($"AutoParking: 气压 {latestTelemetry.truckFloat.airPressure:0.0} bar 低于应急值，行车制动无效，改用驻车制动停车");
+            }
+
+            demand = demand with { HoldBrake = true };
+        }
+
         output.Apply(demand);
-        ProbeBrakeChannel(demand, state);
-        ProbeGearChannel(demand, state);
+        ProbeBrakeChannel(demand, state, active);
+        ProbeGearChannel(demand, state, active);
+
+        if (active.Replans != lastReplanCount)
+        {
+            lastReplanCount = active.Replans;
+            Logger.Info($"AutoParking: replanned {active.Replans}/{settings.MaxReplans} - {active.Status}");
+        }
 
         lock (sync)
         {
@@ -417,7 +456,7 @@ public sealed class AutoParkingPlugin : Plugin
     ///  is over by then - so it goes to the log as it happens. sent_brake high with game_brake
     ///  near zero means the abackward axis is not the brake pedal.
     /// </summary>
-    private void ProbeBrakeChannel(ControlDemand demand, VehicleState state)
+    private void ProbeBrakeChannel(ControlDemand demand, VehicleState state, Follower active)
     {
         if (demand.Brake < 0.5f || settings.DryRun)
             return;
@@ -427,13 +466,16 @@ public sealed class AutoParkingPlugin : Plugin
 
         lastBrakeProbeUtc = state.Utc;
 
-        float userBrake, userThrottle, airPressure, brakeTemp;
+        float userBrake, userThrottle, airPressure, brakeTemp, gameBrake, gameThrottle, cruise;
         bool parkingBrake;
         int gear;
         lock (sync)
         {
             userBrake = latestTelemetry.truckFloat.userBrake;
             userThrottle = latestTelemetry.truckFloat.userThrottle;
+            gameBrake = latestTelemetry.truckFloat.gameBrake;
+            gameThrottle = latestTelemetry.truckFloat.gameThrottle;
+            cruise = latestTelemetry.truckFloat.cruiseControlSpeed;
             airPressure = latestTelemetry.truckFloat.airPressure;
             brakeTemp = latestTelemetry.truckFloat.brakeTemperature;
             parkingBrake = latestTelemetry.truckBool.parkingBrake;
@@ -445,18 +487,19 @@ public sealed class AutoParkingPlugin : Plugin
         // only when the brake is actually applied at the wheels.
         Logger.Info($"AutoParking: 制动探针 v={Math.Abs(state.SignedSpeed) * 3.6:0.0} km/h " +
                     $"sent_accel={output.LastAcceleration:0.00} (brake={demand.Brake:0.00} throttle={demand.Throttle:0.00}) " +
+                    $"steer={output.LastSteer:0.00} 剩={active.RemainingDistance:0.0} 横={active.CrossTrackErrorMeters:0.00} " +
+                    $"航向差={active.HeadingErrorDegrees:0.0} " +
                     $"user_brake={userBrake:0.00} user_throttle={userThrottle:0.00} " +
+                    $"game_brake={gameBrake:0.00} game_throttle={gameThrottle:0.00} cruise={cruise:0.0} " +
                     $"air={airPressure:0.00} brake_temp={brakeTemp:0.0} hand={parkingBrake} gear={gear}");
     }
 
     /// <summary>
-    ///  Samples the gearbox action every time a pulse goes out. Pedals are analog axes and are
-    ///  known to reach the game; shifting is a boolean action on the same table, so this is the
-    ///  one line that says whether the host can drive actions at all. shifter_type also decides
-    ///  whether gear_drive / gear_reverse exist: a sequential or H-manual box has to be shifted
-    ///  with gear_up / gear_down instead, and no amount of waiting on the telemetry confirms it.
+    ///  Samples the gearbox action every time a pulse goes out, with the stage that asked for it.
+    ///  Repeated pulses for a gear the telemetry already reports mean the confirmation is reading
+    ///  the wrong signal, and only the status text says which stage is looping.
     /// </summary>
-    private void ProbeGearChannel(ControlDemand demand, VehicleState state)
+    private void ProbeGearChannel(ControlDemand demand, VehicleState state, Follower active)
     {
         if (demand.Gear == GearRequest.None || settings.DryRun)
             return;
@@ -472,11 +515,11 @@ public sealed class AutoParkingPlugin : Plugin
             data = latestTelemetry;
         }
 
-
         Logger.Info($"AutoParking: 挡位探针 请求={demand.Gear} → gear={data.truckInt.gear} " +
                     $"dash={data.truckInt.gearDashboard} slot={data.truckUI.shifterSlot} " +
                     $"shifter_type={data.configString.shifterType} rpm={data.truckFloat.engineRpm:0} " +
-                    $"hand={data.truckBool.parkingBrake} v={Math.Abs(state.SignedSpeed) * 3.6:0.0} km/h");
+                    $"hand={data.truckBool.parkingBrake} v={Math.Abs(state.SignedSpeed) * 3.6:0.0} km/h " +
+                    $"剩={active.RemainingDistance:0.0} m · {active.Status}");
     }
 
     private void CompletePhase(ParkingPhase from)
@@ -768,6 +811,10 @@ public sealed class AutoParkingPlugin : Plugin
                     settings.DryRun = ToBool(value, settings.DryRun);
                     changed = true;
                     break;
+                case "controlWeight":
+                    settings.ControlWeight = ToDouble(value, settings.ControlWeight);
+                    changed = true;
+                    break;
                 case "refuseWithTrailer":
                     settings.RefuseWithTrailer = ToBool(value, settings.RefuseWithTrailer);
                     changed = true;
@@ -840,12 +887,28 @@ public sealed class AutoParkingPlugin : Plugin
                     settings.ToleranceHeadingDeg = ToDouble(value, settings.ToleranceHeadingDeg);
                     changed = true;
                     break;
+                case "obstacleLookahead":
+                    settings.ObstacleLookaheadM = ToDouble(value, settings.ObstacleLookaheadM);
+                    changed = true;
+                    break;
+                case "replanWhileStopped":
+                    settings.ReplanWhileStopped = ToBool(value, settings.ReplanWhileStopped);
+                    changed = true;
+                    break;
+                case "maxReplans":
+                    settings.MaxReplans = (int)ToDouble(value, settings.MaxReplans);
+                    changed = true;
+                    break;
                 case "handbrakeOnFinish":
                     settings.HandbrakeOnFinish = ToBool(value, settings.HandbrakeOnFinish);
                     changed = true;
                     break;
                 case "planRadiusMargin":
                     settings.PlanRadiusMargin = ToDouble(value, settings.PlanRadiusMargin);
+                    changed = true;
+                    break;
+                case "terminalStraight":
+                    settings.TerminalStraightM = ToDouble(value, settings.TerminalStraightM);
                     changed = true;
                     break;
                 case "steerGain":
@@ -993,9 +1056,22 @@ public sealed class AutoParkingPlugin : Plugin
 
             try
             {
-                follower = new Follower(planResult!.Path!, settings, settings.WheelbaseM);
+                Pose2 spot = target.Value;
+                AutoParkingSettings cfg = settings;
+
+                follower = new Follower(planResult!.Path!, settings, settings.WheelbaseM,
+                    (from, field) =>
+                    {
+                        // Ask the planner the same question we asked at engage time, only from the
+                        // pose we are actually standing at now. Null when there is nothing usable,
+                        // which leaves the follower on the route it already has.
+                        PlanResult next = Planner.Plan(from, spot, cfg, field);
+                        return next.Ok ? next.Path : null;
+                    });
+
                 TakeOverAssists();
                 phase = ParkingPhase.Engaging;
+                warnedNoAir = false;
             }
             catch (Exception ex)
             {
@@ -1248,9 +1324,12 @@ public sealed class AutoParkingPlugin : Plugin
                     { "目标车位", targetRow },
                     { "规划结果", planResult?.Summary ?? "未规划" },
                     { "控制器", follower?.Status ?? "未启用" },
+                    { "重规划", follower == null ? "未启用" : $"{follower.Replans} / {settings.MaxReplans} 次" },
                     { "拟发输出", $"转向 {output.LastSteer:0.00} · 油门 {output.LastThrottle:0.00} · 刹车 {output.LastBrake:0.00} · 手刹 {(output.LastHandbrake ? "on" : "off")}" },
                     { "通道计数", $"已发 {output.Published} / Dry-run 屏蔽 {output.Suppressed}" },
                     { "人工输入", lastRawUserInputs },
+                    { "制动能力", $"{latestTelemetry.truckFloat.airPressure:0.0} bar（应急 {latestTelemetry.configFloat.airPressureEmergency:0.0}）" +
+                                (HasBrakeAir() ? "" : " · 行车制动无效") },
                     { "最小转弯半径", $"{Kinematics.MinTurnRadius(settings):0.00} m" },
                     { "地面基准", $"{GroundContactOffsetNoLock:0.00} m（+微调 {settings.ArGroundTrimM:0.00}）" },
                     { "地图数据", mapStatus },

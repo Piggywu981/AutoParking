@@ -80,6 +80,7 @@ path unsolvable or blocked by an obstacle / path too long.
 |---|---|---|---|
 | Master | `DryRun` | true | Compute only, send nothing |
 | | `RefuseWithTrailer` | true | Refuse to start with a trailer |
+| | `ControlWeight` | 20 | The host averages every channel writing the same field, so a low weight is not deference — it is being overwritten. A measured competitor at ≈14 turned our brake demand into positive throttle and drained the air reservoirs. Raise this above any ACC/overtake plugin running alongside |
 | Body | `WheelbaseM` / `MaxSteerDeg` | 4.0 / 33 | Determines minimum turning radius — the two most important geometry parameters |
 | | `VehicleLengthM` / `VehicleWidthM` | 6.5 / 2.6 | Rectangular footprint used for obstacle conflict detection |
 | Speed | `ForwardSpeedKph` / `ReverseSpeedKph` | 6 / 3 | Creep speed caps |
@@ -91,9 +92,13 @@ path unsolvable or blocked by an obstacle / path too long.
 | | `ReverseLateral` | Reverse Pure Pursuit | Lateral law in reverse; switchable to cross-track-error PD |
 | Planning | `PlanRadiusMargin` | 1.35 | **Plan on a circle larger than the vehicle's own minimum turning radius**; otherwise every arc needs full lock, and once the actuator saturates the controller has no correction authority left |
 | | `GearSwitchPenaltyM` | 6.0 | Cost per extra gear change |
+| | `TerminalStraightM` | 1.5 | Length of the straight leg driven into the spot. An arc only reaches the correct heading at its very end, so stopping 0.35 m short leaves the bay turned by exactly that much |
 | | `PathSampleM` | 0.25 | Path sampling step |
 | Tolerance | `ToleranceLateralM` / `ToleranceHeadingDeg` | 0.20 / 4.0 | What counts as "in place" |
 | | `ObstacleMarginM` | 0.5 | Vehicle footprint outward expansion |
+| | `ObstacleLookaheadM` | 4.0 | Only conflicts this far ahead stop the truck. Note the swept footprint is ~8 m long, so a blocker registers about 7.5 m out regardless of this number |
+| Re-planning | `ReplanWhileStopped` | true | Re-solve the route **only while the vehicle is stopped** — at a gear change, or after 2 s held by a blocker. Never mid-drive: a new route shares the pose but not the arc length, and the progress estimator cannot tell the two references apart |
+| | `MaxReplans` | 3 | Cap on swaps; after it the route is frozen again. Hitting the cap does **not** abort — only the hotkey ends the maneuver |
 | Finish | `HandbrakeOnFinish` / `RestoreAssistsOnFinish` | true | Apply handbrake and restore driver assists on completion |
 | Visualization | `MapScalePxPerM` / `MapZoom` / `MapViewRadiusM` / `SnapToNavCurve` | 1.25 / 1.0 / 120 / true | |
 | | `ArGroundTrimM` | 0.0 | AR ground trim (manual offset beyond the wheel-contact-point estimate) |
@@ -128,7 +133,9 @@ A bicycle model drives the real `Follower`, reporting lateral/heading error, gea
 counts, and steering quality metrics (full-lock duration, steering reversals, total steering
 wheel travel). There is also a **deaf gearbox** case (gear pulses never engage) verifying that
 "waiting for the gear" degrades to "keep driving and re-send pulses" instead of waiting
-forever.
+forever, and a **blocker appears mid-maneuver** case that runs the same geometry twice: with
+re-planning off the truck holds until the budget runs out, with it on the truck re-solves from
+where it is standing and reaches the spot.
 It lives outside the plugin directory because the plugin `.csproj` uses default globbing —
 any `.cs` file would be compiled into the DLL.
 
@@ -173,7 +180,7 @@ Meaning of a few log lines:
 | `engaged: … · shift N · conflicts 0, dry-run=…` | Task accepted, following started |
 | `start rejected: …` | Which rule from §4 refused the start |
 | `brake probe sent_accel=-0.50 … user_brake=0.50` | Actual signed value sent + game's echo. When `sent_accel` is negative you should see `user_brake` rise and `user_throttle` stay 0 |
-| `gear probe request=Reverse → gear=0 … shifter_type=…` | One line per gear pulse. `shifter_type` decides whether this truck accepts `gear_drive/gear_reverse` |
+| `gear probe request=Reverse → gear=0 dash=-1 … shifter_type=…` | One line per gear pulse, with the stage that asked. `shifter_type` decides whether this truck accepts `gear_drive/gear_reverse`. **`gear=0` with `dash=-1` is normal**: an automatic falls back to neutral at every standstill, so confirmation reads either signal — a pulse storm here means that latch is failing |
 | `controls registered (…Toggle / .Abort)` | One line at startup; missing means `Init()` never ran |
 
 Two pitfalls already hit — documented in `docs\2026-09-30-autoparking-design.md` §17; check

@@ -117,21 +117,30 @@ public static class Planner
                                              double radius, double penalty, double maxLength)
     {
         List<ParkingPath> candidates = new();
+        double tail = Math.Clamp(settings.TerminalStraightM, 0.0, 5.0);
 
         ParkingPath? straight = TryStraightReverse(start, goal, settings);
         if (straight != null)
             candidates.Add(straight);
 
-        foreach (ParkingPath forward in ReedsShepp.Solve(start, goal, radius, settings.PathSampleM, penalty))
+        // Reeds-Shepp lands its final arc exactly on the goal pose, so the last heading is only
+        // right at the last centimetre: a route stopped 0.35 m short walks out of the bay turned
+        // by however much arc was left over. Planning to a standoff and driving the final metres
+        // straight in makes every stopping point in that window correctly aligned.
+        foreach (ParkingPath forward in ReedsShepp.Solve(start, Standoff(goal, tail, DriveDirection.Forward),
+                                                         radius, settings.PathSampleM, penalty))
         {
-            if (forward.Length <= maxLength)
-                candidates.Add(forward);
+            ParkingPath? withTail = AppendStraightTail(forward, goal, settings.PathSampleM);
+            if (withTail != null && withTail.Length <= maxLength)
+                candidates.Add(withTail);
         }
 
-        List<ParkingPath> reversed = ReedsShepp.Solve(goal, start, radius, settings.PathSampleM, penalty);
+        List<ParkingPath> reversed = ReedsShepp.Solve(Standoff(goal, tail, DriveDirection.Reverse), start,
+                                                      radius, settings.PathSampleM, penalty);
         if (reversed.Count > 0)
         {
             ParkingPath? backIn = ReedsShepp.Invert(reversed[0], penalty);
+            backIn = AppendStraightTail(backIn, goal, settings.PathSampleM);
             if (backIn != null && backIn.Length <= maxLength)
                 candidates.Add(backIn);
         }
@@ -142,6 +151,48 @@ public static class Planner
 
         candidates.Sort((a, b) => a.Cost.CompareTo(b.Cost));
         return candidates;
+    }
+
+    /// <summary>
+    ///  Where the vehicle has to be to reach the spot in a straight line: <paramref name="tail"/>
+    ///  metres along its own nose for a drive-in, or astern of it for a back-in.
+    /// </summary>
+    private static Pose2 Standoff(Pose2 goal, double tail, DriveDirection travel)
+    {
+        double sign = travel == DriveDirection.Forward ? -1.0 : 1.0;
+        return new Pose2(goal.X + goal.Forward.X * (float)(tail * sign),
+                         goal.Z + goal.Forward.Y * (float)(tail * sign),
+                         goal.HeadingRad);
+    }
+
+    private static ParkingPath? AppendStraightTail(ParkingPath? route, Pose2 goal, double sampleM)
+    {
+        if (route == null || route.Points.Count == 0)
+            return route;
+
+        PathPoint last = route.Points[^1];
+        ParkingPath? leg = StraightBetween(new Pose2(last.Position.X, last.Position.Y, goal.HeadingRad),
+                                          goal, last.Travel, sampleM);
+        if (leg == null)
+            return route;
+
+        List<PathPoint> points = new(route.Points.Count + leg.Points.Count);
+        points.AddRange(route.Points);
+
+        double offset = last.DistanceAlong;
+        for (int i = 1; i < leg.Points.Count; i++)
+        {
+            points.Add(leg.Points[i] with { DistanceAlong = offset + leg.Points[i].DistanceAlong });
+        }
+
+        return new ParkingPath
+        {
+            Points = points,
+            Source = route.Source,
+            Cost = route.Cost + leg.Length,
+            GearSwitches = route.GearSwitches,
+            Description = route.Description + " + 直线入位"
+        };
     }
 
     /// <summary>
@@ -253,20 +304,25 @@ public static class Planner
 
     /// <summary>
     ///  Sweeps the vehicle footprint along the route and counts obstacles that overlap it.
-    ///  The first metres and the last metre are skipped: the vehicle starts inside its own
-    ///  footprint and the spot is expected to be clear by definition.
+    ///  By default the first metres and the last metre are skipped: the vehicle starts inside its
+    ///  own footprint and the spot is expected to be clear by definition. A caller that is already
+    ///  driving asks a different question - "is anything in front of me" - and passes its own
+    ///  grace, because the route-relative grace would hide the whole near field.
     /// </summary>
-    public static int CountCorridorConflicts(ParkingPath path, AutoParkingSettings settings, ObstacleSnapshot obstacles)
+    public static int CountCorridorConflicts(ParkingPath path, AutoParkingSettings settings, ObstacleSnapshot obstacles,
+                                             double? startGraceM = null, double? endGraceM = null)
     {
         if (obstacles.Polygons.Count == 0 || path.Points.Count < 2)
             return 0;
 
+        double startGrace = startGraceM ?? StartGraceM;
+        double endGrace = endGraceM ?? EndGraceM;
         double length = settings.VehicleLengthM + 0.6 + 2.0 * settings.ObstacleMarginM;
         double width = settings.VehicleWidthM + 0.5 + 2.0 * settings.ObstacleMarginM;
         double total = path.Length;
 
         int conflicts = 0;
-        for (double along = StartGraceM; along <= total - EndGraceM; along += CorridorSampleM)
+        for (double along = startGrace; along <= total - endGrace; along += CorridorSampleM)
         {
             if (!path.TryPointAt(along, out PathPoint point))
                 break;

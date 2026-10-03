@@ -17,6 +17,15 @@ public sealed class AutoParkingSettings
     public bool DryRun { get; set; } = true;
     public bool RefuseWithTrailer { get; set; } = true;
 
+    /// <summary>
+    ///  Weight on our control channels. The host averages every channel that touches the same
+    ///  field and splits the result by sign, so a lower weight does not lose politely: another
+    ///  plugin publishing full throttle turns our brake demand into a positive average, our pedal
+    ///  never reaches the wheels, and the truck drains its air reservoirs fighting it. Measured in
+    ///  the game at an opposing weight of about 14, hence a default well above that.
+    /// </summary>
+    public double ControlWeight { get; set; } = 20.0;
+
     // Engagement limits
     public double MaxTakeoverDistanceM { get; set; } = 30.0;
     public double EntryDistanceM { get; set; } = 12.0;
@@ -64,10 +73,28 @@ public sealed class AutoParkingSettings
     ///  to correct anything - a saturated actuator is no longer a linear one.
     /// </summary>
     public double PlanRadiusMargin { get; set; } = 1.35;
+
+    /// <summary>
+    ///  Length of the straight leg driven into the spot. The final heading of an arc is only
+    ///  reached at the end of the arc, so without this a route stopped short leaves the bay
+    ///  turned by the leftover arc; inside a straight tail any stopping point is aligned.
+    /// </summary>
+    public double TerminalStraightM { get; set; } = 1.5;
     public double PathSampleM { get; set; } = 0.25;
 
     // Obstacles
     public double ObstacleMarginM { get; set; } = 0.5;
+
+    /// <summary>
+    ///  Only conflicts this far ahead of the vehicle stop it. Anything further is not a reason to
+    ///  stand still at the start of the maneuver - it is a reason to re-solve at the next gear
+    ///  change, which is what makes segmented re-planning reachable at all.
+    /// </summary>
+    public double ObstacleLookaheadM { get; set; } = 4.0;
+
+    // Re-planning
+    public bool ReplanWhileStopped { get; set; } = true;
+    public int MaxReplans { get; set; } = 3;
 
     // Tolerances and aborts
     public double ToleranceLateralM { get; set; } = 0.20;
@@ -109,6 +136,7 @@ public sealed class AutoParkingSettings
         if (SettingsVersion < 1)
             SettingsVersion = 1;
 
+        ControlWeight = Math.Clamp(ControlWeight, 1.0, 100.0);
         MaxTakeoverDistanceM = Math.Clamp(MaxTakeoverDistanceM, 5.0, 100.0);
         EntryDistanceM = Math.Clamp(EntryDistanceM, 6.0, 30.0);
         OvershootM = Math.Clamp(OvershootM, 0.0, 2.0);
@@ -139,9 +167,12 @@ public sealed class AutoParkingSettings
 
         GearSwitchPenaltyM = Math.Clamp(GearSwitchPenaltyM, 0.0, 20.0);
         PlanRadiusMargin = Math.Clamp(PlanRadiusMargin, 1.0, 2.5);
+        TerminalStraightM = Math.Clamp(TerminalStraightM, 0.0, 5.0);
         PathSampleM = Math.Clamp(PathSampleM, 0.1, 1.0);
 
         ObstacleMarginM = Math.Clamp(ObstacleMarginM, 0.2, 1.5);
+        ObstacleLookaheadM = Math.Clamp(ObstacleLookaheadM, 1.5, 15.0);
+        MaxReplans = Math.Clamp(MaxReplans, 0, 8);
 
         ToleranceLateralM = Math.Clamp(ToleranceLateralM, 0.05, 1.0);
         ToleranceHeadingDeg = Math.Clamp(ToleranceHeadingDeg, 1.0, 15.0);

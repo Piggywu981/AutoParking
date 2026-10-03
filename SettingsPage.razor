@@ -16,6 +16,11 @@
                 Description="Plan and display everything, but never send throttle, brake, steering or gear commands. Keep this on until the first real test in your own game."
                 Value="@Plugin.Settings.DryRun"
                 ValueChanged="@((bool value) => Plugin.HandleAction("dryRun", value))" />
+        <Slider Title="控制权重"
+                Description="宿主把所有通道的同一个字段按权重加权平均，再按符号分派。权重低了不是礼貌让位，而是直接被覆盖：实测另一个通道以权重≈14 发满油门时，我们 5.0 的刹车被平均成正值，踏板到不了轮上，还会把气压耗光。与 ACC/超车类插件同时使用时，把此值调到高于对方。"
+                Min="@(1.0f)" Max="@(60.0f)" Step="@(1.0f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.ControlWeight))"
+                ValueChanged="@((float value) => Plugin.HandleAction("controlWeight", value))" />
         <Switch Title="带挂车时拒绝执行"
                 Description="本版本只泊牵引车本体。检测到挂车时直接拒绝，避免挂车甩在通道上。"
                 Value="@Plugin.Settings.RefuseWithTrailer"
@@ -105,6 +110,11 @@
                 Min="@(1.0f)" Max="@(2.5f)" Step="@(0.05f)"
                 Value="@(Convert.ToSingle(Plugin.Settings.PlanRadiusMargin))"
                 ValueChanged="@((float value) => Plugin.HandleAction("planRadiusMargin", value))" />
+        <Slider Title="直线入位段长度"
+                Description="入库前最后一段直线。圆弧的航向只有在弧的终点才正好对上，早停 0.35 m 就会带着角度出库；有一段直线之后，这段里任何一点停下都是正的。0 = 关闭。"
+                Min="@(0.0f)" Max="@(4.0f)" Step="@(0.1f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.TerminalStraightM))"
+                ValueChanged="@((float value) => Plugin.HandleAction("terminalStraight", value))" />
         <Slider Title="转向比例增益" Min="@(0.2f)" Max="@(3.0f)" Step="@(0.05f)"
                 Value="@(Convert.ToSingle(Plugin.Settings.SteerGain))"
                 ValueChanged="@((float value) => Plugin.HandleAction("steerGain", value))" />
@@ -140,6 +150,26 @@
                   Options="@Plugin.ReverseLawOptions"
                   SelectedIndex="@(Plugin.Settings.ReverseLateral == ReverseLateralLaw.CrossTrackPd ? 1 : 0)"
                   SelectedIndexChanged="@((int index) => Plugin.HandleAction("reverseLaw", index))" />
+
+        <Separator Label="障碍与重规划" Class="mt-4" />
+        <p class="description">
+            路径不是开始就定死的：只在<b>车停着</b>的时候重新求解——换挡边界，或者前方被挡停等超过 2 秒。
+            行进中不重算，因为新路径与旧路径只在当前点相切、弧长不重合，最近点投影分不清两个参考。
+        </p>
+        <Slider Title="障碍检查距离 (m)"
+                Description="只有这个距离以内的冲突才会停车。远处障碍不停车、不改道，走到下一个停点再重算。"
+                Min="@(1.5f)" Max="@(15f)" Step="@(0.5f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.ObstacleLookaheadM))"
+                ValueChanged="@((float value) => Plugin.HandleAction("obstacleLookahead", value))" />
+        <Switch Title="停住时允许重算路径"
+                Description="关掉就退回原来的行为：engage 时那条路径一路走到底。"
+                Value="@Plugin.Settings.ReplanWhileStopped"
+                ValueChanged="@((bool value) => Plugin.HandleAction("replanWhileStopped", value))" />
+        <Slider Title="重算次数上限"
+                Description="用完之后退回定死路径。到顶不会中止泊车——只有热键能结束动作。"
+                Min="@(0f)" Max="@(8f)" Step="@(1f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.MaxReplans))"
+                ValueChanged="@((float value) => Plugin.HandleAction("maxReplans", value))" />
 
         <Separator Label="快捷键" Class="mt-4" />
         <p class="description">

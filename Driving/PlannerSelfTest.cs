@@ -118,9 +118,11 @@ public static class PlannerSelfTest
         // most about one extra circle over the straight line, so bound it that way - per-case
         // magic numbers here would just be flaky.
         // Measured against the radius the planner actually drives on, not the vehicle's own
-        // limit: planning with a margin deliberately makes routes longer.
+        // limit: planning with a margin deliberately makes routes longer. The straight tail is
+        // added too - it is a fixed, intended length, and this bound is about loops.
         double straightLine = Geometry.Distance(testCase.Start.Position, testCase.Goal.Position);
-        double loopBound = straightLine + Geometry.TwoPi * Kinematics.PlanningRadius(cfg) * 1.05;
+        double loopBound = straightLine + Geometry.TwoPi * Kinematics.PlanningRadius(cfg) * 1.05
+                                          + Math.Clamp(cfg.TerminalStraightM, 0.0, 5.0);
         if (path.Length > loopBound)
             return $"路径 {path.Length:0.0} m 比直线 {straightLine:0.0} m 多绕了超过一圈（上限 {loopBound:0.0} m）";
 
