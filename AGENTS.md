@@ -2,7 +2,7 @@
 
 Working notes for anyone (human or agent) editing this plugin. Every rule below exists because
 breaking it caused a real bug or a lost day; full provenance in
-`docs\2026-09-30-autoparking-design.md` §17–§25.
+`docs\2026-09-30-autoparking-design.md` §17–§29.
 
 ## Commands
 
@@ -18,6 +18,7 @@ and to run the offline check; only the deploy row needs a full ETS2LA workspace.
 | Build | `dotnet build -c Release` → `bin\Release\AutoParking.dll` |
 | Deploy | put `bin\Release\AutoParking.dll` into `..\..\ETS2LA-win-release-Portable\current\Plugins\` — that is the `current\` tree the `.csproj` HintPaths already read host DLLs from, so the deploy target is wherever this checkout's host install is. Then **restart ETS2LA**: plugins are shadow-copy loaded and a running host keeps the old DLL |
 | Offline check | `dotnet run --project Tools/PlannerHarness -c Release` (planner self-test + closed-loop sim; pure math, no game and no host DLLs) |
+| Data surface dump | `dotnet run --project Tools/MapSurfaceDump -c Release` — reflects the **installed** `TruckLib.dll` / `TruckLib.Models.dll` and prints every public member of each map item and PPD/PMD type. Run it before claiming a map field exists or is missing: the source snapshot is not authoritative, and grepping a hand-written list of candidate names out of a binary produced a false negative once (design doc §29) |
 
 No CI, no linter, no `dotnet test` project. The harness plus the in-game probes on the settings
 page are the entire verification story.
@@ -76,6 +77,35 @@ plugin's own tolerances, which is how it catches regressions the game would stil
   "player input". Never use `user_*` to decide whether a human is driving. Also, `ETS2LA.Logging`
   renders Spectre.Console markup, so a bare `[Tag]` inside a message is silently swallowed —
   write `[[Tag]]`.
+
+## Map data constraints (each one shaped a design decision)
+
+- **Only nodes have a spatial index** (`Nodes.Within`, an R-tree). `Map.MapItems` is a plain
+  dictionary, so "what is near the truck" can only be answered by walking nodes and reading
+  `node.ForwardItem` / `node.BackwardItem`. Every item class does own at least one node — buildings,
+  signs, loose models and POI areas included — so the node walk reaches them, and it reports a
+  polyline item twice (once per end node). Deduplicate by `Uid`, never by "did I see this before".
+- **The host filters map items while it parses**, by `DataSettings.DataFidelity`
+  (`DataSettings.json`, default Medium): buildings and signs survive Medium, loose models such as
+  street lamps need High, company/city POI areas need Extreme, and prefabs/roads that are not shown
+  on the UI map are dropped below High — which is exactly the class of quiet depot a parking spot
+  lives in. Changing fidelity means re-parsing, not a live knob. Read the value out of
+  `DataSettings.Current` instead of assuming it.
+- **Resolving a model's real extents means one PMD file parse per distinct token, and that is the
+  expensive part.** Upstream's visualization plugin disabled its own model streaming over it:
+  *"this lags ETS2LA for ~20 seconds at first start"*
+  (`official-plugins\Plugins\VisualizationSockets\VisualizationSockets.cs:226`). Any footprint work
+  here must cache per token, off the tick thread, with a budget — and the map inventory (§6.4)
+  prints the distinct-token count precisely so that decision is made on a measurement.
+
+- **What a plugin can actually get out of a map item** (verified with `Tools\MapSurfaceDump`, not by
+  reading the source snapshot): every class that exposes nodes has ground geometry —
+  `SingleNodeItem.Node`, `PolylineItem.Node`+`ForwardNode`, `PathItem.Nodes`, `PolygonItem.Nodes`.
+  Real **extents** are nowhere in the map data: the k-DOP is on `MapItem.Kdop`, which is `internal`.
+  And `PrefabDescriptor` carries `Nodes / NavCurves / Semaphores / Signs / SpawnPoints / MapPoints /
+  Intersections / TriggerPoints` but **no placed-model list** — props bundled inside a prefab are
+  unreachable unless we parse `.pdll`/`.ppd` model sections ourselves. So the drawing order is:
+  item geometry (free), PMD boxes (per token, expensive), prefab interior (not available).
 
 ## Definition of done
 

@@ -70,6 +70,7 @@
             <button class="button button-accent w-full!" @onclick="@(() => Plugin.HandleAction("start", null))">Start</button>
             <button class="button w-full!" @onclick="@(() => Plugin.HandleAction("stop", null))">Stop</button>
             <button class="button w-full!" @onclick="@(() => Plugin.HandleAction("clearTarget", null))">清除车位</button>
+            <button class="button w-full!" @onclick="@(() => Plugin.HandleAction("dumpMapInventory", null))">地图清单</button>
         </div>
 
         @if (!string.IsNullOrEmpty(Plugin.LastActionMessage))

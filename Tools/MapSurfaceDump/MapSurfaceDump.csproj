@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Developer-only reflection dump: it prints the public surface of the map-data assemblies that
+    ship with the installed host, so "can we get X out of the map data?" is answered by reading the
+    binary that will actually be loaded instead of by grepping a source snapshot or guessing names.
+
+    It is a console project under Tools\, exactly like PlannerHarness: the plugin .csproj carves
+    Tools\ out of its default globs, and ThirdPartyPlugins\build_all.ps1 only collects csproj files
+    one level down, so nothing here can ship as a plugin.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>MapSurfaceDump</AssemblyName>
+    <HostDir>..\..\..\..\ETS2LA-win-release-Portable\current\</HostDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="TruckLib">
+      <HintPath>$(HostDir)TruckLib.dll</HintPath>
+    </Reference>
+    <Reference Include="TruckLib.Models">
+      <HintPath>$(HostDir)TruckLib.Models.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>

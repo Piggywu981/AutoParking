@@ -42,6 +42,31 @@ internal sealed class MapOverlay
     private static readonly uint ColorLaneRight = Color(0.42f, 0.62f, 0.42f);
     private static readonly uint ColorCurve = Color(0.50f, 0.50f, 0.42f, 0.9f);
     private static readonly uint ColorObstacle = Color(0.90f, 0.35f, 0.35f, 0.9f);
+
+    // Static map content, deliberately far from the vehicle red in hue: the whole point of drawing
+    // it is to tell "the building next to me" apart from "the car that just moved into me".
+    private static readonly uint ColorBuilding = Color(0.85f, 0.45f, 0.80f);
+    private static readonly uint ColorModel = Color(0.80f, 0.88f, 0.35f);
+    private static readonly uint ColorSign = Color(0.55f, 0.65f, 0.95f);
+    private static readonly uint ColorArea = Color(0.45f, 0.80f, 0.70f);
+    private static readonly uint ColorStaticOther = Color(0.75f, 0.75f, 0.75f, 0.9f);
+
+    /// <summary>
+    ///  Per-class colors for the static layer. Anything not named here still gets drawn - in gray -
+    ///  because "what is that cluster of grey dots" is answered by the map inventory, and the whole
+    ///  point of this layer is to surface classes nobody thought to whitelist.
+    /// </summary>
+    private static uint ShapeColor(string kind)
+    {
+        return kind switch
+        {
+            "Buildings" => ColorBuilding,
+            "Model" => ColorModel,
+            "Sign" => ColorSign,
+            "TrafficArea" or "MapArea" or "Trigger" => ColorArea,
+            _ => ColorStaticOther
+        };
+    }
     private static readonly uint ColorTruck = Color(0.30f, 0.95f, 0.45f);
     private static readonly uint ColorTarget = Color(0.95f, 0.85f, 0.30f);
     private static readonly uint ColorTargetLocked = Color(0.35f, 0.90f, 0.95f);
@@ -167,6 +192,33 @@ internal sealed class MapOverlay
             ImGui.TextColored(color, status.Summary);
         }
 
+        // One line, no more: this is the measurement step in front of any of it becoming an
+        // obstacle, and the canvas below is what the window is for. 设置 -> 地图清单 logs the detail.
+        string inventory = plugin.MapProbeSummary;
+        if (!string.IsNullOrEmpty(inventory))
+        {
+            ImGui.TextColored(new Vector4(0.55f, 0.55f, 0.55f, 1f), inventory);
+        }
+
+        if (geometry != null)
+        {
+            // The wording is the current contract, not a footnote: the static layer is drawn so it
+            // can be judged, and it does not veto a route yet.
+            ImGui.TextColored(new Vector4(0.55f, 0.55f, 0.55f, 1f), "静态（只画不拦）：");
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(0.85f, 0.45f, 0.80f, 1f), "建筑");
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(0.80f, 0.88f, 0.35f, 1f), "模型");
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(0.55f, 0.65f, 0.95f, 1f), "牌");
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(0.45f, 0.80f, 0.70f, 1f), "区域");
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(0.75f, 0.75f, 0.75f, 1f), "其他条目");
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(0.55f, 0.55f, 0.55f, 1f), "· 实心=地图标记可碰");
+        }
+
         Vector2 windowPos = ImGui.GetWindowPos();
         Vector2 windowSize = ImGui.GetWindowSize();
         Vector2 canvasMin = new(windowPos.X + Padding, ImGui.GetCursorScreenPos().Y + Padding * 0.5f);
@@ -195,6 +247,30 @@ internal sealed class MapOverlay
         foreach (Vector2[] curve in geometry.DriveableCurves)
         {
             DrawPolyline(drawList, curve, ColorCurve, 1.5f, canvasCenter, truckPlane, scale);
+        }
+
+        foreach (MapGeometry.StaticShape shape in geometry.StaticShapes)
+        {
+            uint color = ShapeColor(shape.Kind);
+
+            if (shape.Points.Length == 1)
+            {
+                Vector2 at = ToCanvas(shape.Points[0], canvasCenter, truckPlane, scale);
+                if (shape.Collision)
+                    drawList.AddCircleFilled(at, 2.2f, color);
+                else
+                    drawList.AddCircle(at, 2.2f, color, 0, 1f);
+                continue;
+            }
+
+            if (shape.Closed)
+            {
+                DrawClosedPolygon(drawList, shape.Points, color, canvasCenter, truckPlane, scale);
+                continue;
+            }
+
+            DrawPolyline(drawList, shape.Points, color, shape.Kind == "Buildings" ? 2.5f : 1.5f,
+                         canvasCenter, truckPlane, scale);
         }
 
         foreach (Vector2[] polygon in geometry.Obstacles.Polygons)

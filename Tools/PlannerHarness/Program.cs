@@ -116,8 +116,12 @@ double dragErrorDeg = deliberate
 bool pickDragOk = jitterIgnored && deliberate && dragErrorDeg < 1e-6;
 Console.WriteLine($"  {(pickDragOk ? "✓" : "✗")} 选位拖动死区：1 px 抖动被忽略={jitterIgnored} · 40 px 生效={deliberate} · 与正东夹角 {dragErrorDeg:0.000}°");
 
+Console.WriteLine();
+Console.WriteLine("地图内容探针（纯逻辑：去重、排序、截断、行数预算）：");
+int probeFailures = MapProbeChecks.Run();
+
 return report.Failures.Count == 0 && simPassed == 5 && keptGoing && stagedLeg.Reached
-    && replanWorks && autoNeutralOk && unwinds && watchdogWorks && pickDragOk ? 0 : 1;
+    && replanWorks && autoNeutralOk && unwinds && watchdogWorks && pickDragOk && probeFailures == 0 ? 0 : 1;
 
 // The recession watchdog needs states that make the distance grow. Nothing in the closed loop does
 // that any more - the window fix removed the pinning that used to - so it is fed synthetic ones:

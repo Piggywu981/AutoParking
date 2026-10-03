@@ -1041,3 +1041,160 @@ user_brake=0.00 user_throttle=0.60 恒定；我们发 brake=0.50~0.82
 **仍未修的已知缺口**：`HandleMouse` 读的是**全局**鼠标状态（`IsMouseClicked` 没带窗口作用域的 flags，
 ImGui 1.92 支持），只靠"鼠标落在画布矩形内"过滤。所以按住 RightAlt 时点在别的窗口上、只要落点在我们的
 矩形内，仍会重放车位。这条我没顺手改，因为它与"窗口跟着走"不是同一个根因，要单独验证。
+
+## 26. 静态地图内容：路灯和建筑物本来就在数据里，是我们只捡了 Road 和 Prefab（2026-10-03，读 official-plugins 与宿主数据层）
+
+**动机**：M4 之后能停了，但障碍物只有实时车辆（`ObstacleScanner` 只读 traffic + parked）。
+停车真正撞的东西是墙、路灯、绿化带。用户要求参考 `InternalVisualization` 和 `VisualizationSockets`
+看怎么识别并显示 buildings / POI。
+
+**读到的事实（都在本工作区里，不需要猜）**：
+
+1. 空间索引只有节点：`Nodes.Within()` 是 RBush R-tree（`TruckLib/.../Collections/NodeDictionary.cs:102`），
+   `Map.MapItems` 是无索引 `Dictionary<ulong, MapItem>`（`Map.cs:35`）。所以"附近有什么"只能走节点。
+2. **所有 item 都挂在自己的节点上**：`SingleNodeItem.Add` 只写 `node.ForwardItem`（`SingleNodeItem.cs:34-44`），
+   折线 item 两端各挂一次。也就是说 `MapGeometry.cs` 现有的节点遍历**早就把 buildings / model / sign / POI
+   区域送到手上了**，是 `Collect()` 的 switch 只认 `Road`/`Prefab`，其余全部丢弃。这不是缺接口，是缺两行。
+3. 类型判别用 `ItemType`（`ScsMap/Enums.cs:12`）。`Buildings` 是 `PolylineItem`：`Node`/`ForwardNode`/`Length`/
+   `Name`（building scheme token，来自 `/def/world/building_scheme.sii`）/`Collision`。`Model` 是 `SingleNodeItem`：
+   `Name`（`/def/world/model.sii` token）/`Scale`/`Collision`。
+4. 真实尺寸要从 **PMD** 来：`PmdFileHandler.Current.GetPmdModel(token)` → `TruckLib.Models.Model`，
+   带 `BoundingBox`/`BoundingBoxCenter`/`Parts→Pieces`。`VisualizationSockets/Classes.cs:201-216` 就是这么用的。
+   安装版 `TruckLib.Models.dll` 里这些成员确实存在；宿主在地图解析完后自己绑好了 Sii/Ppd/Pmd 三个
+   FileSystem（`ETS2LA.State/Program.cs:365-367`，安装版 `ETS2LA.State.dll` 里有 `PmdFileHandler`）。
+   我们自己的 builder 再绑一次 Ppd 已经做了，Pmd 还没做。
+5. **保真度门控**（`ETS2LA.Game/Data/Classes.cs:63-123`）按 `IgnoredItemTypes` 的名字丢条目：
+   Medium 保 Buildings/Sign/BusStop/FuelPump/Gate/Trigger，**Model（路灯、杆、集装箱）要 High**，
+   **Company/CityArea/MapArea/Garage 这类 POI 要 Extreme**。另外 `ShowInUiMap=false` 的 prefab/road 在
+   <High 时整段被丢——"地图上不存在的隐蔽场区"就是这么消失的，对停车业务这条比路灯更要命。
+   用户机器 `%APPDATA%\ETS2LA\DataSettings.json` 实测 `"DataFidelity": 3` = Extreme，**这条不用改**。
+6. 上游踩过的坑，直接写在他代码里：`VisualizationSockets.cs:226-230` 把 Model 分支整段注释掉，理由
+   `// TODO: Optimize model loading, this lags ETS2LA for ~20 seconds at first start`。PMD 是逐 token 惰性解析，
+   市区附近实例上万、token 上百，同步扫一次就是几十秒冻结。**这条决定了第 2/3 步的实现形状**：
+   按 token 缓存、后台线程、每 tick 限额，没算出来之前先用"类别半径圆"兜底。
+
+**诚实的边界**：`InternalVisualization` 里**没有** buildings renderer（6 个是 Nodes/Roads/Prefabs/Traffic/Truck/
+Statistics），`ItemType.Buildings` 只在 node tooltip 的 type switch 里露过一次（`Renderers/NodesRenderer.cs:36`）；
+socket 那边有 `SocketModel`（带包围盒）但也没有 buildings。能借的是写法，不是成品。`ETS2LA.ML/Vision`
+同样只画道路 + 车辆。
+
+**第 1 步做了什么（本次，只读测量，零控车影响）**：`Rendering/MapItemProbe.cs`——按 `ItemType` 分桶，
+每桶记 `Count / Collidable / NearestM / DistinctTokens / TopTokens`，UID 去重（折线 item 从两端到达会重复上报，
+这是实测出来的：harness 里 6 次上报 = 5 个唯一 UID）。`MapGeometryBuilder.Build` 在同一次节点遍历里
+`tally` 所有 item；显示三处：地图窗口**一行**摘要、状态页「地图内容」行、`设置 -> 地图清单` 按钮把
+8 类明细 + 中心/半径/节点数/构建毫秒/宿主保真度写进日志。标签写成 `[[地图清单]]`——双括号是因为 `ETS2LA.Logging` 会把裸写的 `[Tag]` 当 Spectre markup 吞掉。
+
+**为什么排序和截断放在探针里而不是渲染里**：同一份数要进 560 px 的 ImGui 窗口和日志两个地方，
+一个依赖字典插入顺序的 top-N 会让同一个位置两次读数不一致，所以钉死为"数量降序、同数按名字序"，
+行宽 ≤108 字符、超出类别折成一行。`MapItemProbe.cs` 已加进 harness 的链接子集，14 条判据离线跑绿。
+
+**刻意没做的**：没有加设置开关、没有改窗口布局塞明细行、没有碰 `ObstacleSnapshot`/规划器。
+第 2 步（显示 buildings/models）和第 3 步（静态障碍分级进规划）各自单独一轮——
+识别得越全，规划越容易判"无解"，一排路灯就能把车位围死，所以第 3 步必须分级：
+默认只让"确定的硬障碍"（Buildings、`Collision=true` 的 model）参与，软的只显示不拦。
+
+**第 3 步必须先解决的已知障碍**：`Tick` 里地图几何只在 `settings.ShowMapWindow` 为真时重建
+（`AutoParkingPlugin.cs:211`，注释写着"构建要 10–50 ms"）。也就是说**关掉平面地图窗口 = 静态数据停止更新**，
+真跑动作时如果窗口是关的，第 3 步的障碍集会边跑边消失。直接把守卫去掉也不可行——50 ms 落在 60 Hz
+控制线程上就是方向盘抖动。所以要动的是构建本身：分片/后台构建 + 双缓冲快照，或者动作开始时冻结一份
+静态几何。这条现在没做，因为它是第 3 步的前置，不是第 1 步的缺陷。
+
+**待测（下一步的输入，不是结论）**：实车在真车位附近点一次`地图清单`，看①Model 的 distinct token 数（决定 PMD 路线可不可行、要不要限流）；②Buildings 的 `可碰` 是不是几乎全 1
+（若是，`Collision` 标志就没法区分墙和花坛，得另找依据）；③`构建 ms` 有没有因为多走一次类型判断而涨；
+④Extreme 下 POI 类（Company/CityArea）到底叫什么 token，能不能直接拿来标车位语义。
+
+## 27. 第 2 步：把建筑线段和模型点画到平面上（2026-10-03，用户"map 里没看到渲染出来的障碍物"）
+
+**先分清是哪一种"障碍物"**：地图上红色多边形一直是实时车（车流+停放车，来自
+`Local\ETS2LATraffic` / `Local\ETS2LAParkedVehicles` 两块共享内存，无需任何 opt-in 标志）。
+用户要的是**静态**内容——建筑、路灯。第 1 步只打清单没画东西，所以他"看不到"是准确的现状，不是 bug。
+这一轮就是把它画出来（M6b）。
+
+**动手前用代码钉死的前置事实**（避免"推理出一个不存在的渲染"）：
+
+- 折线 item 从**两端节点都可达**：`PolylineItem.Add` 写 `backwardNode.ForwardItem = newItem` 且
+  `forwardNode.BackwardItem = newItem`（`TruckLib/.../PolylineItem.cs:103-108`）；`Append` 同样
+  （`:152-156`）。所以现有 `Nodes.Within()` 遍历已经能拿到 buildings，不需要新查询。
+- 单节点 item 只写 `node.ForwardItem`（`SingleNodeItem.cs:36-41`），`Model` 和 `Sign` 都继承
+  `SingleNodeItem`（`Model.cs:16`、`Sign.cs:14`）→ 点位同样已经在手上。
+- 于是 `CollectStatic()` 与第 1 步的 `Tally()` 共用同一次遍历，UID 集合去重（同一个 item 会被
+  上报两次，这是 §26 里实测到的同一条性质）。
+
+**画了什么**：建筑=品红线段（取 item 自己的 `Node.Position`/`ForwardNode.Position`，不是"我从哪个
+节点到达"的那个节点，否则同一面墙会画成半截）；Model=黄绿点；Sign=蓝紫点；实时车红多边形仍然画在
+最上层。**实心=地图的 `Collision` 标志为真，空心=假**——这个编码是刻意的测量手段：如果整个场区
+画出来全是实心，就说明该标志分不出墙和花坛，第 3 步的硬/软分级必须另找依据（这正是 §26 待测②）。
+
+**上限与诚实标注**：`MaxBuildingSegments = 2000`、`MaxStaticPoints = 3000`，撞到就把
+`MapGeometry.StaticTruncated` 置真，状态行末尾显示"（静态内容已截断）"——**不许静默少画**。
+这两个数是显示上限不是规划上限：采样每 0.5 s 在 tick 线程重建一次，市区 120 m 内散落模型轻松上千。
+
+**刻意没做**：没有 PMD 真实包围盒（等 §26 待测①的 token 种类数再决定要不要按 token 缓存 + 后台构建）、
+没进 `ObstacleSnapshot`、没进 AR 叠加层、没加显示开关（关窗口就是开关）。窗口里加了一行图例，
+把"只画不拦"写在脸上，免得用户以为它已经在拦了。
+
+**验证状态**：构建 0 error / 13 既有 warning；harness 判定与 §26 相同（`自检 24/24`、`闭环 4/5`、
+探针 14 项全绿，退出码仍由那条 1.4° 航向 case 决定）。`MapGeometry.cs` 不属于 harness 链接的纯数学子集，
+所以这一轮**没有离线断言能覆盖它**——画得对不对只能在游戏里看，尚未实测。
+
+## 28. 场区里的箱子/墩子/配电箱不在清单上：Compound 把自己的孩子藏在外面（2026-10-03，用户截图）
+
+**观察**：截图里 `11 类 185 个：Sign 65 · Buildings 31 · Trajectory 25 等 11 类`，而画面是一个堆满
+集装箱、木托盘堆、配电箱的场区。120 m 半径只数出 185 个条目，说明**这些道具压根没进清单**——
+不是"没画"，是"没数到"。这一条区分很重要：如果是没画，改渲染；如果是没数到，改遍历。
+
+**代码证明的机制**：`Compound` 是 `SingleNodeItem`（`Compound.cs:26`），所以节点遍历能看见它**本身**；
+但它的孩子只存在它自己的字典里——`CompoundSerializer.Deserialize` 把子 item 写进 `comp.MapItems`、
+把子节点写进 `comp.Nodes`（`:17-39`），而 `Map.CompoundItems` 那条路径明确显示孩子会**从地图的
+`MapItems`/`Nodes` 里被移除**（`Map.cs:415-422`）。于是一堆木托盘在清单里就是**一个** item。
+`Nodes.Within()` 也搜不到它们：那棵 R-tree 只装地图自己的节点。
+
+**改了什么**：`MapGeometryBuilder.Visit()` 在数完 compound 之后**下钻一层**遍历 `compound.MapItems.Values`
+（一层就够，格式里没有 compound 套 compound；`MapItems` 为 null 时跳过）。孩子的坐标用孩子自己的节点——
+compound 内部节点的序列化格式和地图节点相同，是**绝对世界坐标**，所以能直接进同一套画布投影。
+`MapItemProbe` 加了 `TypeTally.Nested`，明细行显示 `内含 N`：如果只看到 `Model 1400` 而不知道其中
+1380 个来自 compound，下一步就会去查一个根本不存在的"漏画"问题。harness 里加了两条判据
+（`compound 内的道具单独计数`、`明细行显示内含数`），探针判据 14 → 16 全绿。
+顺带把窗口那行摘要从 top-3 提到 top-5——这次正是 top-3 把证据藏住了。
+
+**同时排掉的一条路**：`PrefabDescriptor` 在这个构建里只暴露 `Nodes / NavCurves / Semaphores / TerrainPoints`
+（安装版 `TruckLib.Models.dll` 的元数据里就这些 getter），**没有摆放模型列表**。所以"prefab 内部塞的道具"
+这条路走不通，能拿到的只有 compound 的孩子和地图上的散件。
+
+**尚未证实（等下一次读数，别当结论）**：下钻之后 `Model` 到底会不会出现在清单里、`内含` 有多少。
+如果 `Model` 仍然接近 0，那说明这些箱子是 **prefab 自带几何**，只能靠 PMD（按 token 缓存 + 后台构建，
+见 §26 待测①）或者退一步用"prefab 边界多边形"近似——那时近似反而更诚实，因为规划真正需要的是
+"这块地不能压"，不是"这个箱子在 (x,z)"。
+
+## 29. "能不能再多显示一些"：把静态图层从三种类改成"凡是有地面几何的条目都画"（2026-10-03）
+
+**先撤一条弱证据**。§28 里我写 `PrefabDescriptor` "只有 Nodes/NavCurves/Semaphores/TerrainPoints"，
+那是拿一份**我猜的候选名**去 grep `strings` 的结果——命中不了不等于不存在。这次改成反射实测：
+新工具 `Tools\MapSurfaceDump`（和 PlannerHarness 一样放在 `Tools\` 下，不会被编进 DLL，也不会被
+`build_all.ps1` 收走），直接加载**安装版**的 `TruckLib.dll` / `TruckLib.Models.dll`，打印每个
+`IMapObject` 实现类和 PPD/PMD 类型的公开成员。结论：
+
+- `PrefabDescriptor` 的公开成员确实是 `Intersections / MapPoints / NavCurves / NavNodes / Nodes /
+  Semaphores / Signs / SpawnPoints / TriggerPoints`——**没有摆放模型列表**。所以"prefab 内部塞的道具"
+  用随宿主的库拿不到，要拿必须自己解析 `.pdll`/`.ppd` 的模型段。这条现在是证出来的，不是猜出来的。
+- 但**地图条目那一层我们还漏了一大片**。反射列出的类里，凡是公开暴露节点的都是可画几何：
+  `SingleNodeItem.Node`（点）、`PolylineItem.Node/ForwardNode`（线段）、`PathItem.Nodes`（链，
+  `PathNodeList : IList<INode>`）、`PolygonItem.Nodes`（环，`PolygonNodeList : IList<INode>`）。
+  也就是说 Vegetation、Hinge、Mover、AnimatedModel、Gate、BezierPatch、Company、Hookup、Garage、
+  Service、FuelPump、BusStop、CityArea、MapArea、TrafficArea、Trigger 全都能画，之前只挑了三种。
+
+**改法**：与其再手挑六个类，不如把静态图层做成**通用**的。`MapGeometry.StaticShapes` 一条一个条目，
+`StaticShape(Points, Kind, Token, Collision, Closed)`，`TryShape` 按基类给形状；渲染端未命名的类
+一律画成灰色，**先让你看见，再决定它叫什么**。只有三类被显式跳过并写明理由：`Road`/`Terrain`
+（车道线已经画得更好）、`Compound`（它自己的节点就在刚画出来的那堆孩子上面，纯重复点）。
+上限合并成一个 `MaxStaticShapes = 4000`，撞到就在状态行写"（静态内容已截断）"。
+`Kind` 就是地图的 `ItemType` 名，所以"那一坨灰点是什么"由地图清单那行直接回答，不需要第二套映射。
+
+**仍未解决、而且这条改完更清楚的一件事**：如果那些箱子/托盘既不在 `Model` 也不在 `Compound` 孩子里，
+它们就只能是 prefab 自带几何——那不在"多显示几个类"的能力范围内，只能走 PMD（按 token 缓存 + 后台
+构建，§26 待测①）或者退到"prefab 边界近似"。判据是现成的：重启后地图清单/`[[全图清点]]` 里
+`Model` 与 `Vegetation`/`Hinge` 的计数，加上现在这一层画出来之后**屏幕上灰点跟实物对不对得上**。
+
+**验证**：构建 0 error / 13 既有 warning；harness 判定不变（`自检 24/24`、`闭环 4/5`、探针 16 项全绿，
+退出码仍由那条 1.4° 航向 case 决定）。`MapGeometry.cs`/`MapOverlay.cs` 不在 harness 的纯数学子集里，
+所以这一层依旧是**没有离线断言覆盖、只能实车看**的代码。

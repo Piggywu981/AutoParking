@@ -78,7 +78,16 @@ when that row or probe is rendered.
   `/plugins/adjustments/local.autoparking`, i.e. Settings → Adjustments → **Auto Parking**.
 - Two visualization windows are toggled from the settings page:
   - **Flat map** (ImGui window, on by default): road lane lines, prefab edges/navigation curves,
-    obstacles, current path.
+    obstacles, current path, plus the static map layer — every map item class that has ground
+    geometry gets drawn: magenta building segments, olive loose-model points (street lamps, poles,
+    containers), blue-violet sign points, teal area rings (traffic / map / trigger zones) and gray
+    for every other class, so an unfamiliar cluster is visible before it is named. Filled means the
+    map format's own collision flag is set, hollow means it is not. Roads, terrain quads and the
+    compound markers themselves are the only classes skipped, and each has a reason in `MapGeometry.cs`.
+    **That layer is drawn but does not block the route yet** (§6.4 explains why the order is
+    measure → draw → plan; see also the caps in `MapGeometry.cs`), and whether it shows anything at
+    all depends on the host's Data Fidelity — buildings need Medium, models need High.
+    The 地图数据 status row carries the counts (`静态 N 项`).
   - **AR overlay** (on the game screen, on by default): spot box, vehicle footprint projection,
     forward-direction arrow, target pose.
 
@@ -198,6 +207,35 @@ without that, default globbing would compile it straight into the shipped DLL. I
 pure-math subset of the sources rather than referencing the plugin project, so it needs neither
 the game nor the host DLLs and runs from a bare clone of this repo.
 
+### 6.4 Map Inventory (the 地图清单 button on the settings page)
+Read-only measurement of what actually stands inside the sampled circle around the truck, bucketed
+by map item type: how many, how many carry the map format's collision flag, how near the closest
+one is, and the most frequent model/scheme tokens plus the **total number of distinct tokens**.
+One summary line is shown in the map window and in the 地图内容 ("map content") status row; the
+button writes up to 8 per-type lines to the log (tagged `[[地图清单]]`) together with the sample
+center, radius, node count, build milliseconds and the host's data fidelity.
+
+The same button then runs a **whole-map census** on a background thread (tagged `[[全图清点]]`):
+every parsed item on the map counted by type, with the elapsed time. That is what separates
+"this class is not in the data" from "our node walk did not reach it" — two very different
+diagnoses that look identical on screen.
+
+Props bundled into a `Compound` — stacked crates, pallets, junction boxes — are walked into as well
+and reported as 内含 N: a compound keeps its children in its **own** dictionaries, so to the map's
+node index a whole stack is a single item (design doc §28). Without that, an inventory of a full
+depot reads like an empty one.
+
+Nothing here blocks a route yet — that is deliberate. Static obstacles are the next milestone, and
+the classification rules for them have to come from the token names a real spot produces, not from
+guesses. The distinct-token count is itself a measurement we need: upstream's visualization plugin
+switched model loading off entirely because resolving one model description per token cost
+*"~20 seconds at first start"* (`official-plugins\Plugins\VisualizationSockets\VisualizationSockets.cs:226`).
+
+Note: which item types reach `MapData` at all is decided by the host's **Data Fidelity** setting
+(`DataSettings.json`), and the filtering happens while the map is *parsed* — buildings and signs
+survive Medium, street lamps and other loose models need **High**, company/city POI areas need
+**Extreme**. Changing it means re-parsing (restart), not a live knob.
+
 ## 7. Architecture Overview
 
 ```
@@ -214,6 +252,7 @@ Driving\
   PlannerSelfTest.cs   The 24 cases from 6.1
 Rendering\
   MapGeometry.cs       map/ppd data → drawable geometry (incl. prefab descriptor parsing)
+  MapItemProbe.cs      What the same node walk contains, bucketed by map item type (read-only, §6.4)
   MapOverlay.cs        Flat map window + spot picking/zoom/buttons
   ArOverlay.cs         In-game AR drawing
 SettingsPage.razor     @page "/plugins/adjustments/local.autoparking"
@@ -242,10 +281,11 @@ Meaning of a few log lines:
 | `brake probe transport=memory sent_accel=-0.50 … user_brake=0.50` | Which pedal transport the host used, the signed value we sent, and the game's echo. On the `legacy` transport a negative `sent_accel` reliably shows up as `user_brake` rising with `user_throttle` at 0; **that mapping has not been re-measured under `memory`**, so trust `air=` (transport-independent) first |
 | `gear probe request=Reverse → gear=0 dash=-1 … shifter_type=…` | One line per gear pulse, with the stage that asked. `shifter_type` decides whether this truck accepts `gear_drive/gear_reverse`. **`gear=0` with `dash=-1` is normal**: an automatic falls back to neutral at every standstill, so confirmation reads either signal — a pulse storm here means that latch is failing |
 | `controls registered (…Toggle / .Abort)` | One line at startup; missing means `Init()` never ran |
+| `[[地图清单]] 中心=… 半径=… 节点=… 条目=… 构建=… ms 宿主保真度=…` | The map inventory of §6.4, written only when the button is pressed; the indented lines after it are one per item type |
 
-Six field observations that each turned out to be a real bug or a real constraint, with the tell
+Seven field observations that each turned out to be a real bug or a real constraint, with the tell
 that found it — all recorded with evidence in
-`docs\2026-09-30-autoparking-design.md` §17–§25:
+`docs\2026-09-30-autoparking-design.md` §17–§29:
 
 - **Pedals do nothing (or stop the moment you click the overlay)** → read `transport=` on the brake
   probe / the **pedal transport** status row. `legacy` means the host routes our throttle and brake
@@ -276,6 +316,13 @@ that found it — all recorded with evidence in
   canvas moved, so a single run says which of the three is still wrong.
 - **Gear pulses repeat at ~1 Hz** → the automatic dropping to neutral at standstill is normal;
   confirmation must accept the dashboard reading. A pulse storm means it does not.
+- **No buildings, street lamps or POI on the map, while the roads render fine** → the host drops
+  whole item classes *while parsing*, by **Data Fidelity** (`DataSettings.json`): buildings and
+  signs from Medium up, loose models (street lamps, poles, containers) only from **High**, and
+  company/city POI areas only at **Extreme**. Below High it also throws away every prefab and road
+  that is not shown on the UI map — which is exactly the class of quiet depot you park in.
+  Read the number before touching anything: the 地图数据 row ends with `建筑 N 段 / 点位 M`, and
+  设置 → 地图清单 logs the per-class breakdown plus the fidelity the host is actually using.
 
 Two older pitfalls, still the first things to suspect:
 

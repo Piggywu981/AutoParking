@@ -18,8 +18,10 @@
   <ItemGroup>
     <Compile Include="Program.cs" />
     <Compile Include="ClosedLoop.cs" />
+    <Compile Include="MapProbeChecks.cs" />
     <Compile Include="$(PluginRoot)Geometry.cs" />
     <Compile Include="$(PluginRoot)Settings.cs" />
+    <Compile Include="$(PluginRoot)Rendering\MapItemProbe.cs" />
     <Compile Include="$(PluginRoot)Driving\ObstacleSnapshot.cs" />
     <Compile Include="$(PluginRoot)Driving\ParkingPath.cs" />
     <Compile Include="$(PluginRoot)Driving\ReedsShepp.cs" />

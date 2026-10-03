@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.Numerics;
 using ETS2LA.Backend.Events;
@@ -127,6 +128,10 @@ public sealed class AutoParkingPlugin : Plugin
     };
 
     private static readonly TimeSpan GeometryInterval = TimeSpan.FromMilliseconds(500);
+
+    // The log holds the full inventory; the map window only ever shows the one-line summary,
+    // because the canvas inside it is the point of the window.
+    private const int MapProbeLogTypes = 8;
 
     public override PluginInformation Info { get; } = new()
     {
@@ -268,6 +273,78 @@ public sealed class AutoParkingPlugin : Plugin
         }
 
         Replan(geometry);
+    }
+
+    /// <summary>
+    ///  Writes the measured inventory to the log. The count of distinct tokens per class is the
+    ///  number that decides whether real model footprints are affordable later: parsing one PMD
+    ///  per token is what cost the upstream visualization plugin a ~20 s stall.
+    /// </summary>
+    private void DumpMapInventory()
+    {
+        MapGeometry? geometry;
+        lock (sync) geometry = mapGeometry;
+
+        if (geometry == null)
+        {
+            lock (sync)
+            {
+                lastActionFailed = true;
+                lastActionMessage = "地图数据还没就绪（平面地图窗口要开着，游戏地图要解析完）";
+            }
+            return;
+        }
+
+        MapItemProbe probe = geometry.Probe;
+        string fidelity = DataSettings.Current.DataFidelity.ToString();
+
+        Logger.Info($"AutoParking: [[地图清单]] 中心=({probe.Center.X:0}, {probe.Center.Y:0}) " +
+                    $"半径={probe.RadiusM:0} m 节点={probe.NodesScanned} 条目={probe.TotalItems} " +
+                    $"构建={geometry.BuildMilliseconds:0} ms 宿主保真度={fidelity}");
+
+        foreach (string line in probe.Lines(MapProbeLogTypes))
+            Logger.Info($"AutoParking: [[地图清单]]   {line}");
+
+        lock (sync)
+        {
+            lastActionFailed = false;
+            lastActionMessage = $"已打印清单：{probe.Summary}（保真度 {fidelity}，见日志）";
+        }
+
+        DumpWholeMapCensus();
+    }
+
+    /// <summary>
+    ///  The whole-map census walks every parsed item - millions in the base map - so it runs on its
+    ///  own thread and reports into the log. It answers the question the sampled inventory cannot:
+    ///  whether a class is absent from the data, or merely unreachable from the node index.
+    /// </summary>
+    private void DumpWholeMapCensus()
+    {
+        MapData? map = geometryBuilder.FindMapData(out _);
+        if (map == null)
+            return;
+
+        Task.Run(() =>
+        {
+            try
+            {
+                Stopwatch sw = Stopwatch.StartNew();
+                Dictionary<string, int> census = MapGeometryBuilder.Census(map);
+                sw.Stop();
+
+                string fidelity = DataSettings.Current.DataFidelity.ToString();
+                Logger.Info($"AutoParking: [[全图清点]] 类型 {census.Count} 种 · 条目 {census.Values.Sum()} " +
+                            $"· 用时 {sw.ElapsedMilliseconds} ms · 宿主保真度={fidelity}");
+
+                foreach (KeyValuePair<string, int> pair in census.OrderByDescending(p => p.Value))
+                    Logger.Info($"AutoParking: [[全图清点]]   {pair.Key} {pair.Value}");
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"AutoParking: 全图清点失败 {ex.GetType().Name}: {ex.Message}");
+            }
+        });
     }
 
     /// <summary>
@@ -663,6 +740,19 @@ public sealed class AutoParkingPlugin : Plugin
     }
 
     /// <summary>
+    ///  Measured contents of the sampled circle, as one line: the map window is 560 px tall and the
+    ///  canvas inside it is the point of the window, so the per-class detail goes to the log instead
+    ///  (设置 -> 地图清单).
+    /// </summary>
+    public string MapProbeSummary
+    {
+        get
+        {
+            lock (sync) return mapGeometry?.Probe.Summary ?? "";
+        }
+    }
+
+    /// <summary>
     ///  Height of the ground plane under the vehicle. The telemetry truck origin is the
     ///  vehicle's own origin point, not its contact patch, so drawing at that height puts
     ///  everything about a metre in the air - and the gap differs between a car and a truck.
@@ -975,6 +1065,9 @@ public sealed class AutoParkingPlugin : Plugin
                 break;
             case "selfTest":
                 RunSelfTest();
+                break;
+            case "dumpMapInventory":
+                DumpMapInventory();
                 break;
             case "testGearDrive":
             case "testGearReverse":
@@ -1344,6 +1437,7 @@ public sealed class AutoParkingPlugin : Plugin
                     { "最小转弯半径", $"{Kinematics.MinTurnRadius(settings):0.00} m" },
                     { "地面基准", $"{GroundContactOffsetNoLock:0.00} m（+微调 {settings.ArGroundTrimM:0.00}）" },
                     { "地图数据", mapStatus },
+                    { "地图内容", mapGeometry?.Probe.Summary ?? "未构建（平面地图窗口要开着）" },
                     { "规划自检", selfTestSummary },
                     { "输出", settings.DryRun ? "Dry-run（不发控制）" : "真实输出" },
                     { "最近一次拒绝/中止", lastRejectReason == "" ? "-" : lastRejectReason }
