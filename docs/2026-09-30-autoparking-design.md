@@ -2,7 +2,8 @@
 
 - 日期：2026-09-30
 - 目标项目：ETS2LA V3（C# / .NET 10），安装版 `2026.9.5092`
-- 工作区：`E:\ETS2LA\V3-C#\ThirdPartyPlugins\AutoParking\`
+- 工作区：本仓库根目录（工作区里的 `ThirdPartyPlugins\AutoParking\`）。**文档内一律不写绝对路径**：
+  相对仓库根书写，`..\..\` 即包含本仓库的那个 ETS2LA 工作区。
 - 插件 Id：`local.autoparking`
 - 参考代码：`SourceCode`（只读）、`ThirdPartyPlugins\{OvertakeAssistant,SequentialAutoShift,SpeedLimitUnlocker}`、`official-plugins\Plugins\InternalVisualization`、`V2-Python`（ACC 控制参数）
 
@@ -536,7 +537,7 @@ V2 到点减速公式作为兜底叠加：`a_stop = -v²/(2*max(s_left-0.5, 0.2)
 - 侧方停车（平行库）在 R≈6 m 下往往超出长度闸门，v1 不保证可泊。
 - `ObstacleSnapshot` 拆成独立文件，使规划器与自检完全不依赖 ETS2LA，可在无游戏环境下编译运行。
 
-**本地验证方式**（不需要游戏）：`E:\ETS2LA\V3-C#\scratch\PlannerHarness\` 用 `<Compile Include>` 链接纯数学子集，`dotnet run` 打印自检结果与若干典型路径的形状/长度/挡位切换。该目录在插件工作区之外，不会被 `build_all.ps1`（depth 1）或插件工程的默认 glob 收进去。
+**本地验证方式**（不需要游戏）：`Tools\PlannerHarness\` 用 `<Compile Include>` 链接纯数学子集，`dotnet run --project Tools/PlannerHarness` 打印自检结果与若干典型路径的形状/长度/挡位切换。它原来在仓库外，2026-10-03 挪了进来（见 §23）。
 
 ### M3 — 控制层（已完成，闭环仿真 5/5 到位 + 规划自检 24/24）
 新增：`Driving\Follower.cs`（`VehicleState`/`ControlDemand` 纯数据 + 横纵向控制 + 换挡状态机）、`Driving\ControlOutput.cs`（唯一发控制的地方）。插件侧接了：60 Hz Tick、接管/交还辅助、快捷键 `local.autoparking.Start` / `.Abort`、`OnDisable` 强制释放通道并恢复辅助、状态表新增「控制器 / 拟发输出 / 通道计数」。
@@ -598,7 +599,7 @@ overlay（ETS2LA 窗口）和游戏是**两个应用**，点 overlay 上的按�
 §11 计划独立的 `Safety.cs` 没有落盘：中止条件实际分散在 `Driving\Follower.cs`（`CheckFaults`、挡位重试、障碍等待）和 `AutoParkingPlugin.cs`（`StepManeuver` 遥测守卫、`CheckOutputIsEffective` 输出生效诊断、`Abort`/`CompletePhase` 时序）。当前规模下两处内聚度够，不再为它拆文件——§11 的预估行数本就与实际不符。
 
 **4. 本地验证方式失效**
-§M2 记的 `E:\ETS2LA\V3-C#\scratch\PlannerHarness\` 在 `D:` 工作树里不存在（顶层只有 `ETS2LA-win-release-Portable`、`SourceCode`、`ThirdPartyPlugin`）。重跑闭环仿真需要重建该 harness，并且**必须显式 `DryRun=false`**，否则上面那批门控会把中止条件全部跳过，等于没测。
+§M2 记的 harness 目录（那里当时写的是绝对路径，这也是本文档现在一律改写相对路径的原因）在 `D:` 工作树里不存在（顶层只有 `ETS2LA-win-release-Portable`、`SourceCode`、`ThirdPartyPlugin`）。重跑闭环仿真需要重建该 harness，并且**必须显式 `DryRun=false`**，否则上面那批门控会把中止条件全部跳过，等于没测。
 
 **5. "人类接管"中止条件整体删除（2026-10-02，用户要求：先删方向盘，再删油门/刹车）**
 `Follower.CheckFaults` 里整个 `UserOverrideEnabled` 分支移除，三个通道（`userSteer` / `userThrottle` / `userBrake`）都不再触发中止。连带清理：
@@ -625,7 +626,7 @@ overlay（ETS2LA 窗口）和游戏是**两个应用**，点 overlay 上的按�
 仍未分辨的是两种可能：(a) 踏板指令根本没到轮端；(b) 到了但authority不足（坡道/空挡滑行/游戏刹车曲线）。为此改了两处：
 - 探针改读 `user_brake / user_throttle / airPressure / brakeTemperature / parkingBrake`。气压是"轮端确实施加了制动"的物理证据，比任何回显字段都硬。
 - 紧急制动从"只踩踏板"改成 `ControlDemand.Hold(1.0f)`，即**踏板 + 手刹一起**。理由：手刹在泊车完成时已证明能真正停住车，而踏板这一路还没有任何一次实车证据表明它会减速。
-一次性反射探针放在 `scratch\ChannelProbe\`（插件目录之外，不进 depth-1 批量构建），要再查宿主字段直接 `dotnet run`。
+一次性反射探针当时写在仓库外的 `scratch\ChannelProbe\`；它是用完即删的，现在那个目录已经不存在了。要再查宿主字段，就照 `Tools\PlannerHarness` 的做法在 `Tools\` 下另起一个临时工程（见 §23：放外面会被 glob 编进 DLL 的说法已经不适用，`Tools\**` 现在被排除）。
 
 **7. 第三轮实车：指令根本没进游戏（2026-10-02）**
 日志：`sent_brake=0.50 user_brake=0.00 user_throttle=0.00 air=114.18→116.01 hand=False gear=0` 连续 8 条 → `aborted: 换挡 3 次未成功（目标 Forward）`。
@@ -728,7 +729,7 @@ overlay（ETS2LA 窗口）和游戏是**两个应用**，点 overlay 上的按�
 - 状态表「人工输入」行尾部改成 `gear=实际/仪表 shifter=变速箱类型`。
 - 设置页新增「指令通路自检」两个按钮：**测试挂 D / 测试挂 R**（未启用车库且非 Dry-run 时可按）。油门刹车走模拟轴、换挡手刹走布尔动作，是两条不同代码路径；这两个按钮能在 2 秒内回答"布尔动作到底进不进得去游戏"，不必跑完整个泊车位。
 
-**离线回归**：`scratch\PlannerHarness` 加了 `gearboxDeaf` 仿真（脉冲永远不接合）。结果：自检 24/24、闭环 5/5 不变；失聪挡箱用例换挡脉冲 296 次、正常进入行驶段（不再是踩着刹车等到超时）。构建 0 错误，DLL 已更新到 `current\Plugins\AutoParking.dll`（00:26），**需要重启 ETS2LA 才生效**。
+**离线回归**：`scratch\PlannerHarness`（2026-10-03 起改在仓库内 `Tools\PlannerHarness`）加了 `gearboxDeaf` 仿真（脉冲永远不接合）。结果：自检 24/24、闭环 5/5 不变；失聪挡箱用例换挡脉冲 296 次、正常进入行驶段（不再是踩着刹车等到超时）。构建 0 错误，DLL 已更新到 `current\Plugins\AutoParking.dll`（00:26），**需要重启 ETS2LA 才生效**。
 
 
 ### 末端停车角度：一个症状，四个独立缺陷（2026-10-03，离线闭环定位）
@@ -940,3 +941,32 @@ user_brake=0.00 user_throttle=0.60 恒定；我们发 brake=0.50~0.82
 监视器在闭环里**没有自然触发场景**（窗口修好后 `剩` 不再变大），所以用合成状态序列单独测：沿直线路线前进 9 m 再退回，使 `剩` 超过历史最小值——断言"发制动"且"重规划 ≥1 次"，两条都通过。它不是只写了没测的代码。
 
 **遗留**：`右前45度` 终端航向 1.4° 未达我设的 1.0° 判据（harness 退出码因此仍为 1）；纵向权限/爬行未动；权重≈14 的对手身份未定；`CrossTrackPd` 符号仍未定论。
+
+---
+
+## 23. harness 挪进仓库：`Tools\PlannerHarness`（2026-10-03，推翻 §M2 的决定）
+
+用户要求：把离线仿真工程放进项目仓库，然后同步 AGENTS.md 与 README。
+
+**当年为什么放外面**（§M2 记的理由，至今仍然成立）：插件 `.csproj` 用默认 globbing，仓库里任何 `.cs` 都会被编译进发布的 DLL——一个带 `Program.cs` 的目录会让插件工程直接炸掉（top-level statements 与自动生成的 `Main` 冲突）。
+
+**为什么现在可以放进来**：`DefaultItemExcludes` 正是为这种目录准备的开关，代价比"测试代码不在仓库里"低得多。仓库外的 harness 对任何只 clone 本仓库的人来说等于不存在，自检 24/24 与闭环用例因此不可复现。
+
+**三处改动：**
+
+1. `AutoParking.csproj`：`<DefaultItemExcludes>$(DefaultItemExcludes);Tools\**</DefaultItemExcludes>`。
+2. `Tools\PlannerHarness\PlannerHarness.csproj`：链接路径从 `..\..\ThirdPartyPlugins\AutoParking\…` 改为 `$(PluginRoot)`（= `..\..\`），并把"这是开发者工程、永不被游戏加载"写进文件注释。
+3. 文档：AGENTS.md 的命令表与边界条款、两份 README 的 6.3 与架构一览、本文件里指向旧路径的三处。
+
+**为什么放在 `Tools\` 而不是仓库根**：`ThirdPartyPlugins\build_all.ps1` 用 `Get-ChildItem -Filter *.csproj -Depth 1` 收集插件，也就是 `ThirdPartyPlugins\*\*.csproj`。它把 `AutoParking.csproj` 当插件（正确），但摆在 `ThirdPartyPlugins\` 直属层的控制台工程会被它 build 完再复制进 `current\Plugins\`（错误）。放进 `Tools\` 后它落在深度 2，脚本看不到——这条是读脚本核实过的，不是猜的。
+
+**验证**（两条命令都按文档里的写法从仓库根执行）：
+
+| 检查 | 结果 |
+|---|---|
+| `dotnet build -c Release` | 0 错误，警告数与挪动前一致（13 个，均为既有） |
+| harness 有没有混进发布的 DLL | `bin\Release\AutoParking.dll` 里搜 `ClosedLoop` / `PlannerHarness`：**0 / 0** |
+| `dotnet run --project Tools/PlannerHarness -c Release` | 自检 24/24、闭环 4/5、具名用例逐条与挪动前同值，退出码仍 1（那条 1.4°） |
+| `git check-ignore` | `Tools\**\bin`、`Tools\**\obj` 已被既有的 `bin/`、`obj/` 规则覆盖，`.gitignore` 不用改 |
+
+**遗留**：旧目录 `..\..\scratch\PlannerHarness\` 只剩 `bin\`、`obj\` 两份生成物，源码已搬空；自动模式下对工作区外的删除被拦，需要手动删。

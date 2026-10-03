@@ -1,3 +1,21 @@
+# 本项目 100% 由 AI 生成，没有任何一行代码是人写的。
+
+- **没有任何人类逐行审过这份代码。** 它是 AI 编码代理在多次会话中产出的：没有设计评审、没有安全
+  评审、没有代码评审，也不存在一个"把每条分支都搞清楚了"的维护者。下面写的每一句都是模型说的话，
+  而模型会在自信的同时说错。
+- **它在开车。** 油门、刹车、挡位、转向以 60 Hz 打进一个正在运行的游戏。这里的 bug 不是崩溃，而是
+  一辆继续加速、刹不住、或者往反方向打轮的车。没有人走到过的分支，行为是**未知**，不是安全。
+- **按需求设计成永不自动中止。** 能结束一次泊车的只有你按下的热键（见「故障排查」）。这既是本项目的
+  明确要求，也是它最危险的一条性质——调试时手必须一直放在 `Abort` 上。
+- **验证非常薄。** 下文的 "24/24"、"已验证" 只意味着一个几何自检和一个自行车模型仿真器自洽，
+  **不代表**代码正确、完整，或在仿真从未建模的情况下安全。实车闭环调参仍未完成，见下面的状态说明。
+- **不要因为"以为有人检查过"就拿去部署、二开，或让编码代理直接合并。** 用就在游戏里、空场上用，
+  后果自己承担。正因为没做完，issue 和 PR 才欢迎。
+
+以下全部内容（包括这段警告）都由写代码的同一批 AI 产出。
+
+---
+
 # AutoParking — ETS2LA V3 自动泊车第三方插件
 
 在**平面地图**上选一个车位，插件把车位用 **AR 叠加层**画到游戏画面里，然后自动完成
@@ -23,7 +41,8 @@
    ```
    <ETS2LA 安装目录>\current\Plugins\AutoParking.dll
    ```
-   本仓库里部署到 `E:\ETS2LA\V3-C#\ETS2LA-win-release-Portable\current\Plugins\`。
+   如果同一个工作区里也有便携版主程序，那它就是 `.csproj` 的 HintPath 指向的同一棵 `current\`：
+   相对仓库根为 `..\..\ETS2LA-win-release-Portable\current\Plugins\`（见 `AGENTS.md`）。
 3. **重启 ETS2LA**（插件是影子复制加载的，热重载不可靠）。
 
 依赖：插件直接引用 `current\` 下的 `ETS2LA.*.dll` 与 `TruckLib*.dll`、`Hexa.NET.ImGui.dll`，
@@ -112,7 +131,7 @@
 `gear=实际/仪表 shifter=变速箱类型` 有没有变号。
 这能在 2 秒内回答"布尔动作到底进不进得去游戏"，不用跑完一整个泊车位。
 
-### 6.3 离线闭环仿真（仓库外，`scratch\PlannerHarness`）
+### 6.3 离线闭环仿真（`Tools\PlannerHarness`）
 自行车模型驱动真实的 `Follower`，输出横向/航向误差、换挡脉冲数，以及转向质量指标
 （满舵时长、方向盘换向次数、方向盘总行程）。具名用例每一个都是为了钉住一个只有逐 tick 才看得见的 bug：
 **挡箱失聪**（脉冲永不接合，必须降级为"继续行驶并补发"而不是死等）、**中途冒出障碍**（关掉重规划会停等到
@@ -120,7 +139,15 @@
 烧出 110 个脉冲）、**两段式路线**（唯一多段路径，曾经带着冻结的 `剩` 直接倒穿终点）、**刹不住冲过
 预热点**（不许把方向盘钉在追一个已经落到身后的视点上），以及一个合成的**距离退行**序列——闭环里
 已经没有自然触发场景，就用合成状态喂出"距终点变大"，确保那段"停车重排二段修正"的保险真的被执行过。
-之所以放在插件目录之外：插件 `.csproj` 用的是默认 globbing，任何 `.cs` 都会被编译进 DLL。
+它自己是一个控制台工程：
+
+```
+dotnet run --project Tools/PlannerHarness -c Release
+```
+
+放在 `Tools\` 下，插件 `.csproj` 用 `DefaultItemExcludes` 把这个目录整个挖掉——否则默认 globbing
+会把它直接编进发布的 DLL。它按 `<Compile Include>` 链接纯数学子集，而不是引用插件工程，所以
+不需要游戏、也不需要宿主 DLL，单独 clone 本仓库就能跑。
 
 ## 7. 架构一览
 
@@ -141,6 +168,7 @@ Rendering\
   MapOverlay.cs        平面地图窗口 + 选位/缩放/按钮
   ArOverlay.cs         游戏内 AR 绘制
 SettingsPage.razor     @page "/plugins/adjustments/local.autoparking"
+Tools\PlannerHarness\  离线仿真工程（6.3）：独立 csproj，靠 DefaultItemExcludes 从 DLL 里排除
 docs\                  设计文档 + 逐条实现记录（含被实测推翻的假设）
 ```
 
@@ -188,7 +216,10 @@ docs\                  设计文档 + 逐条实现记录（含被实测推翻的
 
 ## 9. 参考
 
-- ETS2LA V3 源码：`E:\ETS2LA\V3-C#\SourceCode`（只读参考，不得修改）
-- 平面地图渲染参考：`official-plugins\Plugins\InternalVisualization`
+以下路径都相对仓库根目录；`..\..\` 就是包含 `ThirdPartyPlugins\` 的那个 ETS2LA 工作区。
+
+- ETS2LA V3 源码：`..\..\SourceCode`（只读参考，不得修改）
+- 平面地图渲染参考：`..\..\official-plugins\Plugins\InternalVisualization`
 - 算法参考：V2 Python 版（V3 核心的 ACC 闭源）
 - 设计文档与逐条实现记录：`docs\2026-09-30-autoparking-design.md`
+- 修改本仓库的规则（给人，也给编码代理）：`AGENTS.md`

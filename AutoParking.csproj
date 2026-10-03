@@ -9,6 +9,9 @@
     <RootNamespace>AutoParking</RootNamespace>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <!-- Tools\ is the offline dev harness, a project of its own. Default globbing would compile
+         its sources straight into this DLL. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);Tools\**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>

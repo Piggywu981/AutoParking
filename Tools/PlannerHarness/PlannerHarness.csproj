@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Developer-only console harness: it links the pure-math subset of the plugin and drives it
+    offline, no game and no host DLLs required. It is never loaded by ETS2LA. The plugin project
+    excludes Tools\ from its default globs, so nothing here can leak into the shipped DLL.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AssemblyName>PlannerHarness</AssemblyName>
+    <PluginRoot>..\..\</PluginRoot>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="ClosedLoop.cs" />
+    <Compile Include="$(PluginRoot)Geometry.cs" />
+    <Compile Include="$(PluginRoot)Settings.cs" />
+    <Compile Include="$(PluginRoot)Driving\ObstacleSnapshot.cs" />
+    <Compile Include="$(PluginRoot)Driving\ParkingPath.cs" />
+    <Compile Include="$(PluginRoot)Driving\ReedsShepp.cs" />
+    <Compile Include="$(PluginRoot)Driving\Planner.cs" />
+    <Compile Include="$(PluginRoot)Driving\Follower.cs" />
+    <Compile Include="$(PluginRoot)Driving\PlannerSelfTest.cs" />
+  </ItemGroup>
+
+</Project>

@@ -1,3 +1,28 @@
+# THIS IS 100% AI-GENERATED CODE. NOT ONE LINE WAS WRITTEN BY A HUMAN.
+
+- **No human has read and approved this code.** It was produced by AI coding agents over many
+  sessions. There was no design review, no security review, no code review, and there is no
+  maintainer who understands every path through it. Everything below was asserted by a model —
+  and models assert confidently while being wrong.
+- **It drives a vehicle.** Throttle, brake, gear selection and steering are sent into a running
+  game at 60 Hz. A bug here is not a crash: it is a truck that keeps accelerating, does not brake,
+  or turns the wheel the wrong way. Behavior in an edge case nobody has reached is **unknown**, not
+  safe.
+- **By design, it will never stop itself.** The only thing that ends a maneuver is a hotkey you
+  press (see §8). That is an explicit requirement of this project and also its single most
+  dangerous property. Keep your hand on `Abort`.
+- **Verification is thin.** Numbers below such as "24/24" and "verified" mean one geometry
+  self-test and one bicycle-model simulator agree with themselves. They do **not** mean the code is
+  correct, complete, or safe under conditions the simulation never models. Real-truck tuning is
+  still unfinished, as the status note says.
+- **Do not deploy, fork, extend, or let a coding agent merge this on the assumption that somebody
+  checked.** Use it in a game, in an empty lot, at your own risk. Issues and pull requests are
+  welcome precisely because the work is unfinished.
+
+Everything below — including this warning — was written by the same agents that wrote the code.
+
+---
+
 # AutoParking — ETS2LA V3 Third-Party Auto Parking Plugin
 
 Pick a parking spot on a **flat (2D) map**, and the plugin draws it onto the game screen as an
@@ -27,7 +52,9 @@ transmission) / braking / steering** to back the tractor into the spot.
    ```
    <ETS2LA install dir>\current\Plugins\AutoParking.dll
    ```
-   In this repo it is deployed to `E:\ETS2LA\V3-C#\ETS2LA-win-release-Portable\current\Plugins\`.
+   In a workspace that also holds a portable host build, that is the same `current\` tree the
+   `.csproj` HintPaths point at: `..\..\ETS2LA-win-release-Portable\current\Plugins\` relative to
+   this repo root (see `AGENTS.md`).
 3. **Restart ETS2LA** (plugins are shadow-copy loaded; hot reload is unreliable).
 
 Dependencies: the plugin references `ETS2LA.*.dll`, `TruckLib*.dll`, and `Hexa.NET.ImGui.dll`
@@ -129,20 +156,29 @@ whether `gear=actual/dash shifter=transmission type` changed.
 This answers "do boolean actions actually reach the game?" in 2 seconds without running a
 whole parking maneuver.
 
-### 6.3 Offline Closed-Loop Simulation (outside the repo, `scratch\PlannerHarness`)
+### 6.3 Offline Closed-Loop Simulation (`Tools\PlannerHarness`)
 A bicycle model drives the real `Follower`, reporting lateral/heading error, gear-pulse
 counts, and steering quality metrics (full-lock duration, steering reversals, total steering
-wheel travel. Named cases, each one added to pin down a bug that was only visible in a trace:
+wheel travel). Named cases, each one added to pin down a bug that was only visible in a trace:
 **deaf gearbox** (pulses never engage — must degrade to "keep driving and re-send" instead of
 waiting forever), **blocker appears mid-maneuver** (re-planning off holds until the budget runs
 out, on reaches the spot), **automatic that drops to neutral at a standstill** (gear confirmation
 must accept the dashboard reading, or one shift costs 110 pulses), **two-segment shuttle** (the
-only multi-leg route; it used to drive through the target with `remaining` frozen), **unstopppable
+only multi-leg route; it used to drive through the target with `remaining` frozen), **unstoppable
 overshoot** (must not pin the wheel chasing an aim point that ended up behind the truck), and a
 synthetic **recession** sequence that feeds states where the distance to the spot grows, so the
 "stop and re-solve a correction" watchdog is actually exercised.
-It lives outside the plugin directory because the plugin `.csproj` uses default globbing —
-any `.cs` file would be compiled into the DLL.
+
+It is a console project of its own:
+
+```
+dotnet run --project Tools/PlannerHarness -c Release
+```
+
+It sits under `Tools\`, which the plugin `.csproj` carves out with `DefaultItemExcludes` —
+without that, default globbing would compile it straight into the shipped DLL. It links the
+pure-math subset of the sources rather than referencing the plugin project, so it needs neither
+the game nor the host DLLs and runs from a bare clone of this repo.
 
 ## 7. Architecture Overview
 
@@ -163,6 +199,7 @@ Rendering\
   MapOverlay.cs        Flat map window + spot picking/zoom/buttons
   ArOverlay.cs         In-game AR drawing
 SettingsPage.razor     @page "/plugins/adjustments/local.autoparking"
+Tools\PlannerHarness\  Offline harness (§6.3): own project, excluded from the DLL by DefaultItemExcludes
 docs\                  Design doc + per-item implementation log (incl. assumptions disproven by testing)
 ```
 
@@ -221,10 +258,13 @@ swallowed**.
 
 ## 9. References
 
-- ETS2LA V3 source: `E:\ETS2LA\V3-C#\SourceCode` (read-only reference, do not modify)
-- Flat map rendering reference: `official-plugins\Plugins\InternalVisualization`
+Paths are relative to this repo root; `..\..\` is the workspace that contains it (see `AGENTS.md`).
+
+- ETS2LA V3 host source: `..\..\SourceCode` (read-only reference, do not modify)
+- Flat map rendering reference: `..\..\official-plugins\Plugins\InternalVisualization`
 - Algorithm reference: V2 Python version (V3's core ACC is closed source)
 - Design doc & implementation log: `docs\2026-09-30-autoparking-design.md`
+- Rules for anyone editing this repo (and for coding agents): `AGENTS.md`
 
 ---
 
