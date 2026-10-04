@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Numerics;
 
 namespace AutoParking;
@@ -197,5 +198,74 @@ public static class Geometry
         }
 
         return minA <= maxB && minB <= maxA;
+    }
+
+    /// <summary>
+    ///  Smallest convex ring around a set of ground points. A prefab only publishes its control nodes,
+    ///  so this is deliberately an over-approximation of its footprint: an L-shaped lot comes out as
+    ///  the wedge that closes it. Fewer than three distinct points enclose nothing and are returned
+    ///  unchanged, which is the caller's cue to draw the points instead of a polygon.
+    /// </summary>
+    public static Vector2[] ConvexHull(Vector2[] points)
+    {
+        List<Vector2> unique = new();
+        foreach (Vector2 point in points)
+        {
+            bool seen = false;
+            foreach (Vector2 other in unique)
+            {
+                if (other == point)
+                {
+                    seen = true;
+                    break;
+                }
+            }
+
+            if (!seen)
+                unique.Add(point);
+        }
+
+        if (unique.Count < 3)
+            return points;
+
+        unique.Sort((a, b) => a.X != b.X ? a.X.CompareTo(b.X) : a.Y.CompareTo(b.Y));
+
+        Vector2[] hull = new Vector2[unique.Count * 2];
+        int size = 0;
+
+        for (int i = 0; i < unique.Count; i++)
+        {
+            while (size >= 2 && Cross(hull[size - 2], hull[size - 1], unique[i]) <= 0.0)
+                size--;
+            hull[size++] = unique[i];
+        }
+
+        int upper = size + 1;
+        for (int i = unique.Count - 2; i >= 0; i--)
+        {
+            while (size >= upper && Cross(hull[size - 2], hull[size - 1], unique[i]) <= 0.0)
+                size--;
+            hull[size++] = unique[i];
+        }
+
+        return size - 1 > 0 ? hull[..(size - 1)] : Array.Empty<Vector2>();
+    }
+
+    /// <summary>Area of a ground polygon, positive regardless of vertex order.</summary>
+    public static double PolygonArea(Vector2[] points)
+    {
+        double twice = 0.0;
+        for (int i = 0; i < points.Length; i++)
+        {
+            Vector2 next = points[(i + 1) % points.Length];
+            twice += (double)points[i].X * next.Y - (double)next.X * points[i].Y;
+        }
+
+        return Math.Abs(twice) * 0.5;
+    }
+
+    private static double Cross(Vector2 origin, Vector2 a, Vector2 b)
+    {
+        return (double)(a.X - origin.X) * (b.Y - origin.Y) - (double)(a.Y - origin.Y) * (b.X - origin.X);
     }
 }

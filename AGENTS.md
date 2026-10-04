@@ -2,7 +2,7 @@
 
 Working notes for anyone (human or agent) editing this plugin. Every rule below exists because
 breaking it caused a real bug or a lost day; full provenance in
-`docs\2026-09-30-autoparking-design.md` §17–§29.
+`docs\2026-09-30-autoparking-design.md` §17–§32.
 
 ## Commands
 
@@ -19,6 +19,7 @@ and to run the offline check; only the deploy row needs a full ETS2LA workspace.
 | Deploy | put `bin\Release\AutoParking.dll` into `..\..\ETS2LA-win-release-Portable\current\Plugins\` — that is the `current\` tree the `.csproj` HintPaths already read host DLLs from, so the deploy target is wherever this checkout's host install is. Then **restart ETS2LA**: plugins are shadow-copy loaded and a running host keeps the old DLL |
 | Offline check | `dotnet run --project Tools/PlannerHarness -c Release` (planner self-test + closed-loop sim; pure math, no game and no host DLLs) |
 | Data surface dump | `dotnet run --project Tools/MapSurfaceDump -c Release` — reflects the **installed** `TruckLib.dll` / `TruckLib.Models.dll` and prints every public member of each map item and PPD/PMD type. Run it before claiming a map field exists or is missing: the source snapshot is not authoritative, and grepping a hand-written list of candidate names out of a binary produced a false negative once (design doc §29) |
+| Offline sector read | `dotnet run --project Tools/MapSectorDump -c Release -- <游戏目录或某个 .scs> [x z 半径]` — stages the `.mbd` plus one sector from every archive in mount order and classifies it with the plugin's own `MapItemSurface`/`MapItemProbe`, so the offline answer and the in-game 地图清单 cannot disagree. Settles "is this object in the map data at all?" without running the game (§30) |
 
 No CI, no linter, no `dotnet test` project. The harness plus the in-game probes on the settings
 page are the entire verification story.
@@ -106,6 +107,16 @@ plugin's own tolerances, which is how it catches regressions the game would stil
   Intersections / TriggerPoints` but **no placed-model list** — props bundled inside a prefab are
   unreachable unless we parse `.pdll`/`.ppd` model sections ourselves. So the drawing order is:
   item geometry (free), PMD boxes (per token, expensive), prefab interior (not available).
+
+- **Tokens in map data are often numeric hashes, not names.** Measured in ATS (§30): `Model` tokens
+  come out as `1061`, `5110`, `277`; `Sign` as `539`, `540`; only `Buildings` scheme names read as
+  text (`scheme1048`). So `PmdFileHandler.GetPmdModel(token)`, which keys on the name suffix from
+  `/def/world/*.sii`, will not resolve the numeric ones — any real-footprint work has to map
+  hash → unit name first. Do not assume the name lookup works because one class happens to be textual.
+- **A DLC adds sectors to a map without shipping its own `.mbd`.** True for the game's parser and for
+  anything reading the archives offline: the sector directory is whatever the base `.mbd` names, and
+  later archives drop more `sec*` files into it. `Tools\MapSectorDump` accumulates sector directories
+  across archives for exactly this reason.
 
 ## Definition of done
 

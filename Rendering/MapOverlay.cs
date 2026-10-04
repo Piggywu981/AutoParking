@@ -50,6 +50,7 @@ internal sealed class MapOverlay
     private static readonly uint ColorSign = Color(0.55f, 0.65f, 0.95f);
     private static readonly uint ColorArea = Color(0.45f, 0.80f, 0.70f);
     private static readonly uint ColorStaticOther = Color(0.75f, 0.75f, 0.75f, 0.9f);
+    private static readonly uint ColorPrefab = Color(0.80f, 0.68f, 0.45f, 0.80f);
 
     /// <summary>
     ///  Per-class colors for the static layer. Anything not named here still gets drawn - in gray -
@@ -72,6 +73,7 @@ internal sealed class MapOverlay
     private static readonly uint ColorTargetLocked = Color(0.35f, 0.90f, 0.95f);
     private static readonly uint ColorGrid = Color(1f, 1f, 1f, 0.07f);
     private static readonly uint ColorCanvasEdge = Color(1f, 1f, 1f, 0.22f);
+    private static readonly uint ColorSampleEdge = Color(1f, 1f, 1f, 0.16f);
     private static readonly uint ColorText = Color(0.92f, 0.92f, 0.92f);
     private static readonly uint ColorRouteForward = Color(0.35f, 0.85f, 0.95f);
     private static readonly uint ColorRouteReverse = Color(0.98f, 0.62f, 0.20f);
@@ -103,12 +105,11 @@ internal sealed class MapOverlay
         definition = new WindowDefinition
         {
             Title = WindowTitle,
-            // NoResize only. The whole window border is an ImGui resize grab and the canvas reaches
-            // to within Padding of it, so a press meant for the map edge was grabbing the border
-            // instead - and the window rect, which the projection reads every frame, moved under the
-            // drag. Moving the panel stays allowed: ImGui drags a window from its title bar only,
-            // which is above the canvas rectangle and therefore never read as a pick.
-            Flags = ImGuiWindowFlags.NoResize,
+            // No flags: the panel is movable and resizable again. It was NoResize because a press
+            // near the map edge grabbed ImGui's resize border and the window rect - which the
+            // projection reads every frame - slid under the drag. The pick gesture no longer depends
+            // on that: the projection is latched when the button goes down and the heading has a dead
+            // zone, so a resize cannot silently choose the truck's orientation.
             Width = WindowWidth,
             Height = WindowHeight,
             X = 24,
@@ -216,6 +217,8 @@ internal sealed class MapOverlay
             ImGui.SameLine();
             ImGui.TextColored(new Vector4(0.75f, 0.75f, 0.75f, 1f), "其他条目");
             ImGui.SameLine();
+            ImGui.TextColored(new Vector4(0.80f, 0.68f, 0.45f, 1f), "沙色=prefab 轮廓（凸包近似）");
+            ImGui.SameLine();
             ImGui.TextColored(new Vector4(0.55f, 0.55f, 0.55f, 1f), "· 实心=地图标记可碰");
         }
 
@@ -247,6 +250,30 @@ internal sealed class MapOverlay
         foreach (Vector2[] curve in geometry.DriveableCurves)
         {
             DrawPolyline(drawList, curve, ColorCurve, 1.5f, canvasCenter, truckPlane, scale);
+        }
+
+        // Prefab footprints are the convex hull of the prefab's control nodes - the only ground
+        // positions the map publishes for them. Drawn under everything else and in its own hue
+        // because it is orientation, not an obstacle: the spot being parked in usually sits inside
+        // the very outline appearing here.
+        foreach (MapGeometry.PrefabOutline outline in geometry.PrefabOutlines)
+        {
+            Vector2[] ring = new Vector2[outline.Ring.Length];
+            for (int i = 0; i < outline.Ring.Length; i++)
+                ring[i] = ToCanvas(outline.Ring[i], canvasCenter, truckPlane, scale);
+
+            if (ring.Length < 3)
+            {
+                foreach (Vector2 point in ring)
+                    drawList.AddCircle(point, 2.5f, ColorPrefab, 0, 1.2f);
+            }
+            else
+            {
+                for (int i = 0; i < ring.Length; i++)
+                    drawList.AddLine(ring[i], ring[(i + 1) % ring.Length], ColorPrefab, 1.2f);
+
+                drawList.AddCircleFilled(ToCanvas(outline.Center, canvasCenter, truckPlane, scale), 1.8f, ColorPrefab);
+            }
         }
 
         foreach (MapGeometry.StaticShape shape in geometry.StaticShapes)
@@ -292,6 +319,15 @@ internal sealed class MapOverlay
         {
             DrawRoute(drawList, plan.Path, canvasCenter, truckPlane, scale);
         }
+
+        // The sample is a circle around the truck and the canvas is a rectangle, so "not drawn" is
+        // very often just "not visible". Show the boundary and both radii instead of leaving that to
+        // guesswork - the counts in the corner are what the 地图数据 status row says, on the canvas.
+        drawList.AddCircle(canvasCenter, (float)(geometry.RadiusM * scale), ColorSampleEdge, 64, 1f);
+        float visibleM = MathF.Sqrt(MathF.Pow((canvasMax.X - canvasMin.X) * 0.5f, 2f)
+                                  + MathF.Pow((canvasMax.Y - canvasMin.Y) * 0.5f, 2f)) / scale;
+        drawList.AddText(canvasMin + new Vector2(10f, (canvasMax.Y - canvasMin.Y) - 16f), ColorText,
+            $"采样 {geometry.RadiusM:0} m · 可见 ±{visibleM:0} m · 静态 {geometry.StaticShapes.Count} 项 · 场站轮廓 {geometry.PrefabOutlines.Count}");
 
         DrawScaleBar(drawList, canvasMin, scale);
         HandleMouse(interactive, canvasMin, canvasMax, canvasCenter, truckPlane, scale, settings, geometry);

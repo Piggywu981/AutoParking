@@ -7,6 +7,25 @@ using TruckLib.ScsMap;
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
 
+// Optional: pass the path of one assembly to dump only that one (e.g. TruckLib.HashFs.dll when the
+// question is "what does IFileSystem actually offer?").
+if (args.Length > 0)
+{
+    Assembly single = Assembly.LoadFrom(args[0]);
+    Console.WriteLine($"# {single.GetName().Name}");
+    foreach (Type type in single.GetTypes().Where(t => t.IsPublic).OrderBy(t => t.FullName, StringComparer.Ordinal))
+    {
+        Console.WriteLine($"{type.FullName} : {type.BaseType?.Name}");
+        foreach (MemberInfo member in type.GetMembers(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly)
+                                         .OrderBy(m => m.Name, StringComparer.Ordinal))
+        {
+            Console.WriteLine($"    {member.MemberType} {member.Name}");
+        }
+    }
+
+    return;
+}
+
 Assembly scs = typeof(Map).Assembly;
 Assembly models = typeof(TruckLib.Models.Ppd.PrefabDescriptor).Assembly;
 

@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Developer-only offline reader: it opens a game .scs directly, parses the ONE sector around a
+    coordinate, and prints what the map data actually contains there. It exists because "why is that
+    crate not drawn" was being answered by guessing, while the answer is a fact about the files and
+    does not need the game running at all.
+
+    It links the same classification sources the plugin uses (Rendering\MapItemSurface.cs,
+    Rendering\MapItemProbe.cs), so the two cannot disagree about what a class is called.
+
+    Lives under Tools\: the plugin .csproj carves Tools\ out of its default globs, and
+    ThirdPartyPlugins\build_all.ps1 only collects csproj files one level down.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AssemblyName>MapSectorDump</AssemblyName>
+    <PluginRoot>..\..\</PluginRoot>
+    <HostDir>..\..\..\..\ETS2LA-win-release-Portable\current\</HostDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="$(PluginRoot)Geometry.cs" />
+    <Compile Include="$(PluginRoot)Rendering\MapItemProbe.cs" />
+    <Compile Include="$(PluginRoot)Rendering\MapItemSurface.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="TruckLib">
+      <HintPath>$(HostDir)TruckLib.dll</HintPath>
+    </Reference>
+    <Reference Include="TruckLib.Core">
+      <HintPath>$(HostDir)TruckLib.Core.dll</HintPath>
+    </Reference>
+    <Reference Include="TruckLib.HashFs">
+      <HintPath>$(HostDir)TruckLib.HashFs.dll</HintPath>
+    </Reference>
+    <Reference Include="TruckLib.Models">
+      <HintPath>$(HostDir)TruckLib.Models.dll</HintPath>
+    </Reference>
+    <Reference Include="RBush">
+      <HintPath>$(HostDir)RBush.dll</HintPath>
+    </Reference>
+    <Reference Include="GisDeflate">
+      <HintPath>$(HostDir)GisDeflate.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>

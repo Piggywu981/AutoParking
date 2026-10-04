@@ -47,6 +47,15 @@ public sealed class MapGeometry
 
     public readonly record struct StaticShape(Vector2[] Points, string Kind, string Token, bool Collision, bool Closed);
 
+    /// <summary>
+    ///  Convex hull of a prefab's control nodes. The map publishes no footprint for a prefab, so this
+    ///  is an over-approximation drawn for orientation only - and it is deliberately not an obstacle,
+    ///  because the parking spot usually sits inside the very prefab being outlined.
+    /// </summary>
+    public readonly List<PrefabOutline> PrefabOutlines = new();
+
+    public readonly record struct PrefabOutline(Vector2[] Ring, Vector2 Center, string Token, int NodeCount, double AreaM2);
+
     /// <summary>True when a cap below cut collection short, so the picture is not the whole sample.</summary>
     public bool StaticTruncated;
 
@@ -115,6 +124,7 @@ public sealed class MapGeometryBuilder
     // thousands of loose models, and the sample is rebuilt twice a second on the tick thread.
     // When a cap bites, MapGeometry.StaticTruncated says so instead of quietly under-drawing.
     private const int MaxStaticShapes = 4000;
+    private const int MaxPrefabOutlines = 400;
 
     // Roads and terrain already have a better rendering (lane centerlines), and a compound's own node
     // sits on top of the children that are now drawn individually.
@@ -214,11 +224,12 @@ public sealed class MapGeometryBuilder
             foreach (Prefab prefab in prefabs)
             {
                 AddPrefab(prefab, geometry);
+                AddPrefabOutline(prefab, geometry);
             }
 
             geometry.Obstacles = ObstacleScanner.Scan(center, radiusM);
             geometry.Status = $"道路 {roads.Count} 段 / 场站 {prefabs.Count} 个 / 障碍 {geometry.Obstacles.Count}" +
-                              $" / 静态 {geometry.StaticShapes.Count} 项" +
+                              $" / 静态 {geometry.StaticShapes.Count} 项 / 场站轮廓 {geometry.PrefabOutlines.Count}" +
                               (geometry.StaticTruncated ? "（静态内容已截断）" : "");
         }
         catch (Exception ex)
@@ -269,10 +280,10 @@ public sealed class MapGeometryBuilder
     private static void Visit(IMapObject? item, Node reachedVia, MapGeometry geometry, MapItemProbe probe,
                               HashSet<ulong> staticTaken, bool nested)
     {
-        if (!Describe(item, out string itemType, out string? token, out bool collision))
+        if (!MapItemSurface.Describe(item, out string itemType, out string? token, out bool collision))
             return;
 
-        probe.Add(item!.Uid, itemType, token, collision, GroundPosition(item, reachedVia), nested);
+        probe.Add(item!.Uid, itemType, token, collision, MapItemSurface.GroundPosition(item, reachedVia), nested);
         CollectShape(item, itemType, token, collision, geometry, staticTaken);
 
         // A compound keeps its children in its own dictionaries - CompoundSerializer fills
@@ -290,69 +301,6 @@ public sealed class MapGeometryBuilder
     }
 
     /// <summary>
-    ///  Where the item sits on the ground. The item's own nodes beat the node we arrived through:
-    ///  a polyline's endpoints are its geometry, and the arrival node is whichever end was in range.
-    /// </summary>
-    private static Vector2 GroundPosition(IMapObject item, Node reachedVia)
-    {
-        return item switch
-        {
-            SingleNodeItem { Node: not null } single => Geometry.ToPlane(single.Node.Position),
-            PolylineItem { Node: not null } polyline => Geometry.ToPlane(polyline.Node.Position),
-            _ => Geometry.ToPlane(reachedVia.Position)
-        };
-    }
-
-    /// <summary>
-    ///  Type name, model/scheme token and collision flag for one map item. Named types are listed
-    ///  explicitly because the token that identifies them differs per class; anything else still has
-    ///  to be counted, which is the whole point of measuring before classifying.
-    /// </summary>
-    private static bool Describe(IMapObject? item, out string itemType, out string? token, out bool collision)
-    {
-        itemType = "";
-        token = null;
-        collision = false;
-
-        switch (item)
-        {
-            case Road road:
-                itemType = "Road";
-                token = road.RoadType.ToString();
-                return true;
-            case Prefab prefab:
-                itemType = "Prefab";
-                token = prefab.Model.ToString();
-                collision = prefab.Collision;
-                return true;
-            case Buildings building:
-                itemType = "Buildings";
-                token = building.Name.ToString();
-                collision = building.Collision;
-                return true;
-            case TruckLib.ScsMap.Sign sign:
-                itemType = "Sign";
-                token = sign.Model.ToString();
-                return true;
-            // Fully qualified: TruckLib.Models.Model (the PMD mesh) shares the short name.
-            case TruckLib.ScsMap.Model model:
-                itemType = "Model";
-                token = model.Name.ToString();
-                collision = model.Collision;
-                return true;
-            case Compound compound:
-                itemType = "Compound";
-                collision = compound.Collision;
-                return true;
-            case MapItem other:
-                itemType = other.ItemType.ToString();
-                return true;
-            default:
-                return false;
-        }
-    }
-
-    /// <summary>
     ///  Pulls the drawable ground geometry out of the item classes the probe only counts. Every one
     ///  of these is reached twice (once from each end node), hence the UID set. Nothing collected
     ///  here feeds the planner yet - 建筑线段和点位现在只是画出来给人看的.
@@ -363,7 +311,7 @@ public sealed class MapGeometryBuilder
         if (SkippedShapeKinds.Contains(kind) || !taken.Add(item.Uid))
             return;
 
-        if (!TryShape(item, out Vector2[]? points, out bool closed) || points == null)
+        if (!MapItemSurface.TryShape(item, out Vector2[]? points, out bool closed) || points == null)
             return;
 
         if (geometry.StaticShapes.Count >= MaxStaticShapes)
@@ -376,34 +324,35 @@ public sealed class MapGeometryBuilder
     }
 
     /// <summary>
-    ///  Ground geometry of one map item, in the shape its class defines: a point, a segment, a chain,
-    ///  a ring. A polyline item's own two nodes are the endpoints - not whichever node the walk
-    ///  arrived through, which would draw half a wall.
+    ///  A prefab's footprint, approximated as the convex hull of its control nodes: those are the only
+    ///  ground positions the map publishes for it. Over-approximated on purpose and never an obstacle -
+    ///  the spot being parked in normally sits inside the prefab, so blocking on this would block the
+    ///  maneuver itself.
     /// </summary>
-    private static bool TryShape(IMapObject item, out Vector2[]? points, out bool closed)
+    private static void AddPrefabOutline(Prefab prefab, MapGeometry geometry)
     {
-        points = null;
-        closed = false;
-
-        switch (item)
+        if (geometry.PrefabOutlines.Count >= MaxPrefabOutlines)
         {
-            case SingleNodeItem { Node: not null } single:
-                points = new[] { Geometry.ToPlane(single.Node.Position) };
-                closed = true;
-                return true;
-            case PolylineItem { Node: not null, ForwardNode: not null } line:
-                points = new[] { Geometry.ToPlane(line.Node.Position), Geometry.ToPlane(line.ForwardNode.Position) };
-                return true;
-            case PathItem { Nodes: { Count: > 1 } } path:
-                points = path.Nodes.Select(node => Geometry.ToPlane(node.Position)).ToArray();
-                return true;
-            case PolygonItem { Nodes: { Count: > 2 } } area:
-                points = area.Nodes.Select(node => Geometry.ToPlane(node.Position)).ToArray();
-                closed = true;
-                return true;
-            default:
-                return false;
+            geometry.StaticTruncated = true;
+            return;
         }
+
+        List<Vector2> nodes = new();
+        foreach (INode node in prefab.Nodes)
+        {
+            if (node != null)
+                nodes.Add(Geometry.ToPlane(node.Position));
+        }
+
+        if (nodes.Count == 0)
+            return;
+
+        Vector2[] points = nodes.ToArray();
+        Vector2 center = new(points.Average(point => point.X), points.Average(point => point.Y));
+        Vector2[] ring = Geometry.ConvexHull(points);
+
+        geometry.PrefabOutlines.Add(new MapGeometry.PrefabOutline(ring, center, prefab.Model.ToString(),
+                                                                  points.Length, Geometry.PolygonArea(ring)));
     }
 
     private void AddRoad(Road road, MapGeometry geometry)

@@ -120,8 +120,27 @@ Console.WriteLine();
 Console.WriteLine("地图内容探针（纯逻辑：去重、排序、截断、行数预算）：");
 int probeFailures = MapProbeChecks.Run();
 
+Console.WriteLine();
+Console.WriteLine("prefab 轮廓（只能由控制点取凸包，所以是近似）：");
+Vector2[] hullSquare = Geometry.ConvexHull(new[]
+{
+    new Vector2(0, 0), new Vector2(10, 0), new Vector2(10, 10), new Vector2(0, 10), new Vector2(5, 5)
+});
+double hullArea = Geometry.PolygonArea(hullSquare);
+bool hullDropsInterior = hullSquare.Length == 4 && Math.Abs(hullArea - 100.0) < 1e-6;
+Console.WriteLine($"  {(hullDropsInterior ? "✓" : "✗")} 内部点被剔除：{hullSquare.Length} 个顶点 · 面积 {hullArea:0.###}（判据 4 / 100）");
+
+Vector2[] hullCollinear = Geometry.ConvexHull(new[] { new Vector2(0, 0), new Vector2(5, 0), new Vector2(10, 0) });
+bool hullDegenerates = hullCollinear.Length < 3;
+Console.WriteLine($"  {(hullDegenerates ? "✓" : "✗")} 共线点不成多边形：{hullCollinear.Length} 个（判据 < 3，调用方据此改画点/线）");
+
+Vector2[] hullPair = Geometry.ConvexHull(new[] { new Vector2(1, 2), new Vector2(3, 4) });
+bool hullPairSafe = hullPair.Length == 2 && Geometry.PolygonArea(hullPair) == 0.0;
+Console.WriteLine($"  {(hullPairSafe ? "✓" : "✗")} 两点输入不崩、面积为 0：{hullPair.Length} 个");
+
 return report.Failures.Count == 0 && simPassed == 5 && keptGoing && stagedLeg.Reached
-    && replanWorks && autoNeutralOk && unwinds && watchdogWorks && pickDragOk && probeFailures == 0 ? 0 : 1;
+    && replanWorks && autoNeutralOk && unwinds && watchdogWorks && pickDragOk && probeFailures == 0
+    && hullDropsInterior && hullDegenerates && hullPairSafe ? 0 : 1;
 
 // The recession watchdog needs states that make the distance grow. Nothing in the closed loop does
 // that any more - the window fix removed the pinning that used to - so it is fed synthetic ones:

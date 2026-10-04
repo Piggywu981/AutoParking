@@ -87,7 +87,12 @@ when that row or probe is rendered.
     **That layer is drawn but does not block the route yet** (§6.4 explains why the order is
     measure → draw → plan; see also the caps in `MapGeometry.cs`), and whether it shows anything at
     all depends on the host's Data Fidelity — buildings need Medium, models need High.
-    The 地图数据 status row carries the counts (`静态 N 项`).
+    The 地图数据 status row carries the counts (`静态 N 项 / 场站轮廓 M`).
+    Sand-coloured rings are **prefab footprints approximated as the convex hull of the prefab's control
+    nodes** — the only ground positions the map publishes for a prefab. They are orientation, not
+    obstacles (the spot normally sits inside the outline being drawn), they over-approximate L-shaped
+    and roundabout pieces, and a 2-node prefab forms no polygon at all. Design doc §31 shows what this
+    looked like on a real depot: road-junction pieces, not the containers in front of the truck.
   - **AR overlay** (on the game screen, on by default): spot box, vehicle footprint projection,
     forward-direction arrow, target pose.
 
@@ -236,6 +241,22 @@ Note: which item types reach `MapData` at all is decided by the host's **Data Fi
 survive Medium, street lamps and other loose models need **High**, company/city POI areas need
 **Extreme**. Changing it means re-parsing (restart), not a live knob.
 
+### 6.5 Offline sector read (`Tools\MapSectorDump`)
+Asks §6.4's question — *what is actually there* — from the game's own `.scs` files instead of a live
+session. It stages the `.mbd` plus the single sector around a coordinate, taking files from every
+archive in mount order (base supplies the map, a DLC adds sectors without carrying an `.mbd` of its
+own), and classifies them with the plugin's own `MapItemSurface` / `MapItemProbe`, so the offline
+answer and the in-game inventory cannot drift apart.
+
+```
+dotnet run --project Tools/MapSectorDump -c Release -- <game dir or one .scs> [x z radius]
+```
+
+Run it before writing any obstacle-classification rule: it is the only cheap way to tell three
+different situations apart — the object is not in the map data, it is in the data but unreachable
+(prefab interior geometry), or it is present and merely off-screen. Design doc §30 records what it
+answered the first time it was run.
+
 ## 7. Architecture Overview
 
 ```
@@ -253,10 +274,13 @@ Driving\
 Rendering\
   MapGeometry.cs       map/ppd data → drawable geometry (incl. prefab descriptor parsing)
   MapItemProbe.cs      What the same node walk contains, bucketed by map item type (read-only, §6.4)
+  MapItemSurface.cs    One item's type name / token / collision flag / ground shape - shared with the offline reader
   MapOverlay.cs        Flat map window + spot picking/zoom/buttons
   ArOverlay.cs         In-game AR drawing
 SettingsPage.razor     @page "/plugins/adjustments/local.autoparking"
 Tools\PlannerHarness\  Offline harness (§6.3): own project, excluded from the DLL by DefaultItemExcludes
+Tools\MapSurfaceDump\  Reflects the installed TruckLib assemblies - what a plugin can actually read
+Tools\MapSectorDump\   Reads one map sector straight out of the .scs files, no game (§6.5)
 docs\                  Design doc + per-item implementation log (incl. assumptions disproven by testing)
 ```
 
@@ -285,7 +309,7 @@ Meaning of a few log lines:
 
 Seven field observations that each turned out to be a real bug or a real constraint, with the tell
 that found it — all recorded with evidence in
-`docs\2026-09-30-autoparking-design.md` §17–§29:
+`docs\2026-09-30-autoparking-design.md` §17–§32:
 
 - **Pedals do nothing (or stop the moment you click the overlay)** → read `transport=` on the brake
   probe / the **pedal transport** status row. `legacy` means the host routes our throttle and brake
@@ -323,6 +347,8 @@ that found it — all recorded with evidence in
   that is not shown on the UI map — which is exactly the class of quiet depot you park in.
   Read the number before touching anything: the 地图数据 row ends with `建筑 N 段 / 点位 M`, and
   设置 → 地图清单 logs the per-class breakdown plus the fidelity the host is actually using.
+  And if the inventory lists no `Model` and no `Buildings` while the objects are standing right in
+  front of you, they are prefab interior geometry — no layer will ever draw them (§6.5, design doc §30).
 
 Two older pitfalls, still the first things to suspect:
 
