@@ -49,6 +49,10 @@
                 Description="点选时把车位吸附到附近建筑导航曲线的方向上，避免车头朝向乱指。"
                 Value="@Plugin.Settings.SnapToNavCurve"
                 ValueChanged="@((bool value) => Plugin.HandleAction("snapToNavCurve", value))" />
+        <Switch Title="锁定地图窗口"
+                Description="冻结平面地图窗口的位置和大小。地图画布几乎贴到窗口边框，而 ImGui 的窗口可以从边框任意处抓住拖动——在地图边缘按下会把整个窗口拖着走，朝向就变成「窗口移动了多少」而不是「手转了多少」。需要挪窗口时关掉即可；地图窗口里也有同一个开关。"
+                Value="@Plugin.Settings.LockMapWindow"
+                ValueChanged="@((bool value) => Plugin.HandleAction("lockMapWindow", value))" />
 
         <Slider Title="车身长度 (m)"
                 Description="地图上车位框和 AR 里的地面框都按这个尺寸画。用小车测试时请改小。"

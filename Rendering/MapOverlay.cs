@@ -84,6 +84,12 @@ internal sealed class MapOverlay
     private bool registered;
     private bool draggingHeading;
 
+    /// <summary>
+    ///  The lock state currently handed to the host. Kept separate from the setting so the frame
+    ///  that changes it is the frame that re-registers, and nothing else does.
+    /// </summary>
+    private bool windowLocked;
+
     // The projection latched when the pick-drag started. The map is drawn centred on the truck and
     // the truck moves, so a drag measured against the live projection is a race: the spot slides
     // under the cursor and the gesture's angle follows the truck instead of the hand.
@@ -102,24 +108,38 @@ internal sealed class MapOverlay
         if (registered)
             return;
 
-        definition = new WindowDefinition
+        windowLocked = plugin.Settings.LockMapWindow;
+        definition = BuildDefinition(windowLocked);
+
+        OverlayHandler.Current.RegisterWindow(definition, Render);
+        ApplyOpenState(open);
+        registered = true;
+    }
+
+    /// <summary>
+    ///  The window flags are the pick gesture's reference frame. A press inside the canvas is also a
+    ///  press on the window, and ImGui grabs a window from anywhere along its border - the canvas
+    ///  stops Padding short of it, so the edge of the map *is* the edge of the window. When that grab
+    ///  lands, the rect slides under the drag and the heading follows the window instead of the hand.
+    ///  Locking is a switch, not a permanent flag: the panel does need to be moved out of the way,
+    ///  and a build that simply forbade it was reverted for exactly that reason (design doc §27).
+    ///  Re-registering is how this changes at runtime - the host reads Flags at every Begin
+    ///  (`Overlay.cs:385`) and RegisterWindow replaces the stored definition for a title it already
+    ///  knows instead of adding a second window, so nothing is recreated and the position holds
+    ///  (X/Y are applied with `ImGuiCond.Once`, i.e. only the first time the window appears).
+    /// </summary>
+    private static WindowDefinition BuildDefinition(bool locked)
+    {
+        return new WindowDefinition
         {
             Title = WindowTitle,
-            // No flags: the panel is movable and resizable again. It was NoResize because a press
-            // near the map edge grabbed ImGui's resize border and the window rect - which the
-            // projection reads every frame - slid under the drag. The pick gesture no longer depends
-            // on that: the projection is latched when the button goes down and the heading has a dead
-            // zone, so a resize cannot silently choose the truck's orientation.
+            Flags = locked ? ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoResize : ImGuiWindowFlags.None,
             Width = WindowWidth,
             Height = WindowHeight,
             X = 24,
             Y = 180,
             Alpha = 0.86f
         };
-
-        OverlayHandler.Current.RegisterWindow(definition, Render);
-        ApplyOpenState(open);
-        registered = true;
     }
 
     public void Unregister()
@@ -149,6 +169,16 @@ internal sealed class MapOverlay
     private void Render()
     {
         AutoParkingSettings settings = plugin.Settings;
+
+        // Takes effect on the next Begin, not this one - the host already read the flags for this
+        // frame before calling us. Irrelevant to a hand, which cannot press and drag in one frame.
+        if (settings.LockMapWindow != windowLocked)
+        {
+            windowLocked = settings.LockMapWindow;
+            definition = BuildDefinition(windowLocked);
+            OverlayHandler.Current.RegisterWindow(definition, Render);
+        }
+
         Pose2 truck = plugin.CurrentPose;
         MapGeometry? geometry = plugin.MapGeometrySnapshot;
         Pose2? target = plugin.TargetPose;
@@ -396,6 +426,13 @@ internal sealed class MapOverlay
         }
 
         ImGui.SameLine();
+        bool locked = settings.LockMapWindow;
+        if (ImGui.Checkbox("锁定窗口", ref locked))
+        {
+            plugin.HandleAction("lockMapWindow", locked);
+        }
+
+        ImGui.SameLine();
         ImGui.TextUnformatted($"比例 {settings.EffectiveMapPixelsPerMeter:0.00} px/m");
 
         ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f),
@@ -470,7 +507,7 @@ internal sealed class MapOverlay
                 double mapSlid = Geometry.Distance(dragTruckPlane, truckPlane) * dragScale;
                 double rectMoved = Geometry.Distance(dragCanvasMin, canvasMin);
                 Logger.Info($"AutoParking: 选位结束 朝向={released.YawDegrees:0.0}° 拖动={radius:0} px（死区 {HeadingDeadZonePx:0}）" +
-                            $" 期间地图滑动={mapSlid:0} px 画布位移={rectMoved:0} px");
+                            $" 期间地图滑动={mapSlid:0} px 画布位移={rectMoved:0} px 窗口锁定={(settings.LockMapWindow ? 1 : 0)}");
                 plugin.SetTarget(released);   // persist once, on release
             }
 

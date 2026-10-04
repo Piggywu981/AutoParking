@@ -939,6 +939,10 @@ public sealed class AutoParkingPlugin : Plugin
                     settings.SnapToNavCurve = ToBool(value, settings.SnapToNavCurve);
                     changed = true;
                     break;
+                case "lockMapWindow":
+                    settings.LockMapWindow = ToBool(value, settings.LockMapWindow);
+                    changed = true;
+                    break;
                 case "vehicleLength":
                     settings.VehicleLengthM = ToDouble(value, settings.VehicleLengthM);
                     changed = true;

@@ -115,6 +115,14 @@ public sealed class AutoParkingSettings
     public double MapViewRadiusM { get; set; } = 120.0;
     public bool SnapToNavCurve { get; set; } = true;
 
+    /// <summary>
+    ///  Freeze the map panel's position and size. ImGui grabs a window from anywhere on its border,
+    ///  and the canvas reaches to within Padding of that border, so a press meant for the edge of the
+    ///  map moved the rect under the pick. Worth a switch rather than a permanent flag because the
+    ///  panel genuinely needs repositioning some of the time.
+    /// </summary>
+    public bool LockMapWindow { get; set; } = false;
+
     // Saved so reloading the plugin does not silently lose the spot you picked.
     public bool HasSavedSpot { get; set; } = false;
     public double SavedSpotX { get; set; }

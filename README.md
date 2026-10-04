@@ -93,6 +93,9 @@ when that row or probe is rendered.
     obstacles (the spot normally sits inside the outline being drawn), they over-approximate L-shaped
     and roundabout pieces, and a 2-node prefab forms no polygon at all. Design doc §31 shows what this
     looked like on a real depot: road-junction pieces, not the containers in front of the truck.
+    The button row ends with a **lock-window checkbox**: while ticked, the panel's position and size
+    are frozen (`ImGuiWindowFlags.NoMove | NoResize`), which is what makes a pick deterministic — see
+    §8. Off by default, because the panel does need to be moved out of the way sometimes.
   - **AR overlay** (on the game screen, on by default): spot box, vehicle footprint projection,
     forward-direction arrow, target pose.
 
@@ -121,8 +124,10 @@ used to cut our pedal authority mid-maneuver, and now it does not. Keep `Abort` 
 2. Click/adjust the target pose on the flat map, or use "Saved spot" to recall the last one.
    The click places the spot and takes the truck's current heading; **drag out of the circle that
    appears to point the nose** (inside ~12 px the direction is ignored — the pivot is under your
-   cursor, so a one-pixel jitter would otherwise pick the heading). The AR overlay draws the spot
-   simultaneously so you can verify that map coordinates line up
+   cursor, so a one-pixel jitter would otherwise pick the heading). **If you pick near the edge of the
+   canvas, tick 锁定窗口 first** — there, a press on the map is also a press on the panel border, and a
+   window sliding under the drag makes the heading measure the window instead of the hand (§8).
+   The AR overlay draws the spot simultaneously so you can verify that map coordinates line up
    with the actual in-game position.
 3. To preview first, keep **Dry-run on**: all control values are computed and displayed but
    never sent to the game.
@@ -161,6 +166,7 @@ path unsolvable or blocked by an obstacle / path too long.
 | | `MaxReplans` | 3 | Cap on swaps; after it the route is frozen again. Hitting the cap does **not** abort — only the hotkey ends the maneuver |
 | Finish | `HandbrakeOnFinish` / `RestoreAssistsOnFinish` | true | Apply handbrake and restore driver assists on completion |
 | Visualization | `MapScalePxPerM` / `MapZoom` / `MapViewRadiusM` / `SnapToNavCurve` | 1.25 / 1.0 / 120 / true | |
+| | `LockMapWindow` | false | Freeze the map panel's rect while picking (§8) |
 | | `ArGroundTrimM` | 0.0 | AR ground trim (manual offset beyond the wheel-contact-point estimate) |
 
 All numeric values are clamped by `Clamp()` to the safe ranges in this table on save.
@@ -331,13 +337,17 @@ that found it — all recorded with evidence in
   nonzero (which means the stale-anchor case above).
 - **The spot ends up facing a random way** → the orientation is whatever the drag says *once you are
   outside the dead-zone circle*, because the click puts the pivot under your cursor; a drag of one or
-  two pixels used to be enough to pick an arbitrary angle. Resizing the map panel is now disabled
-  (`NoResize`): pressing near the map edge used to grab ImGui's resize border instead, and since the
-  projection is recomputed every frame, the spot slid out from under the drag. **You can still move
-  the panel by its title bar** — that can never collide with a pick, because the title bar sits above
-  the canvas rectangle and the projection is latched when the button goes down. The
-  `选位开始 / 选位结束` log lines carry the drag radius, how far the map slid in between and whether the
-  canvas moved, so a single run says which of the three is still wrong.
+  two pixels used to be enough to pick an arbitrary angle. The other half of it is the window itself:
+  the canvas stops 8 px short of the panel edge, and ImGui grabs a window from anywhere along that
+  border, so a press meant for the edge of the map could drag the whole rect — and the projection is
+  recomputed every frame, so the spot slid out from under the drag. **Tick 锁定窗口 (lock the window)**
+  in the map window's button row while you pick; untick it to move the panel. Two earlier attempts
+  are on record so nobody repeats them: a permanent `NoResize` did not close the path (the log showed
+  the window still tracking the mouse 1:1), and a permanently locked panel was rejected because the
+  panel genuinely needs moving. The `选位开始 / 选位结束` log lines carry the drag radius, how far the
+  map slid in between, whether the canvas moved and whether the window was locked — one pick with the
+  lock off and one with it on is the whole test, and `画布位移` must read 0 when locked.
+  **Measured: the failure. Not yet measured: the fix.**
 - **Gear pulses repeat at ~1 Hz** → the automatic dropping to neutral at standstill is normal;
   confirmation must accept the dashboard reading. A pulse storm means it does not.
 - **No buildings, street lamps or POI on the map, while the roads render fine** → the host drops

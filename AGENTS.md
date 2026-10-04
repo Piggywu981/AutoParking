@@ -2,7 +2,7 @@
 
 Working notes for anyone (human or agent) editing this plugin. Every rule below exists because
 breaking it caused a real bug or a lost day; full provenance in
-`docs\2026-09-30-autoparking-design.md` §17–§32.
+`docs\2026-09-30-autoparking-design.md` §17–§33.
 
 ## Commands
 
@@ -61,7 +61,7 @@ plugin's own tolerances, which is how it catches regressions the game would stil
 - **`README.md` and `README.zh-CN.md` are mirrors.** Edit both in the same change; the English one
   is the source.
 
-## Three host behaviors that have each cost a debugging session
+## Host behaviors that have each cost a debugging session
 
 - `aforward` and `abackward` are folded into a **single `acceleration` bucket that is
   weighted-averaged across every publishing channel**, then split by sign. Writing both fields
@@ -78,6 +78,15 @@ plugin's own tolerances, which is how it catches regressions the game would stil
   "player input". Never use `user_*` to decide whether a human is driving. Also, `ETS2LA.Logging`
   renders Spectre.Console markup, so a bare `[Tag]` inside a message is silently swallowed —
   write `[[Tag]]`.
+
+- **Overlay window flags are read every frame, but from the host's copy of the definition.**
+  `ImGui.Begin` uses `Definition.Flags` each frame (`Overlay.cs:385`) and `RegisterWindow` for a title
+  it already knows swaps that copy in place (`Overlay.cs:639-648`) — so changing a flag at runtime is
+  one more `RegisterWindow`, with no unregister and no recreated window (position holds, because `X/Y`
+  are applied with `ImGuiCond.Once`). `WindowDefinition` is a **struct**, so mutating the local copy is
+  silently a no-op. Matters here because the map canvas stops 8 px short of the panel border and ImGui
+  grabs a window from anywhere along it: a press meant for the edge of the map can move the rect under
+  the pick. Hence `LockMapWindow` (§33).
 
 ## Map data constraints (each one shaped a design decision)
 
