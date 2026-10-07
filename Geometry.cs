@@ -162,6 +162,32 @@ public static class Geometry
         return !SeparatedOnAxes(a, b) && !SeparatedOnAxes(b, a);
     }
 
+    /// <summary>
+    ///  Even-odd ray cast along +X. Cheaper than the SAT overlap test for the "is this cell centre
+    ///  inside that ring" question the rasterizers ask hundreds of times, and it accepts a ring in
+    ///  either winding order. Under 3 vertices there is no interior, so false.
+    /// </summary>
+    public static bool PointInPolygon(Vector2[] polygon, Vector2 point)
+    {
+        if (polygon == null || polygon.Length < 3)
+            return false;
+
+        bool inside = false;
+        for (int i = 0, j = polygon.Length - 1; i < polygon.Length; j = i++)
+        {
+            Vector2 a = polygon[i];
+            Vector2 b = polygon[j];
+
+            if ((a.Y > point.Y) != (b.Y > point.Y)
+                && point.X < (double)(b.X - a.X) * (point.Y - a.Y) / (b.Y - a.Y) + a.X)
+            {
+                inside = !inside;
+            }
+        }
+
+        return inside;
+    }
+
     private static bool SeparatedOnAxes(Vector2[] poly, Vector2[] other)
     {
         for (int i = 0; i < poly.Length; i++)

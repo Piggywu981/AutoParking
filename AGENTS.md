@@ -2,7 +2,7 @@
 
 Working notes for anyone (human or agent) editing this plugin. Every rule below exists because
 breaking it caused a real bug or a lost day; full provenance in
-`docs\2026-09-30-autoparking-design.md` §17–§33.
+`docs\2026-09-30-autoparking-design.md` §17–§36.
 
 ## Commands
 
@@ -24,6 +24,11 @@ and to run the offline check; only the deploy row needs a full ETS2LA workspace.
 No CI, no linter, no `dotnet test` project. The harness plus the in-game probes on the settings
 page are the entire verification story.
 
+**Run the harness whenever you touch anything under `Tools\`, not only the plugin build.** `dotnet build`
+compiles the plugin project, which excludes `Tools\**`; a stale reference in `Program.cs` (a deleted check
+file, a removed gate term) is invisible there. The symptom of exactly that, hit for real: the harness printed
+**0 lines of ✓/✗ and still exited 1** — empty output is a build failure, not a green run.
+
 The harness' process exit code is a gate: `0` means every assertion passed. **Never lower a
 threshold in the harness to get a green run** — its bars are deliberately tighter than the
 plugin's own tolerances, which is how it catches regressions the game would still accept.
@@ -37,6 +42,10 @@ plugin's own tolerances, which is how it catches regressions the game would stil
   under `Tools\` as well: the batch script `ThirdPartyPlugins\build_all.ps1` builds every csproj it
   finds one level down and copies the result into `current\Plugins\`, so a console app placed there
   would ship as a broken plugin.
+- **The harness csproj lists every source file by hand** (`EnableDefaultCompileItems=false`). A new `.cs`
+  under `Tools\PlannerHarness\` that is not added to `<Compile Include>` silently never compiles, so its
+  assertions "pass" by never running. Register both halves when you add a check: the new `*Checks.cs`
+  **and** the plugin source it exercises (`$(PluginRoot)Driving\Foo.cs`).
 - **No NuGet dependencies.** `NuGet.Config` clears every package source, so restore has nowhere to
   fetch from. Host assemblies are referenced by `HintPath` into the install tree with
   `Private=false` — the plugin only ever loads from beside the host.

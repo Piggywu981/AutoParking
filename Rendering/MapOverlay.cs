@@ -77,7 +77,9 @@ internal sealed class MapOverlay
     private static readonly uint ColorText = Color(0.92f, 0.92f, 0.92f);
     private static readonly uint ColorRouteForward = Color(0.35f, 0.85f, 0.95f);
     private static readonly uint ColorRouteReverse = Color(0.98f, 0.62f, 0.20f);
-    private static readonly uint ColorGearSwitch = Color(1f, 1f, 1f);
+    // Same symbol, same hue as the AR gear marker, so the dot on the map and the disc on the ground are
+    // the same decision. White washed out in the game view.
+    private static readonly uint ColorGearSwitch = Color(1f, 0.20f, 0.85f);
 
     private readonly AutoParkingPlugin plugin;
     private WindowDefinition definition;

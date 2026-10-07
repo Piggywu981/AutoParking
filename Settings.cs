@@ -116,6 +116,13 @@ public sealed class AutoParkingSettings
     public bool SnapToNavCurve { get; set; } = true;
 
     /// <summary>
+    ///  How far a navigation curve or lane centerline vouches for the ground beside it. Half of a typical
+    ///  aisle: a curve runs down the middle of the drive lane, and the lane is what we want confirmed.
+    ///  Too large and "unconfirmed" disappears; too small and the bay you are parking into counts as unknown.
+    /// </summary>
+    public double ConfirmedCorridorHalfWidthM { get; set; } = 5.0;
+
+    /// <summary>
     ///  Freeze the map panel's position and size. ImGui grabs a window from anywhere on its border,
     ///  and the canvas reaches to within Padding of that border, so a press meant for the edge of the
     ///  map moved the rect under the pick. Worth a switch rather than a permanent flag because the
@@ -188,6 +195,7 @@ public sealed class AutoParkingSettings
         MapScalePxPerM = Math.Clamp(MapScalePxPerM, 0.5, 3.0);
         MapZoom = Math.Clamp(MapZoom, 1.0, 4.0);
         MapViewRadiusM = Math.Clamp(MapViewRadiusM, 20.0, 200.0);
+        ConfirmedCorridorHalfWidthM = Math.Clamp(ConfirmedCorridorHalfWidthM, 2.0, 20.0);
         ArGroundTrimM = Math.Clamp(ArGroundTrimM, -1.0, 1.0);
     }
 }

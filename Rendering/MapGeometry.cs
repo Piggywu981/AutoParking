@@ -67,6 +67,13 @@ public sealed class MapGeometry
     /// </summary>
     public MapItemProbe Probe = new();
 
+    /// <summary>
+    ///  Which ground inside this sample the map itself vouches for, and which it does not. Built from the
+    ///  same pass that fills the drawing lists, so the picture on screen and the number in the plan cost can
+    ///  never come from different data. Null when the build failed.
+    /// </summary>
+    public GroundTrust? Trust;
+
     public bool IsFresh(TimeSpan maxAge) => DateTime.UtcNow - BuiltUtc <= maxAge;
 
     /// <summary>
@@ -179,7 +186,7 @@ public sealed class MapGeometryBuilder
         }
     }
 
-    public MapGeometry Build(MapData map, Vector2 center, double radiusM)
+    public MapGeometry Build(MapData map, Vector2 center, double radiusM, double corridorHalfWidthM)
     {
         Stopwatch sw = Stopwatch.StartNew();
         MapGeometry geometry = new()
@@ -228,9 +235,36 @@ public sealed class MapGeometryBuilder
             }
 
             geometry.Obstacles = ObstacleScanner.Scan(center, radiusM);
+
+            // Same walk, same lists: the corridors drawn as navigation curves are what vouches for the
+            // ground, and the items the map flags collidable take that voucher back. Read-only for now —
+            // the numbers it produces decide M7c's weights (design doc §34).
+            GroundTrust trust = new()
+            {
+                Center = center,
+                RadiusM = radiusM,
+                CorridorHalfWidthM = corridorHalfWidthM
+            };
+
+            foreach (Vector2[] curve in geometry.DriveableCurves)
+                trust.AddCorridor(curve);
+
+            foreach (MapGeometry.LaneLine lane in geometry.RoadLanes)
+                trust.AddCorridor(lane.Points);
+
+            foreach (MapGeometry.StaticShape shape in geometry.StaticShapes)
+            {
+                if (shape.Collision)
+                    trust.AddBlocker(shape.Points, shape.Closed);
+            }
+
+            geometry.Trust = trust;
+
             geometry.Status = $"道路 {roads.Count} 段 / 场站 {prefabs.Count} 个 / 障碍 {geometry.Obstacles.Count}" +
                               $" / 静态 {geometry.StaticShapes.Count} 项 / 场站轮廓 {geometry.PrefabOutlines.Count}" +
-                              (geometry.StaticTruncated ? "（静态内容已截断）" : "");
+                              (geometry.StaticTruncated ? "（静态内容已截断）" : "") +
+                              $" · 可信地面 {trust.ConfirmedCells} m²" +
+                              (trust.Truncated ? "（栅格已截断）" : "");
         }
         catch (Exception ex)
         {

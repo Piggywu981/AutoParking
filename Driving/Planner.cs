@@ -39,7 +39,10 @@ public static class Planner
     private const double StartGraceM = 2.0;
     private const double EndGraceM = 1.0;
 
-    public static PlanResult Plan(Pose2 start, Pose2 goal, AutoParkingSettings settings, ObstacleSnapshot obstacles)
+    /// <param name="trust">When supplied, every candidate gets its swept footprint and unconfirmed-ground
+    ///  area measured for the readout. It does not take part in the choice — M7a instruments, M7c decides.</param>
+    public static PlanResult Plan(Pose2 start, Pose2 goal, AutoParkingSettings settings, ObstacleSnapshot obstacles,
+                                  GroundTrust? trust = null)
     {
         double radius = Kinematics.PlanningRadius(settings);
 
@@ -60,6 +63,13 @@ public static class Planner
         List<ParkingPath> candidates = Collect(start, goal, settings, radius, penalty, maxLength);
 
         int evaluated = candidates.Count;
+
+        if (trust != null)
+        {
+            foreach (ParkingPath candidate in candidates)
+                RouteFootprint.Measure(candidate, settings, trust);
+        }
+
         ParkingPath? best = null;
         int bestConflicts = int.MaxValue;
 
@@ -88,7 +98,8 @@ public static class Planner
                     : "所有候选路径都超出了长度限制",
                 ConflictCount = 0,
                 MinRadiusM = radius,
-                CandidatesEvaluated = evaluated
+                CandidatesEvaluated = evaluated,
+                Candidates = candidates
             };
         }
 
@@ -100,7 +111,8 @@ public static class Planner
                 Reason = $"路径上有 {bestConflicts} 处障碍冲突",
                 ConflictCount = bestConflicts,
                 MinRadiusM = radius,
-                CandidatesEvaluated = evaluated
+                CandidatesEvaluated = evaluated,
+                Candidates = candidates
             };
         }
 
@@ -109,7 +121,8 @@ public static class Planner
             Path = best,
             ConflictCount = 0,
             MinRadiusM = radius,
-            CandidatesEvaluated = evaluated
+            CandidatesEvaluated = evaluated,
+            Candidates = candidates
         };
     }
 

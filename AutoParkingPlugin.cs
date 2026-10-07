@@ -75,6 +75,7 @@ public sealed class AutoParkingPlugin : Plugin
     private DateTime lastBrakeProbeUtc = DateTime.MinValue;
     private DateTime lastGearProbeUtc = DateTime.MinValue;
     private int lastReplanCount;
+    private string lastCostSignature = "";
     private bool warnedNoAir;
 
     // Reverse distance inside which the parking brake may be used to stop the truck.
@@ -212,6 +213,7 @@ public sealed class AutoParkingPlugin : Plugin
             telemetryStale = (DateTime.UtcNow - lastTelemetryUtc) > TelemetryStaleLimit;
         }
 
+
         // Building map geometry costs 10-50 ms, so only do it while the map window is on.
         if (mapOverlay != null && settings.ShowMapWindow && DateTime.UtcNow >= nextGeometryBuildUtc)
         {
@@ -264,7 +266,8 @@ public sealed class AutoParkingPlugin : Plugin
 
         Pose2 truck = CurrentPose;
         double radius = settings.MapDataRadiusM(MapOverlay.WindowHeight);
-        MapGeometry geometry = geometryBuilder.Build(map, truck.Position, radius);
+        MapGeometry geometry = geometryBuilder.Build(map, truck.Position, radius,
+                                                      settings.ConfirmedCorridorHalfWidthM);
 
         lock (sync)
         {
@@ -368,9 +371,49 @@ public sealed class AutoParkingPlugin : Plugin
             return;
         }
 
-        PlanResult result = Planner.Plan(CurrentPose, spot.Value, snapshot, geometry.Obstacles);
+        PlanResult result = Planner.Plan(CurrentPose, spot.Value, snapshot, geometry.Obstacles, geometry.Trust);
 
         lock (sync) planResult = result;
+
+        LogCandidateCosts(result);
+    }
+
+    /// <summary>
+    ///  One block per plan: every candidate the planner considered with the four numbers M7c will be
+    ///  weighted on. Deliberately not one line for the winner — the whole question is whether the loser
+    ///  that costs less ground was available at all, and that cannot be read off a winner.
+    /// </summary>
+    /// <summary>
+    ///  One block per *decision*, not per plan: the map window rebuilds geometry every 500 ms and
+    ///  re-plans with it, so logging every pass would bury the log under ~18 lines per second of an
+    ///  unchanged answer. The signature is what the readout is for - family, length, conflicts, exposure -
+    ///  so any change a driver could act on still prints.
+    /// </summary>
+    private void LogCandidateCosts(PlanResult result)
+    {
+        if (result.Candidates == null || result.Candidates.Count == 0)
+            return;
+
+        string signature = $"{result.Path?.Source}|{result.Path?.Description}|{result.Path?.Length:0.0}" +
+                           $"|{result.ConflictCount}|{result.Candidates.Count}";
+        if (signature == lastCostSignature)
+            return;
+
+        lastCostSignature = signature;
+        int shown = 0;
+        foreach (ParkingPath candidate in result.Candidates)
+        {
+            if (shown++ == 8)
+            {
+                Logger.Info($"AutoParking: [[路径代价]] 其余 {result.Candidates.Count - 8} 条已省略");
+                break;
+            }
+
+            Logger.Info($"AutoParking: [[路径代价]] {(ReferenceEquals(candidate, result.Path) ? "选中" : "    ")} " +
+                        $"{candidate.Description} · 长 {candidate.Length:0.0} m · 换挡 {candidate.GearSwitches} · " +
+                        $"占地 {candidate.SweptAreaM2:0} m² · 未确认 {candidate.UnconfirmedAreaM2:0} m²" +
+                        (candidate.FootprintTruncated ? "（栅格截断）" : ""));
+        }
     }
 
     public PlanResult? PlanSnapshot
@@ -939,6 +982,10 @@ public sealed class AutoParkingPlugin : Plugin
                     settings.SnapToNavCurve = ToBool(value, settings.SnapToNavCurve);
                     changed = true;
                     break;
+                case "corridorHalfWidth":
+                    settings.ConfirmedCorridorHalfWidthM = ToDouble(value, settings.ConfirmedCorridorHalfWidthM);
+                    changed = true;
+                    break;
                 case "lockMapWindow":
                     settings.LockMapWindow = ToBool(value, settings.LockMapWindow);
                     changed = true;
@@ -1166,13 +1213,17 @@ public sealed class AutoParkingPlugin : Plugin
                 Pose2 spot = target.Value;
                 AutoParkingSettings cfg = settings;
 
+                // Captured once: a map rebuild mid-maneuver must not leave the closure comparing a new
+                // route against a different trust grid than the one the engaged route was measured on.
+                GroundTrust? planTrust = mapGeometry?.Trust;
+
                 follower = new Follower(planResult!.Path!, settings, settings.WheelbaseM,
                     (from, field) =>
                     {
                         // Ask the planner the same question we asked at engage time, only from the
                         // pose we are actually standing at now. Null when there is nothing usable,
                         // which leaves the follower on the route it already has.
-                        PlanResult next = Planner.Plan(from, spot, cfg, field);
+                        PlanResult next = Planner.Plan(from, spot, cfg, field, planTrust);
                         return next.Ok ? next.Path : null;
                     });
 

@@ -117,6 +117,18 @@ bool pickDragOk = jitterIgnored && deliberate && dragErrorDeg < 1e-6;
 Console.WriteLine($"  {(pickDragOk ? "✓" : "✗")} 选位拖动死区：1 px 抖动被忽略={jitterIgnored} · 40 px 生效={deliberate} · 与正东夹角 {dragErrorDeg:0.000}°");
 
 Console.WriteLine();
+Console.WriteLine("点在多边形（扫掠栅格要用它判定环内/环外）：");
+int pointFailures = GeometryPointChecks.Run();
+
+Console.WriteLine();
+Console.WriteLine("路线扫掠占地 / 未确认地面（M7a 仪表）：");
+int footprintFailures = RouteFootprintChecks.Run();
+
+Console.WriteLine();
+Console.WriteLine("地面可信度栅格（哪些地面地图自己担保能开）：");
+int trustFailures = GroundTrustChecks.Run();
+
+Console.WriteLine();
 Console.WriteLine("地图内容探针（纯逻辑：去重、排序、截断、行数预算）：");
 int probeFailures = MapProbeChecks.Run();
 
@@ -140,6 +152,7 @@ Console.WriteLine($"  {(hullPairSafe ? "✓" : "✗")} 两点输入不崩、面�
 
 return report.Failures.Count == 0 && simPassed == 5 && keptGoing && stagedLeg.Reached
     && replanWorks && autoNeutralOk && unwinds && watchdogWorks && pickDragOk && probeFailures == 0
+    && pointFailures == 0 && trustFailures == 0 && footprintFailures == 0
     && hullDropsInterior && hullDegenerates && hullPairSafe ? 0 : 1;
 
 // The recession watchdog needs states that make the distance grow. Nothing in the closed loop does

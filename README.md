@@ -97,7 +97,8 @@ when that row or probe is rendered.
     are frozen (`ImGuiWindowFlags.NoMove | NoResize`), which is what makes a pick deterministic — see
     §8. Off by default, because the panel does need to be moved out of the way sometimes.
   - **AR overlay** (on the game screen, on by default): spot box, vehicle footprint projection,
-    forward-direction arrow, target pose.
+    forward-direction arrow, target pose, and the **route preview** - the corridor the vehicle will
+    occupy and the line it will follow, drawn on the ground before it is driven (§6.7).
 
 ## 3. Bind Hotkeys (Required)
 
@@ -167,6 +168,7 @@ path unsolvable or blocked by an obstacle / path too long.
 | Finish | `HandbrakeOnFinish` / `RestoreAssistsOnFinish` | true | Apply handbrake and restore driver assists on completion |
 | Visualization | `MapScalePxPerM` / `MapZoom` / `MapViewRadiusM` / `SnapToNavCurve` | 1.25 / 1.0 / 120 / true | |
 | | `LockMapWindow` | false | Freeze the map panel's rect while picking (§8) |
+| | `ConfirmedCorridorHalfWidthM` | 5.0 | How far a nav curve or lane vouches for the ground beside it (§6.6) |
 | | `ArGroundTrimM` | 0.0 | AR ground trim (manual offset beyond the wheel-contact-point estimate) |
 
 All numeric values are clamped by `Clamp()` to the safe ranges in this table on save.
@@ -263,6 +265,38 @@ different situations apart — the object is not in the map data, it is in the d
 (prefab interior geometry), or it is present and merely off-screen. Design doc §30 records what it
 answered the first time it was run.
 
+### 6.6 Candidate route cost (the `路径代价` log block)
+
+Every plan logs **all** the routes the planner considered, not just the winner: length, gear switches,
+the ground area the route *demands* (the vehicle envelope the collision test already uses, swept along the
+path and rasterized to 1 m cells, so ground driven over twice counts once) and how much of that area sits
+on ground the map does not vouch for. "Vouched for" means: inside the sampled radius, within
+**可信走廊半宽** of a prefab navigation curve or road lane, and not underneath a collidable map object.
+It is a measurement, not a veto — the winner is still chosen by length plus the gear-change penalty, and
+the harness asserts that supplying the trust grid changes nothing (`仪表不改变选路`). The map's route line
+now reads `占地 A m²（未确认 B m²）`. Design doc §34 says why exposure to *unconfirmed* ground is the thing
+worth minimizing now that prefab interior geometry is unreachable (§32), and records the measured candidate
+table: in the harness scenario the loop-the-aisle family loses on both axes (67.1 m / 339 m² / 194 m²
+unconfirmed) against the chosen compact back-in (49.1 m / 261 m² / 154 m²). **Offline numbers are measured;
+the in-game readout is not yet.**
+
+### 6.7 The route preview in the game view (AR)
+
+Once a route exists, the AR overlay draws it on the ground **before it is driven**: the corridor the
+vehicle will occupy, its centerline, and a filled magenta disc where it changes gear (the map window uses
+the same hue for the same decision). Forward legs are cyan, reverse
+legs orange — the same hues the flat map uses, so a leg on the ground and the leg on the map are
+obviously the same leg. The corridor width is `RouteFootprint.EnvelopeSize().WidthM`, i.e. exactly the
+envelope the collision test blocks on and §6.6 measures, so what you see, what vetoes the route and what
+the log counts cannot drift into three different vehicles.
+
+It is drawn as one batched `Draw3DLineWithGradient(left[], right[])` ribbon per gear run plus a
+centerline sampled every 1.5 m (`DrawStepM`), because a filled polygon per pair of poses **was reported
+too heavy on a real truck**. With no plan yet, the older straight line to the spot (5 m ticks) is still
+drawn — it answers "do map coordinates line up with the in-game position", which the preview cannot
+answer before a route exists. **Measured: the load of the per-segment filled version was too high. Not yet
+measured: the load and the look of this one.**
+
 ## 7. Architecture Overview
 
 ```
@@ -272,6 +306,8 @@ Geometry.cs            Planar poses, heading↔forward, signed lateral error, re
 Driving\
   Planner.cs           Layered planning: straight reverse → Reeds-Shepp forward → reverse sweep → two-segment shuttle
   ReedsShepp.cs        Builds CSC/CCC from turning-circle geometry, self-checks by re-integrating the endpoint
+  GroundTrust.cs       Which ground the map vouches for: nav curves and lanes, minus collidable items, in 1 m cells (§6.6)
+  RouteFootprint.cs    A route's demanded envelope rasterized over that grid - swept area and unconfirmed area (§6.6)
   ParkingPath.cs       Arc-length sampled path + gear-change points
   Follower.cs          Gear state machine + longitudinal PID + lateral Pure Pursuit/reverse law + steering shaping
   ControlOutput.cs     The single place commands are sent: channel publish/renew/release

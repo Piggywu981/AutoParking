@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Numerics;
 using ETS2LA.Overlay;
 using ETS2LA.Overlay.AR;
@@ -12,6 +13,10 @@ namespace AutoParking;
 internal sealed class ArOverlay
 {
     public const string CallbackName = "local.autoparking.ar";
+
+    /// <summary>Distance between route points handed to the AR ribbon. The path is sampled at
+    ///  PathSampleM (0.25 m) for planning; drawing every one of them is what made the AR too heavy.</summary>
+    private const double DrawStepM = 1.5;
 
     // AR drawing takes ARGB; the overlay converts to ImGui's ABGR internally.
     private static uint Argb(float r, float g, float b, float a = 1f)
@@ -27,6 +32,15 @@ internal sealed class ArOverlay
     private static readonly uint PreviewColor = Argb(0.95f, 0.85f, 0.30f, 0.85f);
     private static readonly uint PoleColor = Argb(0.95f, 0.55f, 0.20f);
     private static readonly uint TruckMarkColor = Argb(0.35f, 0.95f, 0.45f);
+
+    // Route preview, same hue pair as the flat map so a cyan leg on the ground and a cyan leg on the map
+    // are obviously the same leg. The ribbon is these colors at low alpha; the centerline is solid.
+    private static readonly uint RouteForwardColor = Argb(0.35f, 0.85f, 0.95f, 0.55f);
+    private static readonly uint RouteReverseColor = Argb(0.98f, 0.62f, 0.20f, 0.55f);
+
+    // Magenta, filled: nothing else in the AR palette is close to it, and it has to hold against asphalt,
+    // concrete and snow, where a white marker washed out in the real depot.
+    private static readonly uint GearChangeColor = Argb(1.0f, 0.20f, 0.85f, 1.0f);
 
     private readonly AutoParkingPlugin plugin;
     private bool registered;
@@ -91,6 +105,12 @@ internal sealed class ArOverlay
 
         // Always drawn so the ground plane can be checked without a selected spot.
         DrawGroundMark(ar, truck.Position, groundY, TruckMarkColor, 1.2f);
+
+        PlanResult? preview = plugin.PlanSnapshot;
+        if (preview?.Path != null)
+        {
+            DrawRoutePreview(ar, preview.Path, settings, groundY);
+        }
 
         Pose2? target = plugin.TargetPose;
         if (target == null)
@@ -157,6 +177,88 @@ internal sealed class ArOverlay
         double headingErrorDegrees = Math.Abs(Geometry.SmallestAngleDifference(truck.HeadingRad, target.HeadingRad)) * 180.0 / Math.PI;
 
         ar.Draw3DText(topPoint, $"{distance:0.0} m   {headingErrorDegrees:0}°", TargetColor);
+    }
+
+    /// <summary>
+    ///  The route the planner chose, drawn on the ground before it is driven: the corridor the vehicle
+    ///  will occupy, its centerline, and where it changes gear. The map window has shown this since M1;
+    ///  the point of putting it in the game view is that this is where it can be judged against the
+    ///  depot actually in front of the truck, which is the one thing the flat map cannot do.
+    ///
+    ///  One batched ribbon call per gear run, not a polygon per pair of envelopes: filling every segment
+    ///  was reported too heavy on a real truck. Lane assist's shape - left and right edge point lists -
+    ///  is the cheap one, because the host batches it, clips it to the render distance and fades it by
+    ///  distance for us.
+    /// </summary>
+    private static void DrawRoutePreview(ARRenderer ar, ParkingPath path, AutoParkingSettings settings, double groundY)
+    {
+        IReadOnlyList<PathPoint> points = path.Points;
+        if (points.Count < 2)
+            return;
+
+        // The same envelope the collision test and the route-cost numbers use, so the corridor drawn on
+        // the ground is the one the planner actually demanded rather than a prettier, narrower one.
+        float halfWidth = (float)(RouteFootprint.EnvelopeSize(settings).WidthM * 0.5);
+        float bandY = (float)(groundY + 0.04f);
+        float lineY = (float)(groundY + 0.06f);
+
+        int start = 0;
+        for (int i = 1; i <= points.Count; i++)
+        {
+            if (i < points.Count && points[i].Travel == points[start].Travel)
+                continue;
+
+            DrawRun(ar, points, start, i, halfWidth, bandY, lineY);
+
+            if (i < points.Count)
+            {
+                // The gear change is the decision worth seeing from the seat. Filled rather than a ring:
+                // a hollow circle at ground level disappears into the texture of the depot floor.
+                PathPoint change = points[i];
+                ar.Draw3DCircle(new ARCoordinate(new Vector3(change.Position.X, lineY, change.Position.Y)),
+                                1.2f, GearChangeColor, true, 2f);
+                start = i;
+            }
+        }
+    }
+
+    private static void DrawRun(ARRenderer ar, IReadOnlyList<PathPoint> points, int from, int to,
+                                float halfWidth, float bandY, float lineY)
+    {
+        uint color = points[from].Travel == DriveDirection.Forward ? RouteForwardColor : RouteReverseColor;
+        List<Vector3> center = new();
+        List<ARCoordinate> left = new();
+        List<ARCoordinate> right = new();
+        double lastTaken = -DrawStepM;
+
+        for (int i = from; i < to; i++)
+        {
+            PathPoint point = points[i];
+
+            // Decimate: the path is sampled at PathSampleM (0.25 m), which is planning resolution, not
+            // drawing resolution. 1.5 m still resolves every corner of a bay entry, and the last point of
+            // a run is always kept so the runs meet at the gear change instead of leaving a gap.
+            if (i != to - 1 && point.DistanceAlong - lastTaken < DrawStepM)
+                continue;
+
+            lastTaken = point.DistanceAlong;
+            Vector2 offset = Geometry.LeftFromHeading(point.HeadingRad) * halfWidth;
+            Vector3 at = new(point.Position.X, bandY, point.Position.Y);
+
+            left.Add(new ARCoordinate(at + new Vector3(offset.X, 0f, offset.Y)));
+            right.Add(new ARCoordinate(at - new Vector3(offset.X, 0f, offset.Y)));
+            center.Add(new Vector3(point.Position.X, lineY, point.Position.Y));
+        }
+
+        if (left.Count < 2)
+            return;
+
+        ar.Draw3DLineWithGradient(left, right, color);
+
+        for (int i = 1; i < center.Count; i++)
+        {
+            ar.Draw3DLine(new ARCoordinate(center[i - 1]), new ARCoordinate(center[i]), color, 2f);
+        }
     }
 
     private static void DrawPreviewPath(ARRenderer ar, Pose2 truck, Pose2 target, double groundY)

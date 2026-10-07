@@ -40,6 +40,21 @@ public sealed class ParkingPath
 
     public int GearSwitches { get; init; }
 
+    /// <summary>
+    ///  Ground area this route demands, in square metres, as whole 1 m cells — the vehicle envelope
+    ///  swept along the path, not the bare body. -1 until RouteFootprint.Measure has run.
+    /// </summary>
+    public double SweptAreaM2 { get; set; } = -1.0;
+
+    /// <summary>
+    ///  Of that, the part sitting on ground the map does not vouch for (see GroundTrust). This is the
+    ///  number the unrecognizable obstacles live in, so it is the one M7c will weight. -1 = unmeasured.
+    /// </summary>
+    public double UnconfirmedAreaM2 { get; set; } = -1.0;
+
+    /// <summary>True when the rasterizer hit its cell budget, so the two areas above are understated.</summary>
+    public bool FootprintTruncated { get; set; }
+
     public DriveDirection FirstTravel => Points.Count == 0 ? DriveDirection.Forward : Points[0].Travel;
 
     /// <summary>
@@ -101,6 +116,13 @@ public sealed class PlanResult
     public int CandidatesEvaluated { get; init; }
 
     /// <summary>
+    ///  Every candidate the planner considered, cheapest first, with the footprint fields filled in when a
+    ///  GroundTrust was supplied. The plugin prints this: two routes with the same length and different
+    ///  exposure are indistinguishable from the winner alone, and distinguishing them is the point of M7a.
+    /// </summary>
+    public IReadOnlyList<ParkingPath>? Candidates { get; init; }
+
+    /// <summary>
     ///  Usable to drive: a route exists and nothing on it overlaps an obstacle. Callers that
     ///  only want to preview a blocked route read <see cref="Path"/> directly.
     /// </summary>
@@ -108,5 +130,8 @@ public sealed class PlanResult
 
     public string Summary => Path != null
         ? $"{Path.Description} · {Path.Length:0.0} m · 换挡 {Path.GearSwitches} · 冲突 {ConflictCount}"
+          + (Path.SweptAreaM2 >= 0.0
+              ? $" · 占地 {Path.SweptAreaM2:0} m²（未确认 {Path.UnconfirmedAreaM2:0} m²）"
+              : "")
         : $"无解：{Reason}";
 }

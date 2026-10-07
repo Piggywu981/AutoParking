@@ -49,6 +49,11 @@
                 Description="点选时把车位吸附到附近建筑导航曲线的方向上，避免车头朝向乱指。"
                 Value="@Plugin.Settings.SnapToNavCurve"
                 ValueChanged="@((bool value) => Plugin.HandleAction("snapToNavCurve", value))" />
+        <Slider Title="可信走廊半宽 (m)"
+                Description="导航曲线/车道线向两侧确认多少地面算「已确认」。太大则未确认面积消失，太小则车位本身也算未知。只影响「占地/未确认」两个读数，暂不影响选路。"
+                Min="@(2f)" Max="@(20f)" Step="@(0.5f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.ConfirmedCorridorHalfWidthM))"
+                ValueChanged="@((float value) => Plugin.HandleAction("corridorHalfWidth", value))" />
         <Switch Title="锁定地图窗口"
                 Description="冻结平面地图窗口的位置和大小。地图画布几乎贴到窗口边框，而 ImGui 的窗口可以从边框任意处抓住拖动——在地图边缘按下会把整个窗口拖着走，朝向就变成「窗口移动了多少」而不是「手转了多少」。需要挪窗口时关掉即可；地图窗口里也有同一个开关。"
                 Value="@Plugin.Settings.LockMapWindow"
