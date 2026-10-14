@@ -1492,3 +1492,98 @@ harness 判定集与改动前完全一致（69 ✓ / 那 3 条已知 ✗）。
 
 **仍未实测**：新预览的观感与开销。§35 的"太重"是在每对位姿填一块凸包的画法上实测到的；
 本节换成与 lane assist 同形状、同 API 的批量 ribbon，密度还更低，但没有数字之前只能说应该好了。
+
+---
+
+## 37. 反编译官方闭源插件，把 §2 的几条事实换成安装包证据（2026-10-14）
+
+**做了什么**：用 REA + `ilspycmd` 静态逆向了发行包里的 7 个闭源 .NET 程序集——
+`Pathfinding` / `LaneAssist` / `AdaptiveCruiseControl` / `VisualizationSockets` / `InternalVisualization`
+和它们依赖的 `Libraries\tumppi066.pathlib\PathLib` / `tumppi066.pidlib\PIDLib`——外加 5 个被引用的
+宿主类型（`GameOutput`、`Plugin`、`LibraryPlugin`、`ControlProperties`、`ControlChannelDefinition`）。
+全程没有加载或执行目标代码；方法级重建被锁在 artifact SHA-256 + MVID + token + 签名哈希 + IL 哈希上。
+
+产物与分析在工作区的 `..\..\ReverseEngineering\`（索引 `README.md`，跨插件汇总
+`_analysis\SUMMARY.md`，宿主契约 `_analysis\HOST-CONTRACT.md`）；对本插件逐条的落地结论在
+`docs\2026-10-14-official-plugin-reverse-engineering-applied.md`。
+
+### 三条被纠正的前提
+
+1. **`ControlProperties.Weight` 默认是 `1.0`，官方六个控制写点一个都没设它。**
+   之前 §2.2 说"同名字段跨通道按 Weight 加权平均"是对的，但据此得出的隐含结论
+   "我们设 20 就等于我们赢"是错的。实际是 `20 / (20 + 1) = 95.2 %`，**不是独占**。
+   官方插件之间不打架靠的是通道 Id 不同 + Timeout 不同，我们压住它们靠的其实
+   还是 `TakeOverAssists()` 里那句 `EnableAssists = false`（`AutoParkingPlugin.cs`）。
+   Weight 只是那条生效之前的一道保险，不该描述成底气。已写进 `Settings.cs` 的注释。
+
+2. **只有 `steering` 和 `acceleration` 两个具名桶，且两者走同一套加权平均；分母是权重和、无零防护。**
+   `GameOutput.ProcessChannel` 里 `aforward`/`abackward` 先折成 `acceleration`，然后
+   `Σ(w·v)/Σw` 再 `clamp(-1,1)`，**没有判零**。所以只有零权重通道贡献时是 `NaN` 直接进共享内存。
+   `Settings.Clamp()` 里那条 `Clamp(ControlWeight, 1.0, 100.0)` 的**下界 1.0 不是保守值，是必需的**，
+   注释已按这个理由重写。
+
+3. **踏板通路的描述不完整**：`steering` 只写 modern；`acceleration` 在
+   `GameSettings.Current.EnableModernOutputForPedals` 为真时写 modern(13/17/18)、否则按符号拆 legacy
+   `aforward`/`abackward`；**全部 bool（含 `TrueToToggle` 脉冲）无条件走 legacy**。
+   §2.2 原文说"`acceleration` 只写 legacy"需要加"除非 `EnableModernOutputForPedals`"——
+   这与 §24 的实测结论一致，是那条描述漏了条件，不是 §24 错了。
+
+顺带确认（没有与现有结论冲突，只是换成了安装包证据）：`ControlChannelDefinition.Timeout` 默认 `0.2f`；
+宿主 `Plugin` 基类 `TickRate` 默认 20、**Tick 跑在 `Task.Run` 的后台线程、抛异常只写一条
+`Logger.Error` 就继续、超时不补拍**；`LibraryPlugin` 只有 `Info`（库没有生命周期）。
+
+### 这一轮改动（代码 + 文档）
+
+- **`Rendering\MapGeometry.FindMapData` 改为先取 `ApplicationState.Current.RunningGame`**，
+  取不到再回退"第一个 IsParsed 的"。原文照抄了官方 LaneAssist / InternalVisualization 的写法——
+  那个写法在 ETS2 和 ATS 都装都解析完时会绑到**另一款没在玩的游戏**上，是官方的坑不是通用答案。
+  回退仍然保留，因为 `IsParsed` 为真时 `GetMapData()` 仍可能为 null。
+- `MapGeometry.Build` 的 `Nodes.Within(center.X, center.Y, ...)` 上方补了坐标约定注释：
+  地面平面用 `Vector2(X, Z)` 携带，**`.Y` 是地图的 Z，不是高程**——读成高程会得出"查询盒是错的"这种
+  负假阴性，AGENTS.md §29 记过同类教训。
+- `Driving\ControlOutput.cs` 与 `Settings.cs` 的注释按上面第 1、2、3 条重写。
+- **新增控制分项曲线窗**（`Driving\ControlTrace.cs` + `Rendering\ControlPlot.cs`，设置页
+  "控制分项曲线"开关，默认关）。存最近 10 s 的横向误差、航向误差、转向（原始 vs 整形后）、
+  目标/实际速度、纵向 P/I/D 与最终指令，倒车段底色标出。**这是取证工具，不是行为改动**：
+  `Follower` 里只是把已经在算的量记一份，`Trace` 为 null 时整条路径跳过。
+
+  用 ImDrawList 手画而不是引 ImPlot：官方 `PIDLib.PIDController` 的监控窗每帧跑 24 次 LINQ
+  min/max 加 12 个数组分配（反编译 `PIDController.cs:292-320` 看得见），开一个窗口调个参数是可接受的，
+  在 60 Hz 下常开着不是。环形缓冲 1024 样本（60 Hz ≈ 17 s），绘制路径不分配。
+  窗口右边缘锚在**最新采样点**而不是墙钟：否则跑完停下的瞬间，时钟还在走，曲线 10 秒内被推走——
+  而停车正是要看它的时候。
+
+- `Tools\PlannerHarness\PlannerHarness.csproj` 补了 `Driving\ControlTrace.cs`。
+  `Follower.cs` 被 harness 手工列进编译，新增引用没登记的后果就是 §36 结尾记的那个：
+  **插件构建 0 错误、harness 输出 0 行 ✓/✗ 却 exit=1**。这次是先查了这条才没踩。
+
+### harness 在我动手之前就是红的（已测，不是假设）
+
+`git worktree add` 出一份 HEAD 原版跑对照（跑完 `git worktree remove` 清干净），三次输出**逐字一致**：
+
+| 运行 | 退出码 | 输出 |
+|---|---|---|
+| HEAD 原版 | 1 | 168 行，闭环 **4/5**，3 处 ✗ |
+| 我的改动（改完 `Follower.cs` 之后） | 1 | 同上 |
+| 我的全部改动之后 | 1 | 同上，`diff` 为空 |
+
+三处 ✗ 分别是：`右前 45 度进库`（位置误差 **0.01 m**，`CompareSteering` 的对照表同一用例）、
+`CompareSteering` 表里新方案那列、以及"关：超时未完成：等待障碍离开 253.6 s"。
+退出门禁是 `Program.cs:153` 的 `simPassed == 5`，4/5 ⇒ exit 1。
+
+**没有去修它**，两个理由：一是 AGENTS.md 明令"不得为了让 harness 变绿而降低阈值"，0.01 m 是
+刻意比插件自身容差更严的那道杆；二是要改就必须先有测量——`差 1 厘米` 是收敛极限还是仿真步长的
+量化噪声，读代码答不了，得先有曲线。曲线就是本轮加的那个窗。
+
+### 明确没做的一件事
+
+文档 §8 第 4 条"借官方弯道限速常数 `sqrt(a_lat · R^1.2)` 做进场速度"**没有落地**。
+那组参数是从官方程序集里读出来的 `[observed]`，但"它对我们的车"是 `[unknown]`，
+按本仓库"Evidence before fixes"的规矩，得等有曲线再动。同理 §5.2 的结论也还是
+"不要接 `PIDLib`"：它 `Reset()` 之后有一整秒输出只有 P 项（`PIDController.cs:217-232`），
+而我们频繁分段/重规划。
+
+**仍未实测**：曲线窗本身的渲染开销、以及 60 Hz 写 + 渲染线程读下的锁表现
+（锁序是刻意单向的：`ControlPlot.Render` 只取 `trace.Gate`，不碰插件的 `sync`，
+因为 tick 线程是拿 `sync` 再拿 Gate 的）。没跑过实车之前这些都只是设计意图。
+
