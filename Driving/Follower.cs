@@ -110,6 +110,9 @@ public sealed class Follower
     private double integral;
     private double lastError;
     private double lastSteer;
+    private double lastPidP;
+    private double lastPidI;
+    private double lastPidD;
     private DateTime blockedSince = DateTime.MinValue;
     private DateTime lastBlockedUtc = DateTime.MinValue;
     private DateTime nextReplanUtc = DateTime.MinValue;
@@ -159,6 +162,14 @@ public sealed class Follower
     public double HeadingErrorDegrees { get; private set; }
 
     public DriveDirection CurrentTravel => confirmedGear ?? wantedGear;
+
+    /// <summary>
+    ///  Optional sink for the per-cycle control terms. The plugin owns the buffer and hands it here
+    ///  so the values are recorded at the point they are computed; nothing outside this class can
+    ///  see the intermediates otherwise, and reconstructing them from telemetry after the fact gives
+    ///  a plot of the wrong signal.
+    /// </summary>
+    public ControlTrace? Trace { get; init; }
 
     private void BuildRuns()
     {
@@ -392,14 +403,32 @@ public sealed class Follower
         CrossTrackErrorMeters = Geometry.SignedLateral(anchor.Position, Geometry.ForwardFromHeading(anchor.HeadingRad), vehicle.Position);
         HeadingErrorDegrees = Geometry.SmallestAngleDifference(vehicle.HeadingRad, anchor.HeadingRad) * 180.0 / Math.PI;
 
-        double steer = reversing ? ReverseSteering(vehicle, anchor) : ForwardSteering(vehicle, run);
-        steer = ShapeSteer(steer);
+        double steerRaw = reversing ? ReverseSteering(vehicle, anchor) : ForwardSteering(vehicle, run);
+        double steer = ShapeSteer(steerRaw);
 
         double reference = ReferenceSpeed(run, speedLimit);
         double acceleration = Longitudinal(vehicle, reference);
 
         float throttle = acceleration > 0 ? (float)Math.Clamp(acceleration / settings.MaxAccel, 0.0, 1.0) : 0f;
         float brake = acceleration < 0 ? (float)Math.Clamp(-acceleration / settings.MaxBrakeDecel, 0.0, 1.0) : 0f;
+
+        // Recorded in the controller's own frame: unsigned speed against an unsigned reference, so
+        // the P/I/D series mean exactly what Longitudinal used. Reversing is carried separately for
+        // the plot to shade, rather than folded into the signs of signals that are not signed.
+        Trace?.Add(new ControlSample
+        {
+            CrossTrackM = CrossTrackErrorMeters,
+            HeadingErrorDeg = HeadingErrorDegrees,
+            SteerRaw = steerRaw,
+            Steer = steer,
+            TargetSpeedMps = reference,
+            SpeedMps = Math.Abs(vehicle.SignedSpeed),
+            PidP = lastPidP,
+            PidI = lastPidI,
+            PidD = lastPidD,
+            CommandMps2 = acceleration,
+            Reversing = reversing
+        });
 
         status = $"{(reversing ? "倒车" : "前进")} 剩 {RemainingDistance:0.0} m · 误差 {CrossTrackErrorMeters:0.00} m · 目标 {reference * 3.6:0.0} km/h";
 
@@ -585,7 +614,11 @@ public sealed class Follower
         double derivative = (error - lastError) / dt;
         lastError = error;
 
-        double command = settings.PidKp * error + settings.PidKi * integral + settings.PidKd * derivative;
+        lastPidP = settings.PidKp * error;
+        lastPidI = settings.PidKi * integral;
+        lastPidD = settings.PidKd * derivative;
+
+        double command = lastPidP + lastPidI + lastPidD;
 
         // Rolling resistance and drivetrain slack mean a small PID output simply does not move
         // a stopped vehicle, so ask for a fixed launch acceleration until it starts rolling.

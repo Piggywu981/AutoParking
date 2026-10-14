@@ -23,6 +23,17 @@ public sealed class AutoParkingSettings
     ///  plugin publishing full throttle turns our brake demand into a positive average, our pedal
     ///  never reaches the wheels, and the truck drains its air reservoirs fighting it. Measured in
     ///  the game at an opposing weight of about 14, hence a default well above that.
+    ///
+    ///  Two numbers worth knowing, both read off the shipped assemblies rather than inferred:
+    ///  ControlProperties.Weight initialises to 1.0 and no official plugin touches it, so against
+    ///  LaneAssist or ACC this weight is a 20:1 share, not ownership. The real reason the official
+    ///  assists stand down is that we clear ApplicationState.EnableAssists. And steering is its own
+    ///  averaged bucket, competing on exactly the same terms as the pedal, so a conflict shows up as
+    ///  a smeared wheel rather than as one side winning.
+    ///
+    ///  The lower bound is load-bearing: GameOutput divides the weighted sum by the sum of weights
+    ///  with no zero guard, so a bucket fed only by weight-0 channels yields NaN straight into shared
+    ///  memory. Never allow 0 here.
     /// </summary>
     public double ControlWeight { get; set; } = 20.0;
 
@@ -109,6 +120,15 @@ public sealed class AutoParkingSettings
     // Visualisation
     public bool ShowMapWindow { get; set; } = true;
     public bool ShowArOverlay { get; set; } = true;
+
+    /// <summary>
+    ///  Second-by-second curves of the control terms (cross-track, heading, steer raw vs shaped,
+    ///  target vs actual speed, and the longitudinal P/I/D against the returned command). Off by
+    ///  default: it is a tuning instrument, not something to drive with, and leaving a second overlay
+    ///  registered costs the render thread every frame.
+    /// </summary>
+    public bool ShowControlPlot { get; set; } = false;
+
     public double ArGroundTrimM { get; set; } = 0.0;
     public double MapScalePxPerM { get; set; } = 1.25;
     public double MapZoom { get; set; } = 1.0;

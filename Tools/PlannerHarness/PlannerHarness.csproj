@@ -32,6 +32,7 @@
     <Compile Include="$(PluginRoot)Driving\ReedsShepp.cs" />
     <Compile Include="$(PluginRoot)Driving\Planner.cs" />
     <Compile Include="$(PluginRoot)Driving\Follower.cs" />
+    <Compile Include="$(PluginRoot)Driving\ControlTrace.cs" />
     <Compile Include="$(PluginRoot)Driving\PlannerSelfTest.cs" />
   </ItemGroup>
 

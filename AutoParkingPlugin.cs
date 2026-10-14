@@ -63,6 +63,14 @@ public sealed class AutoParkingPlugin : Plugin
     private DateTime nextGeometryBuildUtc = DateTime.MinValue;
     private MapOverlay? mapOverlay;
     private ArOverlay? arOverlay;
+
+    /// <summary>
+    ///  Control terms for the last ~17 s of tracking. Owned by the plugin, written by the follower on
+    ///  the tick thread, read by <see cref="controlPlot"/> on the overlay thread; the trace locks
+    ///  itself so nothing here has to.
+    /// </summary>
+    private readonly ControlTrace controlTrace = new();
+    private ControlPlot? controlPlot;
     private string mapStatus = "尚未构建";
     private PlanResult? planResult;
     private string selfTestSummary = "尚未运行";
@@ -197,8 +205,10 @@ public sealed class AutoParkingPlugin : Plugin
 
         mapOverlay = new MapOverlay(this);
         arOverlay = new ArOverlay(this);
+        controlPlot = new ControlPlot(controlTrace);
         mapOverlay.Register(settings.ShowMapWindow);
         arOverlay.Register();
+        controlPlot.SetVisible(settings.ShowControlPlot);
 
         ControlsBackend.Current.On(toggleControl.Id, OnToggleKeyPressed);
         ControlsBackend.Current.On(abortControl.Id, OnAbortKeyPressed);
@@ -724,6 +734,8 @@ public sealed class AutoParkingPlugin : Plugin
         mapOverlay = null;
         arOverlay?.Unregister();
         arOverlay = null;
+        controlPlot?.SetVisible(false);
+        controlPlot = null;
 
         Events.Current.Unsubscribe<GameTelemetryData>(GameTelemetry.Current.EventString, OnTelemetry);
         GameTelemetry.Current.ReadTrailerData = previousReadTrailerData;
@@ -978,6 +990,10 @@ public sealed class AutoParkingPlugin : Plugin
                     settings.ShowArOverlay = ToBool(value, settings.ShowArOverlay);
                     changed = true;
                     break;
+                case "showControlPlot":
+                    settings.ShowControlPlot = ToBool(value, settings.ShowControlPlot);
+                    changed = true;
+                    break;
                 case "snapToNavCurve":
                     settings.SnapToNavCurve = ToBool(value, settings.SnapToNavCurve);
                     changed = true;
@@ -1170,15 +1186,19 @@ public sealed class AutoParkingPlugin : Plugin
     {
         bool showMap;
         bool showAr;
+        bool showPlot;
         MapOverlay? map;
         ArOverlay? ar;
+        ControlPlot? plot;
 
         lock (sync)
         {
             showMap = settings.ShowMapWindow;
             showAr = settings.ShowArOverlay;
+            showPlot = settings.ShowControlPlot;
             map = mapOverlay;
             ar = arOverlay;
+            plot = controlPlot;
         }
 
         map?.SetOpen(showMap);
@@ -1187,6 +1207,8 @@ public sealed class AutoParkingPlugin : Plugin
             ar?.EnsureRegistered();
         else
             ar?.Unregister();
+
+        plot?.SetVisible(showPlot);
     }
 
     public string StartParking()
@@ -1225,7 +1247,14 @@ public sealed class AutoParkingPlugin : Plugin
                         // which leaves the follower on the route it already has.
                         PlanResult next = Planner.Plan(from, spot, cfg, field, planTrust);
                         return next.Ok ? next.Path : null;
-                    });
+                    })
+                {
+                    Trace = controlTrace
+                };
+
+                // A fresh timeline per maneuver: leaving the previous run in the buffer makes the
+                // plot a smear across two different routes and hides the thing being tuned.
+                controlTrace.Reset();
 
                 TakeOverAssists();
                 phase = ParkingPhase.Engaging;

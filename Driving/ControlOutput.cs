@@ -7,10 +7,15 @@ namespace AutoParking;
 /// <summary>
 ///  The only place in the plugin that publishes driving commands.
 ///
-///  GameOutput merges every channel that touches the same field by weight, drops channels that
-///  have not been refreshed within their timeout, and writes booleans straight into shared
-///  memory - so the drive channel must be refreshed every tick, gear pulses must be sent once,
-///  and the handbrake must be explicitly released or it stays engaged after we go away.
+///  GameOutput averages every channel that touches the same field, weighted by
+///  <see cref="ControlProperties.Weight"/>, then clamps to [-1, 1] and writes the result. Only two
+///  buckets exist by name: <c>steering</c> and <c>acceleration</c> (which <c>aforward</c> and
+///  <c>abackward</c> are folded into), and both are averaged identically, so a competing plugin
+///  smears our wheel rather than losing to us. Dropping a channel is not instant: an unrefreshed
+///  channel survives until its timeout, so the drive channel must be published every tick.
+///  Booleans always go to the legacy segment, and <c>TrueToToggle</c> fires as a pulse on a task,
+///  which is why gear pulses must be sent once and the handbrake must be explicitly released or it
+///  stays engaged after we go away.
 /// </summary>
 public sealed class ControlOutput
 {
@@ -67,6 +72,8 @@ public sealed class ControlOutput
         // negative to abackward (negated). Publishing both fields therefore halves the demand
         // and flips braking into throttle - exactly what a real run showed, where commanding
         // abackward=1.0 produced a steady user_throttle=0.5 and 50 km/h. Send one signed field.
+        // The official ACC does the same thing with an if/else on one ControlVariables, so this is
+        // the intended shape of the API rather than a workaround of ours.
         if (acceleration >= 0.0f)
             variables.aforward = acceleration;
         else

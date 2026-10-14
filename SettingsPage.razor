@@ -45,6 +45,10 @@
                 Description="在游戏画面上画出车位框、朝向和距离。受 ETS2LA 的 AR 距离裁剪限制。"
                 Value="@Plugin.Settings.ShowArOverlay"
                 ValueChanged="@((bool value) => Plugin.HandleAction("showArOverlay", value))" />
+        <Switch Title="控制分项曲线"
+                Description="最近 10 秒的横向误差、航向误差、转向（原始 vs 限速整形后）、目标/实际速度、纵向 P/I/D 与最终指令。调参时开：数值表只能给当前读数，曲线才看得出是收敛还是在抖。平时关掉，注册窗口本身也有开销。"
+                Value="@Plugin.Settings.ShowControlPlot"
+                ValueChanged="@((bool value) => Plugin.HandleAction("showControlPlot", value))" />
         <Switch Title="吸附到导航曲线"
                 Description="点选时把车位吸附到附近建筑导航曲线的方向上，避免车头朝向乱指。"
                 Value="@Plugin.Settings.SnapToNavCurve"

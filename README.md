@@ -76,7 +76,7 @@ when that row or probe is rendered.
 
 - Settings page route (auto-discovered by convention, no registration needed):
   `/plugins/adjustments/local.autoparking`, i.e. Settings → Adjustments → **Auto Parking**.
-- Two visualization windows are toggled from the settings page:
+- Three visualization windows are toggled from the settings page:
   - **Flat map** (ImGui window, on by default): road lane lines, prefab edges/navigation curves,
     obstacles, current path, plus the static map layer — every map item class that has ground
     geometry gets drawn: magenta building segments, olive loose-model points (street lamps, poles,
@@ -99,6 +99,12 @@ when that row or probe is rendered.
   - **AR overlay** (on the game screen, on by default): spot box, vehicle footprint projection,
     forward-direction arrow, target pose, and the **route preview** - the corridor the vehicle will
     occupy and the line it will follow, drawn on the ground before it is driven (§6.7).
+  - **Control terms plot** (ImGui window, **off by default**): the last few seconds of the control
+    terms as curves - cross-track error, heading error, steer before and after the rate limiter,
+    target against actual speed, and the longitudinal P/I/D against the command actually returned,
+    with reverse legs shaded. It exists because a status row can only show one current number, and
+    tuning needs to know whether that number is converging or oscillating. Turning it on registers
+    a second overlay window, so it is off for normal use.
 
 ## 3. Bind Hotkeys (Required)
 

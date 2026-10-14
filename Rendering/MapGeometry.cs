@@ -7,6 +7,7 @@ using ETS2LA.Game;
 using ETS2LA.Game.Data;
 using ETS2LA.Game.PpdFiles;
 using ETS2LA.Game.Utils;
+using ETS2LA.State;
 using TruckLib;
 using TruckLib.HashFs;
 using TruckLib.Models.Ppd;
@@ -155,9 +156,8 @@ public sealed class MapGeometryBuilder
                 return null;
             }
 
-            for (int i = 0; i < installations.Count; i++)
+            foreach (Installation installation in OrderCandidates(installations, ApplicationState.Current.RunningGame))
             {
-                Installation installation = installations[i];
                 if (!installation.IsParsed)
                     continue;
 
@@ -186,6 +186,26 @@ public sealed class MapGeometryBuilder
         }
     }
 
+    /// <summary>
+    ///  The running installation first, then every other one. Ordering matters more than it looks:
+    ///  taking "the first parsed installation", which is what the official LaneAssist and
+    ///  InternalVisualization both do, binds the file system and reads map data from whichever game
+    ///  the loader reached first - with ETS2 and ATS both installed that can be a game we are not
+    ///  driving in. Falling through the rest is still required, because an installation can report
+    ///  <c>IsParsed</c> while <c>GetMapData()</c> is still null.
+    /// </summary>
+    private static IEnumerable<Installation> OrderCandidates(List<Installation> installations, Installation? running)
+    {
+        if (running != null)
+            yield return running;
+
+        foreach (Installation installation in installations)
+        {
+            if (!ReferenceEquals(installation, running))
+                yield return installation;
+        }
+    }
+
     public MapGeometry Build(MapData map, Vector2 center, double radiusM, double corridorHalfWidthM)
     {
         Stopwatch sw = Stopwatch.StartNew();
@@ -198,6 +218,10 @@ public sealed class MapGeometryBuilder
 
         try
         {
+            // Within(minX, minZ, maxX, maxZ). The ground plane is carried as Vector2 (X, Z), so the
+            // map's Z axis really is .Y here and .Y is not a height - every caller builds it as
+            // new Vector2(coordinate.X, coordinate.Z). Nodes are the only spatially indexed map
+            // class, so this box is the whole reach of "what is near this point".
             IReadOnlyList<Node> nodes = map.Nodes.Within(center.X - radiusM, center.Y - radiusM,
                                                          center.X + radiusM, center.Y + radiusM);
 
