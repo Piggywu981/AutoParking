@@ -20,6 +20,8 @@
 //         STR\t<uid:0xHEX>\t<ascii-run>
 //       One record per line, CRLF-terminated like any Console output on Windows, every byte ASCII,
 //       floats InvariantCulture "0.###". Narration is suppressed there so nothing has to be filtered.
+//       STR carries every string the 串 block prints for that item: runs reached through a pointer keep
+//       their @+0xNN provenance label, runs read inline are bare. Consumers match with substring tests.
 
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -488,7 +490,7 @@ void DoViz(ulong basePtr, double radius)
 //   ITEM\t<type:int>\t<uid:0xHEX>\t<flags:0xHEX>\t<x>\t<y>\t<z>\t<dx>\t<dy>\t<dz>
 //   STR\t<uid:0xHEX>\t<ascii-run>
 // x/y/z is the k-DOP centre, dx/dy/dz its extents, floats InvariantCulture "0.###". STR lines come from
-// exactly the call --deep already prints - ReadAsciiRuns(h, elem, 0x100, 5) - so the two modes cannot
+// the one scan DeepItemStrings() performs - the same walk --deep prints as 串 - so the two modes cannot
 // disagree about a uid; a uid may repeat, one line per run, and each run is 0x20-0x7E by construction.
 void DoDeep(ulong basePtr, double x, double z, double r, bool tsv)
 {
@@ -539,7 +541,7 @@ void DoDeep(ulong basePtr, double x, double z, double r, bool tsv)
                 Console.WriteLine($"ITEM\t{type}\t0x{uid:X12}\t0x{flags:X}\t" +
                                   $"{Num(cx, inv)}\t{Num((miny + maxy) / 2, inv)}\t{Num(cz, inv)}\t" +
                                   $"{Num(maxx - minx, inv)}\t{Num(maxy - miny, inv)}\t{Num(maxz - minz, inv)}");
-                foreach (string s in ReadAsciiRuns(h, (long)elem, 0x100, 5))
+                foreach (string s in DeepItemStrings(it, (long)elem).records)
                     Console.WriteLine($"STR\t0x{uid:X12}\t{s}");
             }
             else
@@ -550,25 +552,55 @@ void DoDeep(ulong basePtr, double x, double z, double r, bool tsv)
                 Console.WriteLine($"     @({cx:F2}, {((miny + maxy) / 2):F2}, {cz:F2})  尺寸 {(maxx - minx):F2}x{(maxy - miny):F2}x{(maxz - minz):F2}  离目标 {dist:F2} m");
                 Console.WriteLine($"     vptr=0x{vptr:X}{(vptrInModule ? "（游戏模块内）" : "（模块外）")}  类名={ClassName(vptr) ?? "?"}");
 
-                var found = new List<string>();
-                for (int w = 0; w + 8 <= 0x100; w += 8)
-                {
-                    ulong p = BitConverter.ToUInt64(it, w);
-                    if (p < 0x10000 || p > 0x7FFFFFFFFFFF) continue;
-                    foreach (string s in ReadAsciiRuns(h, (long)p, 96, 4))
-                    {
-                        if (s.Length >= 4 && !found.Contains(s)) found.Add($"@+0x{w:X2} {s}");
-                    }
-                    if (found.Count >= 8) break;
-                }
-                foreach (string s in ReadAsciiRuns(h, (long)elem, 0x100, 5))
-                    if (!found.Any(f => f.EndsWith(s))) found.Add($"内联 {s}");
-                foreach (string s in found.Take(12)) Console.WriteLine($"     串  {s}");
+                foreach (string s in DeepItemStrings(it, (long)elem).human.Take(12)) Console.WriteLine($"     串  {s}");
             }
             shown++;
         }
     }
     if (!tsv) Console.WriteLine($"\n共展开 {shown} 个条目（另有 {skipped} 个 Terrain/Sound/VisArea/MapArea 静默跳过）");
+}
+
+// Every string one kdop item carries, scanned ONCE for both print modes so the console and the machine
+// records can never disagree about an item. Two channels: (1) the element's own first 0x100 bytes hold
+// pointers, and walking every 8-byte word and reading 96 bytes at each plausible user-mode pointer is
+// where the IDENTITY strings live - the trigger's `state park_trigger_on_stopped`, an `/automat/...`
+// path, anything the item only references instead of storing - and (2) the ASCII runs stored inline in
+// those 0x100 bytes, which the pointer scan has not already reached. The TSV STR channel used to read
+// only channel (2), which made the sidecar strictly weaker than the console it was built to replace.
+// Returns the pair of views over one scan: `human` is what --deep prints as 串 (each entry labelled
+// @+0xNN for a pointer window, 内联 for an inline run), `records` is the same strings with the
+// non-ASCII 内联 marker dropped so a STR field stays 0x20-0x7E, while the @+0xNN provenance is kept
+// because it is the only thing that says WHERE the run was found. An inline run that a pointer window
+// already produced is folded into that entry, so a uid never emits a string twice *across channels*.
+// Duplicates inside the pointer channel are preserved exactly as the console prints them, including
+// the quirk that the original Contains(run) test compares a bare run against already-labelled entries
+// and so never fires - measured here: 14 (uid, run) pairs among the 819 STR rows appear twice, and
+// every one of them is a 串 line --deep prints twice for that same item, so the records add nothing
+// the console does not already say.
+(List<string> human, List<string> records) DeepItemStrings(byte[] it, long elem)
+{
+    const string inlineMarker = "内联 "; // presentation-only; never part of a record field
+    var human = new List<string>();
+    var records = new List<string>();
+    for (int w = 0; w + 8 <= 0x100; w += 8)
+    {
+        ulong p = BitConverter.ToUInt64(it, w);
+        if (p < 0x10000 || p > 0x7FFFFFFFFFFF) continue;
+        foreach (string s in ReadAsciiRuns(h, (long)p, 96, 4))
+        {
+            if (s.Length < 4 || human.Contains(s)) continue;
+            human.Add($"@+0x{w:X2} {s}");
+            records.Add($"@+0x{w:X2} {s}");
+        }
+        if (human.Count >= 8) break;
+    }
+    foreach (string s in ReadAsciiRuns(h, elem, 0x100, 5))
+        if (!human.Any(f => f.EndsWith(s)))
+        {
+            human.Add(inlineMarker + s);
+            records.Add(s);
+        }
+    return (human, records);
 }
 
 // One formatter for every float field of the TSV record: InvariantCulture "0.###", which for a finite
