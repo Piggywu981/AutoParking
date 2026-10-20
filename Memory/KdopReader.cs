@@ -23,6 +23,10 @@ namespace AutoParking;
 ///    main module image → base_ctrl instance pattern → instance pointer (RIP-relative)
 ///    → member sweep for array_dyn_t&lt;kdop_item_t*&gt; lists (offsets are build-specific)
 ///    → kdop_item_t: vptr@00, item_type@0x0A, k-DOP min/max@0x0C..0x34, flags@0x34, uid@0x40.
+///    → what an item *is* is not decided here: MemClassifier.Classify(type, flags, dx, dy, dz) is
+///      pure so Tools\PlannerHarness can assert every kind rule without a game process. Only the
+///      "over 20 m across is not worth publishing" size filter stayed here, and it is a publishing
+///      rule, not an identity rule.
 ///
 ///  Hard rules this class follows:
 ///    - never runs on the tick thread or the render thread (§39/§40: a stalled tick is how the
@@ -36,23 +40,6 @@ internal sealed class KdopReader
     ///  convention: (SCS X, SCS Z) — the same plane CurrentPose.Position lives on.</summary>
     public sealed record MemItem(int Type, MemKind Kind, ulong Uid, Vector2 PlanePos,
                                  float Height, float Dx, float Dy, float Dz, uint Flags);
-
-    public enum MemKind
-    {
-        /// <summary>Sign, near-square footprint ~0.6–1.1 m wide, ~0.9–1.2 m tall — the shape of
-        ///  every cone measured so far, archive (§38) and runtime (§41) alike.</summary>
-        Cone,
-        /// <summary>A bigger Sign: construction boards, gantry signs, the row-head signs.</summary>
-        Board,
-        /// <summary>Mover items - the game's dynamic/animated objects.</summary>
-        Mover,
-        /// <summary>Buildings items. An archive class, but the host's filtered MapData does not
-        ///  necessarily carry them at the current spot, so the memory layer draws and blocks them
-        ///  too (§43, owner decision: near-lot structures must not be hit whatever they are).</summary>
-        Building,
-        /// <summary>Any other small item class; drawn nowhere, blocks nothing.</summary>
-        Other
-    }
 
     /// <summary>
     ///  The player's own vehicle box, measured the way the game measures every vehicle: the local
@@ -227,7 +214,7 @@ internal sealed class KdopReader
         }
 
         long ms2 = ElapsedMs(start);
-        int cones = 0, boards = 0, movers = 0, buildings = 0;
+        int cones = 0, boards = 0, movers = 0, buildings = 0, triggers = 0, parked = 0;
         foreach (MemItem item in items)
         {
             switch (item.Kind)
@@ -236,12 +223,21 @@ internal sealed class KdopReader
                 case MemKind.Board: boards++; break;
                 case MemKind.Mover: movers++; break;
                 case MemKind.Building: buildings++; break;
+                // The two runtime kinds the marker feature is built on: the 0x22 goal volume that sits
+                // on the 0xC17 pair (its own game-side state string reads park_trigger_on_stopped),
+                // and the 0x2F hookups standing in the row around it. Counted apart from Other because
+                // this string is the only in-game evidence that the new rules fire at all - neither
+                // kind is otherwise tellable on the map, one being invisible and the other a gray
+                // footprint that looks like every other parked box.
+                case MemKind.Trigger: triggers++; break;
+                case MemKind.ParkedVehicle: parked++; break;
             }
         }
 
         string status = instance == 0
             ? "游戏中无实例（主菜单？）"
-            : $"读到 {items.Count} 项 · 锥桶 {cones} · 牌 {boards} · 建筑 {buildings} · 动态 {movers} · {ms2:0} ms"
+            : $"读到 {items.Count} 项 · 锥桶 {cones} · 牌 {boards} · 建筑 {buildings} · 动态 {movers} "
+              + $"· 触发 {triggers} · 停放 {parked} · {ms2:0} ms"
               + (body.Available ? $" · 车体 {body.LengthM:0.00}×{body.WidthM:0.00}×{body.HeightM:0.00} m" : " · 车体未读到");
 
         Snapshot fresh = new() { Items = items, Body = body, StampUtc = DateTime.UtcNow, Status = status, ReadMilliseconds = ms2 };
@@ -361,29 +357,13 @@ internal sealed class KdopReader
         if (MathF.Max(dx, MathF.Max(dy, dz)) > 20f)
             return null; // buildings/terrain boxes: the archive layer already draws those it knows
 
-        MemKind kind = Classify(type, dx, dy, dz);
         ulong uid = BitConverter.ToUInt64(it, 0x40);
         uint flags = BitConverter.ToUInt32(it, 0x34);
+        // Classification itself is MemClassifier's (pure, harness-asserted). The size filter above
+        // stays here on purpose: it decides what this layer publishes at all, not what an item is.
+        MemKind kind = MemClassifier.Classify(type, flags, dx, dy, dz);
         return new MemItem(type, kind, uid, new Vector2((minx + maxx) / 2, (minz + maxz) / 2),
                            (miny + maxy) / 2, dx, dy, dz, flags);
-    }
-
-    private static MemKind Classify(int type, float dx, float dy, float dz)
-    {
-        // Numbering matches TruckLib ItemType (design doc §38): 0x02 Buildings, 0x09 Mover, 0x24 Sign.
-        if (type == 0x02)
-            return MemKind.Building;
-        if (type == 0x09)
-            return MemKind.Mover;
-        if (type == 0x24)
-        {
-            float ratio = dz > 0 ? dx / dz : 0;
-            if (dx is >= 0.35f and <= 1.15f && dz is >= 0.35f and <= 1.15f
-                && dy is >= 0.75f and <= 1.4f && ratio is >= 0.55f and <= 1.8f)
-                return MemKind.Cone;
-            return MemKind.Board;
-        }
-        return MemKind.Other;
     }
 
     // ---- process + offset resolution ---------------------------------------------------------------

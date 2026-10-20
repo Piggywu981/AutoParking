@@ -93,6 +93,10 @@ internal sealed class MapOverlay
     private static readonly uint ColorMemConeEdge = Color(0.12f, 0.04f, 0.01f);
     private static readonly uint ColorMemBoard = Color(0.55f, 0.10f, 0.10f);
     private static readonly uint ColorMemMover = Color(0.29f, 0.56f, 0.85f);
+    // A parked hookup drawn from memory (§54): deliberately gray, the neutral "this is furniture that
+    // is already standing here" hue, and never ColorBuilding - the static layer paints buildings
+    // magenta, and a row of parked trailers must not read as a row of walls.
+    private static readonly uint ColorMemParked = Color(0.62f, 0.62f, 0.62f, 0.90f);
     private static readonly uint ColorBarrier = Color(0.95f, 0.90f, 0.25f);
     private static readonly uint ColorWall = Color(0.85f, 0.35f, 0.85f);
     private static readonly uint ColorCrate = Color(0.75f, 0.55f, 0.25f);
@@ -325,19 +329,27 @@ internal sealed class MapOverlay
 
         // The game's runtime-spawned items (roadwork cones above all) exist only in game memory -
         // the host's MapData cannot contain them (design doc §41). This layer reads from the
-        // reader's snapshot, so it works even before the map geometry is ready. "Other" kinds are
-        // skipped on purpose: the full list also carries archive items the static layer below
-        // already draws, and double-drawing them would hide which dots the archive is missing.
+        // reader's snapshot, so it works even before the map geometry is ready. "Other" is skipped on
+        // purpose: the full list also carries archive items the static layer below already draws, and
+        // double-drawing them would hide which dots the archive is missing. "Trigger" is skipped too,
+        // for the reason at its own line below.
         KdopReader.Snapshot? memSnapshot = settings.ShowMemoryItems ? plugin.MemoryItemSnapshot : null;
         float memNearestM = float.MaxValue;
         if (memSnapshot != null)
         {
             foreach (KdopReader.MemItem item in memSnapshot.Items)
             {
-                if (item.Kind == KdopReader.MemKind.Other)
+                if (item.Kind == MemKind.Other)
                     continue;
 
-                if (item.Kind == KdopReader.MemKind.Cone)
+                // An invisible detection volume, and a loose one: spec F10 measured the 0x22 boxes
+                // (7.36³ and 10.16×6.68 m) and refuted the hypothesis that such a box is the bay's
+                // outline. Painting that footprint would show a parking space that is not there.
+                // Written as an explicit skip so a reader sees it was decided, not forgotten.
+                if (item.Kind == MemKind.Trigger)
+                    continue;
+
+                if (item.Kind == MemKind.Cone)
                 {
                     float distance = (float)Geometry.Distance(item.PlanePos, truckPlane);
                     if (distance < memNearestM)
@@ -350,18 +362,18 @@ internal sealed class MapOverlay
 
                 switch (item.Kind)
                 {
-                    case KdopReader.MemKind.Cone:
+                    case MemKind.Cone:
                         drawList.AddCircleFilled(at, 4.2f, ColorMemCone);
                         drawList.AddCircle(at, 4.2f, ColorMemConeEdge, 12, 1.4f);
                         break;
-                    case KdopReader.MemKind.Board:
+                    case MemKind.Board:
                         drawList.AddRectFilled(at - new Vector2(3f, 3f), at + new Vector2(3f, 3f), ColorMemBoard);
                         break;
-                    case KdopReader.MemKind.Mover:
+                    case MemKind.Mover:
                         drawList.AddCircleFilled(at, 3.2f, ColorMemMover);
                         drawList.AddCircle(at, 3.2f, ColorMemConeEdge, 12, 1f);
                         break;
-                    case KdopReader.MemKind.Building:
+                    case MemKind.Building:
                     {
                         // The real footprint, not a fixed marker: a wall run must read as a wall.
                         // Same hue as the static layer's buildings - a building is a building -
@@ -369,6 +381,18 @@ internal sealed class MapOverlay
                         Vector2 half = new(MathF.Max(item.Dx, 0.6f) * scale * 0.5f,
                                            MathF.Max(item.Dz, 0.6f) * scale * 0.5f);
                         drawList.AddRectFilled(at - half, at + half, ColorBuilding);
+                        drawList.AddRect(at - half, at + half, ColorMemConeEdge, 0f, 0, 1f);
+                        break;
+                    }
+                    case MemKind.ParkedVehicle:
+                    {
+                        // The same treatment in gray: a hookup with a parked flag is a vehicle that is
+                        // already standing here, and its k-DOP is that vehicle's real footprint - the
+                        // row the target resolver measures its gap between (§54). Gray rather than
+                        // ColorBuilding so a parked row cannot be misread as a run of walls.
+                        Vector2 half = new(MathF.Max(item.Dx, 0.6f) * scale * 0.5f,
+                                           MathF.Max(item.Dz, 0.6f) * scale * 0.5f);
+                        drawList.AddRectFilled(at - half, at + half, ColorMemParked);
                         drawList.AddRect(at - half, at + half, ColorMemConeEdge, 0f, 0, 1f);
                         break;
                     }

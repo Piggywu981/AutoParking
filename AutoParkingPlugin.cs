@@ -365,7 +365,7 @@ public sealed class AutoParkingPlugin : Plugin
 
         List<Vector2> cones = new();
         foreach (KdopReader.MemItem item in memory.Items)
-            if (item.Kind == KdopReader.MemKind.Cone)
+            if (item.Kind == MemKind.Cone)
                 cones.Add(item.PlanePos);
 
         geometry.Bays.AddRange(ParkingBays.Detect(cones));
@@ -380,6 +380,12 @@ public sealed class AutoParkingPlugin : Plugin
     ///  whatever exactly they are). Merging here means the engaged maneuver's captured geometry
     ///  carries the set from its last rebuild (≤0.5 s old), while HandleObstacles sees fresh data
     ///  every tick - the same freshness split the traffic obstacles already live with.
+    ///
+    ///  The kind test below is a whitelist, so a kind the classifier learns afterwards is not a
+    ///  blocker by construction. That is deliberate for Trigger (an invisible volume) and
+    ///  ParkedVehicle (the game's own framing vehicles, which the target resolver reads as the gap
+    ///  the truck is asked to use): making either of them block needs its own evidence, not a
+    ///  rename (§54).
     /// </summary>
     private int AddMemoryObstacles(MapGeometry geometry, Vector2 truckPlane, double radiusM)
     {
@@ -393,8 +399,8 @@ public sealed class AutoParkingPlugin : Plugin
         int added = 0;
         foreach (KdopReader.MemItem item in memory.Items)
         {
-            if (item.Kind is not (KdopReader.MemKind.Cone or KdopReader.MemKind.Board
-                or KdopReader.MemKind.Mover or KdopReader.MemKind.Building))
+            if (item.Kind is not (MemKind.Cone or MemKind.Board
+                or MemKind.Mover or MemKind.Building))
                 continue;
 
             if (Math.Abs(item.PlanePos.X - truckPlane.X) > radiusM
