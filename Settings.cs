@@ -261,18 +261,26 @@ public sealed class AutoParkingSettings
     public double SavedSpotZ { get; set; }
     public double SavedSpotHeadingRad { get; set; }
 
-    // Marker-following auto-park. Defaults and clamp ranges come from spec §6 of
-    // docs/superpowers/specs/2026-10-19-universal-autoparking-design.md. Nothing reads these yet:
+    // Marker-following auto-park. The defaults come from spec §6 of
+    // docs/superpowers/specs/2026-10-19-universal-autoparking-design.md - that table lists 9 keys and
+    // no ranges at all (the 0.05/0.30 pair in the spec is InsertPad's pad clamp, a different number),
+    // so the clamp bounds below plus AutoParkByMarker and GameProcessName come from the plan
+    // (docs/superpowers/plans/2026-10-20-universal-autoparking.md, Task 6). Nothing reads these yet:
     // the consumers arrive with the target-resolution wiring later in the same plan, so until then
     // this is inert configuration and the current maneuver behaves exactly as before.
 
     /// <summary>
     ///  Run the whole chain - resolve the game's marker, plan, draw the target pose and the route on
-    ///  the map - while sending no control commands at all: the effective dry-run flag becomes
-    ///  <see cref="DryRun"/> || this. On by default, because the marker protocol is new and the first
-    ///  passes are meant to be watched rather than driven; letting the truck move is the explicit act
-    ///  of turning this off. Shadow mode neither pauses nor aborts anything - only the hotkeys end a
-    ///  maneuver - it only withholds the pedals, the wheel, the gearbox and the handbrake.
+    ///  the map - while sending no control commands at all. The rule is a conjunction, not this flag
+    ///  alone: the effective dry-run value is <see cref="DryRun"/> || <see cref="ShadowMode"/>, so the
+    ///  truck only receives pedals, wheel, gearbox and handbrake when BOTH are off - the expression
+    ///  Task 8 writes at the control-output boundary, and until that wiring lands both flags are
+    ///  inert, as the header above says. Since
+    ///  <see cref="DryRun"/> also defaults to true, turning this off is necessary but not sufficient -
+    ///  the Dry-run switch is the other half and sits at the top of the same settings page. On by
+    ///  default because the marker protocol is new and the first passes are meant to be watched rather
+    ///  than driven. Shadow mode neither pauses nor aborts anything - only the hotkeys end a maneuver -
+    ///  it only withholds the commands.
     /// </summary>
     public bool ShadowMode { get; set; } = true;
 
@@ -280,16 +288,26 @@ public sealed class AutoParkingSettings
     ///  Resolve where the game wants the truck parked from the runtime memory items (0xC17 mover pair
     ///  → framing-vehicle gap → <see cref="SavedSpotX"/>) instead of demanding a map pick. Off
     ///  restores the previous behavior outright: no picked spot means the start is refused, which is
-    ///  how the manual workflow stays reachable. With it on, a hand-picked spot is still only taken
-    ///  when <see cref="MinConfidence"/> lets the 0.4 tier through.
+    ///  how the manual workflow stays reachable. With it on, the last tier is the hand-picked
+    ///  <see cref="SavedSpotX"/> spot, and that tier is exempt from <see cref="MinConfidence"/> (see
+    ///  the rule written there): a person chose the pose, so there is no detector uncertainty left to
+    ///  threshold, and the fallback promised here works at the 0.6 default.
     /// </summary>
     public bool AutoParkByMarker { get; set; } = true;
 
     /// <summary>
-    ///  Path to the sidecar executable that reads the game process for the identity channel. Empty
-    ///  means MemoryProbe.exe next to the plugin DLL. JSON-only knob on purpose: the host settings
-    ///  page ships Slider/Switch/Dropdown and has no text input, so there is no control to add and
-    ///  no HandleAction case (it would be unreachable). Edit AutoParking.json; documented in README.
+    ///  Path to the sidecar executable that reads the game process for the identity channel. JSON-only
+    ///  knob on purpose: the host settings page ships Slider/Switch/Dropdown and has no text input, so
+    ///  there is no control to add and no HandleAction case (it would be unreachable). Edit
+    ///  AutoParking.json; documented in README.
+    ///
+    ///  Empty does NOT mean "MemoryProbe.exe next to the plugin DLL": the host shadow-copies the DLL
+    ///  alone into %TEMP%\ETS2LA\PluginShadow/&lt;name&gt;_&lt;guid&gt;/, so at runtime that directory
+    ///  holds no exe, and AppContext.BaseDirectory is not current\Plugins either. The resolution order
+    ///  is therefore explicit SidecarPath first, then "&lt;host exe dir&gt;\Plugins\MemoryProbe.exe",
+    ///  then AppContext.BaseDirectory as the last try - and the candidate actually chosen must be
+    ///  logged, because the shadow copy makes every one of these paths ambiguous from inside the host.
+    ///  Pending Task 8: nothing reads this key yet and none of the above is implemented here.
     /// </summary>
     public string SidecarPath { get; set; } = "";
 
@@ -301,10 +319,17 @@ public sealed class AutoParkingSettings
     public string GameProcessName { get; set; } = "eurotrucks2";
 
     /// <summary>
-    ///  On the reverse leg, size the obstacle envelope from the measured lateral clear of the
-    ///  framing-vehicle gap (see <see cref="SafetyMarginM"/>) instead of the fixed per-side padding,
-    ///  which is a highway number and rejects every route in a 3.4 m bay (§53). Off keeps both legs
-    ///  on the fixed values.
+    ///  On the reverse leg, set the per-side obstacle padding from the measured lateral clear of the
+    ///  framing-vehicle gap (see <see cref="SafetyMarginM"/>) instead of the fixed value:
+    ///  pad = clamp((lateral clear - VehicleWidthM)/2 - SafetyMarginM, 0.05, 0.30). That is not a
+    ///  shrinking rule - it widens the envelope in a roomy gap and tightens it in a narrow one.
+    ///  Measured on the practice course (lateral clear 3.24 m against the typed 2.60 m width) the
+    ///  default 0.10 gives 0.22 m/side where the fixed pair gives 0.10 m/side, so there it opens up;
+    ///  it drops below the fixed value only under roughly 3.0 m of clear. Off keeps both legs on the
+    ///  fixed values. The padding this replaces is the pre-§53 one - 0.25 pad + 0.50 margin, i.e.
+    ///  0.75 m/side, a highway number whose box is wider than the 3.44 m bay mouth and so rejected
+    ///  every route in it - not today's 0.10/side total, which already leaves twelve clean routes
+    ///  there (see <see cref="EnvelopePadM"/> for the measured pad table).
     /// </summary>
     public bool DynamicEnvelope { get; set; } = true;
 
@@ -334,19 +359,30 @@ public sealed class AutoParkingSettings
     public double SettleTimeS { get; set; } = 3.0;
 
     /// <summary>
-    ///  A resolved target below this confidence refuses the start (refusal to start, never an abort -
-    ///  see the project policy that only hotkeys end a maneuver). The tiers are fixed in TargetResolver:
-    ///  0.9 mover pair, 0.6 framing-vehicle gap, 0.4 saved spot. The 0.6 default therefore excludes
-    ///  the saved-spot tier: drop it to 0.4 to let a hand-picked spot through the marker path, or
-    ///  turn <see cref="AutoParkByMarker"/> off to keep the old pick-only flow untouched.
+    ///  The gate in refusal form: a resolved target is refused at start when
+    ///  confidence &lt; MinConfidence. Strict &lt;, so 0 disables the gate outright (no tier sits below
+    ///  0) and a tier exactly equal to the threshold passes. Refusal to start, never an abort - see
+    ///  the project policy that only hotkeys end a maneuver. The tiers are fixed in TargetResolver:
+    ///  0.9 mover pair, 0.6 framing-vehicle gap, 0.4 saved spot.
+    ///
+    ///  Exemption (owner ruling R36): the gate does not apply to the user-asserted tier. Task 8 is to
+    ///  refuse only when confidence &lt; MinConfidence AND the target's provenance is not the saved-spot
+    ///  tier; TargetResolver emits that provenance with the literal prefix "saved-spot"
+    ///  (Driving/TargetResolver.cs), so key on the provenance, never on the error string. The gate
+    ///  exists to stop the plugin guessing, and a pose a human picked has no detector uncertainty to
+    ///  threshold - with the 0.6 default that keeps the fallback <see cref="AutoParkByMarker"/>
+    ///  promises reachable. Do not achieve it by lowering this default or ConfSaved.
     /// </summary>
     public double MinConfidence { get; set; } = 0.6;
 
     /// <summary>
     ///  The service brake runs on an air circuit, so below this pressure a brake demand is physically
-    ///  inert (§24: read air= before concluding a brake did nothing). Starting a parking maneuver we
-    ///  cannot stop is the only thing this guards, and it is checked once at start - it does not
-    ///  watch a running maneuver. 0 turns the check off.
+    ///  inert (§24: read air= before concluding a brake did nothing). The gate in refusal form: refuse
+    ///  the start when air &lt; MinAirBar. Strict &lt;, which is what makes the documented "0 = this
+    ///  check is off" true - at 0 nothing can be below it, whereas air &lt;= 0 would refuse forever on
+    ///  an unfired engine, and a tier/reading exactly equal to the threshold passes. Starting a
+    ///  parking maneuver we cannot stop is the only thing this guards, and it is checked once at
+    ///  start - it does not watch a running maneuver, and only the hotkeys end one.
     /// </summary>
     public double MinAirBar { get; set; } = 4.0;
 

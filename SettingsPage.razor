@@ -13,7 +13,7 @@
     else
     {
         <Switch Title="Dry-run"
-                Description="Plan and display everything, but never send throttle, brake, steering or gear commands. Keep this on until the first real test in your own game."
+                Description="Plan and display everything, but never send throttle, brake, steering or gear commands. Keep this on until the first real test in your own game. It is one half of a pair: the effective gate is DryRun || ShadowMode, so the truck only receives commands when this switch and 影子模式 (further down, in the 通用泊车 section) are both off."
                 Value="@Plugin.Settings.DryRun"
                 ValueChanged="@((bool value) => Plugin.HandleAction("dryRun", value))" />
         <Slider Title="控制权重"
@@ -45,11 +45,11 @@
                 Value="@Plugin.Settings.AutoParkByMarker"
                 ValueChanged="@((bool value) => Plugin.HandleAction("autoParkByMarker", value))" />
         <Switch Title="影子模式"
-                Description="全链路解析 + 规划，并把目标与路线画在地图上，但不发任何控制命令：油门、刹车、转向、挡位、手刹一个都不发。实车前先用它核对规划线；关掉它才是让车真正动起来的动作。影子模式本身不会暂停也不会中止——只有热键能结束动作。"
+                Description="全链路解析 + 规划，并把目标与路线画在地图上，但不发任何控制命令：油门、刹车、转向、挡位、手刹一个都不发。生效门是 DryRun || ShadowMode，也就是本页顶部的 Dry-run 与这里两个开关必须都关掉，卡车才会收到命令——只关掉影子模式而 Dry-run 还开着，车不会动。实车前先用它核对规划线。影子模式本身不会暂停也不会中止——只有热键能结束动作。"
                 Value="@Plugin.Settings.ShadowMode"
                 ValueChanged="@((bool value) => Plugin.HandleAction("shadowMode", value))" />
         <Switch Title="倒库腿动态包络"
-                Description="按停放车缺口的实测横向净宽收缩障碍包络；关闭则两条腿都用固定值。"
+                Description="按停放车缺口的实测横向净宽定每侧外扩：生效外扩 = clamp((净宽 − 车宽)/2 − 「动态包络安全边」, 0.05, 0.30)。它不是只会收缩——缺口宽时放宽、缺口窄时收紧：实测净宽 3.24 m、手填车宽 2.60 m 时默认给 0.22 m/侧，比固定的 0.10 m/侧更宽；净宽低于约 3.0 m 才比固定值更紧。关闭则两条腿都用固定值。"
                 Value="@Plugin.Settings.DynamicEnvelope"
                 ValueChanged="@((bool value) => Plugin.HandleAction("dynamicEnvelope", value))" />
         <Slider Title="接近腿包络 (m/侧)"
@@ -68,12 +68,12 @@
                 Value="@(Convert.ToSingle(Plugin.Settings.SettleTimeS))"
                 ValueChanged="@((float value) => Plugin.HandleAction("settleTimeS", value))" />
         <Slider Title="起步置信度门槛"
-                Description="目标解析置信度低于此值拒绝起步（0.9 = 标记对，0.6 = 车间隙，0.4 = 手动存点），只在起步时门控，不会中止在跑的机动。注意默认 0.6 会把「手动存点」那一档挡在外面：要用已存点请把它降到 0.4，或直接关掉上面的跟随开关回到旧流程。"
+                Description="起步门，拒绝式：目标置信度 < MinConfidence 就不起步（严格小于，所以 0 = 关掉这一项，等于门槛的值能过）。只在起步时门控，不会中止在跑的机动。各档置信度固定：0.9 = 标记对，0.6 = 车间隙，0.4 = 手动存点。手动存点那一档不受这道门约束（TargetResolver 的出处前缀就是 saved-spot）——点是人自己选的，没有识别不确定性可拦，所以默认 0.6 下「跟随标记退回到你存的点」照样可用；这道门只拦插件猜出来的目标。"
                 Min="@(0f)" Max="@(1f)" Step="@(0.05f)"
                 Value="@(Convert.ToSingle(Plugin.Settings.MinConfidence))"
                 ValueChanged="@((float value) => Plugin.HandleAction("minConfidence", value))" />
         <Slider Title="起步气压门槛 (bar)"
-                Description="低于此气压制动踏板物理无效（行车制动走气路），所以拒绝实车起步。只在起步时检查一次，仅门控，不会中止在跑的机动。0 = 关掉这一项。"
+                Description="起步门，拒绝式：气压 < MinAirBar 就不起步——低于这个气压行车制动走的气路不够，制动踏板物理无效。严格小于，所以 0 = 关掉这一项（未点火时气压读 0，用小于等于就会永远拒绝）。只在起步时检查一次，仅门控，不会中止在跑的机动。"
                 Min="@(0f)" Max="@(10f)" Step="@(0.5f)"
                 Value="@(Convert.ToSingle(Plugin.Settings.MinAirBar))"
                 ValueChanged="@((float value) => Plugin.HandleAction("minAirBar", value))" />

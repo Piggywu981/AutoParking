@@ -79,7 +79,7 @@
 ### 4.6 影子模式与起步门（M4 兼容）
 
 - `ShadowMode`（默认 **true**）：1–4 全跑，`ControlOutput` 不发布；AR/地图叠加画目标 pose+出处+规划线。影子下到达判定照常走（用遥测位姿），方便离线验证判定逻辑。
-- **起步门**（gate，不是 abort——门只在 Idle→Acquiring 时检查一次）：引擎开、|speed|<0.5 m/s、档位已知、气压 > `MinAirBar`（默认 4.0，制动证据）、`RefuseWithTrailer` 检查、置信度 ≥ MinConfidence、规划 0 冲突。任一不过 → 拒绝起步 + 日志逐条列出不过项。
+- **起步门**（gate，不是 abort——只在 Idle→Acquiring 检查一次；判据一律写拒绝式）：拒绝起步当——引擎未启动（转速过低）、|speed| 不小于 0.5 m/s、档位未知、气压 < `MinAirBar`（默认 4.0，制动证据；严格小于，所以 0 = 关掉这一项）、`RefuseWithTrailer` 且带挂车、置信度 < MinConfidence（严格小于，0 = 关掉；出处前缀为 `saved-spot` 的用户自述档豁免——门是拦插件猜的，人自己选的点没有识别不确定性，见 Task 6 的 R36）、规划冲突数不为 0。任一命中 → 拒绝起步 + 日志逐条列出不过项。
 - 运行中：**只有 `OnAbortKeyPressed` 能结束**。标记消失、sidecar 死亡、遥测缺口——降级/停步/保持报告，绝不自动 abort（AGENTS.md 硬政策）。
 - 实车开关：`ShadowMode=false` 需在 SettingsPage 显式关（默认安全）。
 
