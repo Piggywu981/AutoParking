@@ -74,7 +74,7 @@
                 Value="@(Convert.ToSingle(Plugin.Settings.MinConfidence))"
                 ValueChanged="@((float value) => Plugin.HandleAction("minConfidence", value))" />
         <Slider Title="起步气压门槛（单位未定）"
-                Description="起步门，拒绝式：气压 < MinAirBar 就不起步（严格小于，所以 0 = 关掉这一道可调门槛，等于门槛的值能过）。但 0 关掉的只是这道可调门槛，不是全部气压检查：现役的空压检查是 HasBrakeAir()，拿同一个字段和游戏自己的 airPressureEmergency 比（读不到配置时下限 20），与本项无关、一直在跑。本项默认 0，因为 truckFloat.airPressure 的单位在本仓库里没有定论：两个调用点按 bar 打印（AutoParkingPlugin.cs:654、:1988），同一字段上的常量却叫 psi（PedalFallbackMinAirDropPsi，:142），而本仓库自己的日志在这个字段上读到 114–123（设计文档 §17 :637、:716，§39 :1742，§40 :1758）——只有 psi 说得通，按 bar 设成 4.0 这类值几乎永远不会触发。单位由 Task 9 的实车一轮定案：引擎熄火与运转两种状态下并排打印 air= 与 airPressureEmergency。只在起步时检查一次，仅门控，不会中止在跑的机动。"
+                Description="起步门，拒绝式：气压 < MinAirBar 就不起步（严格小于，所以 0 = 关掉这一道可调门槛，等于门槛的值能过）。但 0 关掉的只是这道可调门槛，不是全部气压检查：现役的空压检查是 HasBrakeAir()，拿同一个字段和游戏自己的 airPressureEmergency 比（读不到配置时下限 20），与本项无关，在 `:649`（末端手刹回退）与状态行按需调用。本项默认 0，因为 truckFloat.airPressure 的单位在本仓库里没有定论：两个调用点按 bar 打印（AutoParkingPlugin.cs:654、:1988），同一字段上的常量却叫 psi（PedalFallbackMinAirDropPsi，:142），而本仓库自己的日志在这个字段上读到 114–123（设计文档 §17 :637、:716，§39 :1742，§40 :1758）——只有 psi 说得通，按 bar 设成 4.0 这类值几乎永远不会触发。单位仍未定案：需要在实车里并排打印 air= 与 airPressureEmergency（引擎熄火与运转两种状态）才能定。只在起步时检查一次，仅门控，不会中止在跑的机动。"
                 Min="@(0f)" Max="@(200f)" Step="@(0.5f)"
                 Value="@(Convert.ToSingle(Plugin.Settings.MinAirBar))"
                 ValueChanged="@((float value) => Plugin.HandleAction("minAirBar", value))" />
@@ -98,15 +98,15 @@
                 Value="@Plugin.Settings.ShowControlPlot"
                 ValueChanged="@((bool value) => Plugin.HandleAction("showControlPlot", value))" />
         <Switch Title="游戏内存条目（运行时生成的锥桶）"
-                Description="施工区的锥桶是游戏运行时生成的，不在地图文件里，宿主的地图数据永远看不到。开启后插件以只读方式从游戏进程读它自己的条目列表（0.5 秒一拍、独立后台线程，不占 tick），把锥桶/施工牌/动态物件画进平面地图——橙红点是内存来的，橙色点是地图数据来的。游戏大版本更新后特征码可能需要重找，届时地图角落的状态行会写明原因。"
+                Description="施工区的锥桶是游戏运行时生成的，不在地图文件里，宿主的地图数据永远看不到。开启后插件以只读方式从游戏进程读它自己的条目列表（0.5 秒一拍、独立后台线程，不占 tick），把锥桶/施工牌/动态物件/建筑/停放的车辆画进平面地图——橙红点是内存来的，橙色点是地图数据来的，停放的车辆是灰色实心块。游戏大版本更新后特征码可能需要重找，届时地图角落的状态行会写明原因。"
                 Value="@Plugin.Settings.ShowMemoryItems"
                 ValueChanged="@((bool value) => Plugin.HandleAction("showMemoryItems", value))" />
         <Switch Title="内存条目拦路"
-                Description="把内存条目（锥桶/施工牌/动态物件/建筑）喂给路径规划的障碍集：路线会绕开它们，实在绕不开就拒绝启动或重规划。2026-10-16 车主决定：场子边上的实物不管是什么都不该撞，所以分类从宽——认错一个小牌的代价是「拒绝启动」（安全侧失败），漏掉一个锥桶的代价是撞上去。注意失败模式没有变：锥桶把路全堵死时，重规划次数用完会退回定死路线继续开，只有热键能结束——手放在 Abort 上。"
+                Description="把内存条目（锥桶/施工牌/动态物件/建筑/停放的车辆）喂给路径规划的障碍集：路线会绕开它们，实在绕不开就拒绝启动或重规划。停放的车辆也算障碍——场子里已经停着的车就是你倒库时要绕开的实物。2026-10-16 车主决定：场子边上的实物不管是什么都不该撞，所以分类从宽——认错一个小牌的代价是「拒绝启动」（安全侧失败），漏掉一个锥桶的代价是撞上去。游戏自己的 0xC17 泊车标记对不拦路：那是游戏指给你的目标位，不是实物。注意失败模式没有变：锥桶把路全堵死时，重规划次数用完会退回定死路线继续开，只有热键能结束——手放在 Abort 上。"
                 Value="@Plugin.Settings.BlockRouteWithMemoryItems"
                 ValueChanged="@((bool value) => Plugin.HandleAction("blockRouteWithMemoryItems", value))" />
         <Switch Title="吸附到游戏车位"
-                Description="从内存里的锥桶布局里认出「两排相对 + 一端封口 + 一端开口」的停车位，点选落在该位内或附近时自动把车位挪到库中心、朝向取「从开口指向封口」（车头朝里、从开口倒/开进去）。同时：落在车位内部的内存条目不再算障碍——车位自己的标记物（实测是两个 8×8 m 的 Mover）会把游戏要求的那个库位判成「被占」，从而永远拒绝启动。车位框的边界锥桶仍然拦路（内缩 0.6 m 判定）。"
+                Description="从内存里的锥桶布局里认出「两排相对 + 一端封口 + 一端开口」的停车位，点选落在该位内或附近时自动把车位挪到库中心、朝向取「从开口指向封口」（车头朝里、从开口倒/开进去）。同时：车位自己的家具落在车位内部时不再算障碍——锥排、施工牌和车位自己的标记物（实测是两个 8×8 m 的 Mover）会把游戏要求的那个库位判成「被占」，从而永远拒绝启动。但停放的车辆不在豁免之列：库里真停着一台车时它仍然拦路，占用中的车位不会被当成空位。车位框的边界锥桶仍然拦路（内缩 0.6 m 判定）。"
                 Value="@Plugin.Settings.SnapToParkingBay"
                 ValueChanged="@((bool value) => Plugin.HandleAction("snapToParkingBay", value))" />
         <Switch Title="吸附到导航曲线"

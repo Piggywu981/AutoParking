@@ -64,7 +64,7 @@ internal static class ParkedObstacleChecks
         // the shared predicate is the only offline guard against the whitelist dropping this kind.
         // Without it the boxes above are fed to the planner by hand and this case stays green
         // through exactly the regression it exists to prevent.
-        bool parkedBlocks = MemClassifier.BlocksMemoryRoutes(MemKind.ParkedVehicle);
+        bool parkedBlocks = MemClassifier.BlocksMemoryRoutes(MemKind.ParkedVehicle, 0x2F, 0x200);
         bool hole = without.Ok && without.ConflictCount == 0 && parkedBlocks;
         Report(ref failures, hole, "无停放车：实测场景规划出 0 冲突路线（漏洞）",
                $"conflicts={without.ConflictCount} · Ok={without.Ok} · Reason={without.Reason} · " +
@@ -84,19 +84,34 @@ internal static class ParkedObstacleChecks
             ? Planner.CountCorridorConflicts(route, cfg, withTrucks)
             : -1;
 
-        // The predicate terms: Trigger must stay out (a detection volume is not an obstacle) and Other
-        // must stay out, while a kind that blocked before still blocks - so the helper cannot pass by
-        // being "everything blocks" or "nothing does".
-        bool moverBlocks = MemClassifier.BlocksMemoryRoutes(MemKind.Mover);
-        bool triggerBlocks = MemClassifier.BlocksMemoryRoutes(MemKind.Trigger);
-        bool otherBlocks = MemClassifier.BlocksMemoryRoutes(MemKind.Other);
+        // The predicate terms, in both directions. A 0xC17 Mover is the game's parking marker and must
+        // NOT block: the resolver returns the pair's midpoint, so its own 8.75/7.94 m boxes contained
+        // the goal and refused the earliest start (Critical 1). A plain Mover (flags 0x417, one bit
+        // different) still blocks. A parked vehicle blocks; Trigger and Other stay out - so the helper
+        // cannot pass by being "everything blocks" or "nothing does".
+        bool markerBlocks = MemClassifier.BlocksMemoryRoutes(MemKind.Mover, 0x09, 0xC17);
+        bool plainMoverBlocks = MemClassifier.BlocksMemoryRoutes(MemKind.Mover, 0x09, 0x417);
+        bool triggerBlocks = MemClassifier.BlocksMemoryRoutes(MemKind.Trigger, 0x22, 0x80006);
+        bool otherBlocks = MemClassifier.BlocksMemoryRoutes(MemKind.Other, 0x05, 0x0);
+
+        // What a detected bay may exempt (Important 5): the bay's own furniture - its cone rows, its
+        // boards and the 8x8 m Mover markings - but never a parked vehicle. "Furniture" is the whole
+        // test now, so a Hookup inside an occupied bay goes into the obstacle set and the planner sees
+        // the vehicle standing in the spot. The bay rectangle itself is the plugin's InsideBay call;
+        // this pins the half that decides which kinds that call may drop.
+        bool coneIsFurniture = MemClassifier.IsBayFurniture(MemKind.Cone);
+        bool parkedIsNotFurniture = !MemClassifier.IsBayFurniture(MemKind.ParkedVehicle);
 
         bool blocked = (!with.Ok || with.ConflictCount > 0) && sameRouteConflicts > 0
-                       && moverBlocks && !triggerBlocks && !otherBlocks;
+                       && plainMoverBlocks && parkedBlocks && !markerBlocks
+                       && !triggerBlocks && !otherBlocks
+                       && coneIsFurniture && parkedIsNotFurniture;
         Report(ref failures, blocked, "三台停放车入障碍集后，同一场景不再被接受",
                $"conflicts={with.ConflictCount} · sameRoute={sameRouteConflicts} · Ok={with.Ok} · " +
                $"Reason={with.Reason} · Route={with.Path?.Description ?? "无"} · " +
-               $"Mover 阻挡={moverBlocks} / Trigger 阻挡={triggerBlocks} / Other 阻挡={otherBlocks}");
+               $"普通 Mover 阻挡={plainMoverBlocks} / 停放车 阻挡={parkedBlocks} / " +
+               $"0xC17 标记对 阻挡={markerBlocks} / Trigger 阻挡={triggerBlocks} / Other 阻挡={otherBlocks} · " +
+               $"库内豁免 锥桶={coneIsFurniture} / 停放车={MemClassifier.IsBayFurniture(MemKind.ParkedVehicle)}（判据 锥桶=True 停放车=False）");
 
         return failures;
     }

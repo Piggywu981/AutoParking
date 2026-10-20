@@ -87,20 +87,27 @@ foreach (string line in File.ReadAllLines(tsvPath))
         double cx = double.Parse(p[4], CultureInfo.InvariantCulture), cz = double.Parse(p[6], CultureInfo.InvariantCulture);
         double dx = double.Parse(p[7], CultureInfo.InvariantCulture), dy = double.Parse(p[8], CultureInfo.InvariantCulture);
         double dz = double.Parse(p[9], CultureInfo.InvariantCulture);
+        // Field 10 of the viz schema is the flags word; keep 0 for an older/other layout.
+        uint flags = p.Length > 10 ? uint.Parse(p[10], NumberStyles.HexNumber, CultureInfo.InvariantCulture) : 0u;
         if (Math.Abs(cx - truck.x) > searchRadius || Math.Abs(cz - truck.z) > searchRadius)
             continue;
 
-        // Same classification as KdopReader: cones, boards, movers and buildings block; everything
-        // else in the memory list mirrors archive items and is ignored here. The >20 m cull and the
-        // cone size rule are not decoration - KdopReader drops terrain-scale boxes before they become
-        // items, and bay detection only sees MemKind.Cone. Classifying by "dx and dz <= 1.15" instead
-        // counted 92 cones where the plugin counts 56 on the 2026-10-17 scene and detected no bay at
-        // all, so the search judged a different obstacle set than the game would.
+        // Same classification as KdopReader/MemClassifier: cones, boards, movers, buildings AND parked
+        // vehicles (0x2F with a bit inside 0x300) block; everything else in the memory list mirrors
+        // archive items and is ignored here. Two things this file used to miss: the game's 0xC17
+        // parking-marker Movers are marker volumes, not objects - their own boxes contain the goal the
+        // plugin resolves, so they must not block here either - and the >20 m cull plus the cone size
+        // rule are not decoration: KdopReader drops terrain-scale boxes before they become items, and
+        // bay detection only sees MemKind.Cone. Classifying by "dx and dz <= 1.15" instead counted 92
+        // cones where the plugin counts 56 on the 2026-10-17 scene and detected no bay at all, so the
+        // search judged a different obstacle set than the game would.
         if (Math.Max(dx, Math.Max(dy, dz)) > 20.0)
             continue;   // KdopReader.Decode: terrain-scale boxes never become items
 
-        bool blocks = type == 0x02 || type == 0x09 || type == 0x24;
-        if (!blocks)
+        bool isParkingMarker = type == 0x09 && (flags & 0xC17u) == 0xC17u;
+        bool isParkedVehicle = type == 0x2F && (flags & 0x300u) != 0;
+        bool blocks = type == 0x02 || type == 0x09 || type == 0x24 || isParkedVehicle;
+        if (!blocks || isParkingMarker)
             continue;
 
         string kind;
@@ -110,7 +117,7 @@ foreach (string line in File.ReadAllLines(tsvPath))
             kind = dx is >= 0.35f and <= 1.15f && dz is >= 0.35f and <= 1.15f
                    && dy is >= 0.75f and <= 1.4f && ratio is >= 0.55f and <= 1.8f ? "cone" : "board";
         }
-        else kind = type == 0x09 ? "mover" : "building";
+        else kind = type == 0x09 ? "mover" : type == 0x2F ? "parked" : "building";
 
         boxes.Add((cx, cz, Math.Max(dx, 0.3f), Math.Max(dz, 0.3f), kind));
     }

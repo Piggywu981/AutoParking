@@ -275,19 +275,17 @@ public sealed class AutoParkingSettings
     ///  Run the whole chain - resolve the game's marker, plan, draw the target pose and the route on
     ///  the map - while sending no control commands at all. The rule is a conjunction, not this flag
     ///  alone: the effective dry-run value is <see cref="DryRun"/> || <see cref="ShadowMode"/>, so the
-    ///  truck only receives pedals, wheel, gearbox and handbrake when BOTH are off. That expression -
-    ///  output.DryRun = settings.DryRun || settings.ShadowMode - is Task 8's to write at the
-    ///  control-output boundary, and until it lands only THIS flag is inert: <see cref="DryRun"/> is
-    ///  already read by shipping code and already gates the output on its own (output.DryRun =
-    ///  settings.DryRun at AutoParkingPlugin.cs:641, :1647 and :1751; the pedal-fallback, brake and
-    ///  gear probes plus the gear self-test return early on it at :807, :879, :941 and :1630; and
-    ///  Driving/Follower.cs:341 trusts it while waiting for a gear), so the protection that exists
-    ///  today is live, not prose. Since
+    ///  truck only receives pedals, wheel, gearbox and handbrake when BOTH are off. That is the shipped
+    ///  gate: one <c>DryRunActive</c> expression feeds every output site (ControlOutput drops both the
+    ///  publish and the release pulse), and the follower is handed a config whose DryRun agrees with
+    ///  it. <see cref="DryRun"/> is additionally read on its own by the pedal-fallback, brake and gear
+    ///  probes and the gear self-test. Since
     ///  <see cref="DryRun"/> also defaults to true, turning this off is necessary but not sufficient -
     ///  the Dry-run switch is the other half and sits at the top of the same settings page. On by
     ///  default because the marker protocol is new and the first passes are meant to be watched rather
     ///  than driven. Shadow mode neither pauses nor aborts anything - only the hotkeys end a maneuver -
-    ///  it only withholds the commands.
+    ///  it only withholds the commands. It sends nothing, so the driver still has to move the truck:
+    ///  the plugin resolves, plans and draws, nothing more.
     /// </summary>
     public bool ShadowMode { get; set; } = true;
 
@@ -312,9 +310,9 @@ public sealed class AutoParkingSettings
     ///  alone into %TEMP%\ETS2LA\PluginShadow/&lt;name&gt;_&lt;guid&gt;/, so at runtime that directory
     ///  holds no exe, and AppContext.BaseDirectory is not current\Plugins either. The resolution order
     ///  is therefore explicit SidecarPath first, then "&lt;host exe dir&gt;\Plugins\MemoryProbe.exe",
-    ///  then AppContext.BaseDirectory as the last try - and the candidate actually chosen must be
-    ///  logged, because the shadow copy makes every one of these paths ambiguous from inside the host.
-    ///  Pending Task 8: nothing reads this key yet and none of the above is implemented here.
+    ///  then AppContext.BaseDirectory as the last try - and the candidate actually chosen is logged at
+    ///  startup with whether it exists (AutoParkingPlugin.InitIdentityChannel). The key is read once,
+    ///  at enable time: changing it, or deploying the probe, needs a plugin reload.
     /// </summary>
     public string SidecarPath { get; set; } = "";
 
@@ -352,8 +350,12 @@ public sealed class AutoParkingSettings
     ///  What is still reserved per side when the reverse-leg envelope is back-computed from the gap:
     ///  pad = clamp((lateral clear - VehicleWidthM)/2 - this, 0.05, 0.30). Measured lateral clear of
     ///  the practice-course gap is 3.24 m, so with the typed 2.60 m width the default 0.10 yields
-    ///  0.22 m/side. Raising it eats the tracking-error budget; the floor of 0 means "trust the
-    ///  measurement with nothing left over", which is only defensible at crawling speed.
+    ///  0.22 m/side. Two things the formula keeps no matter what this is set to: the 0.30 m/side upper
+    ///  clamp still reserves up to 0.30 in a roomy gap, so 0 does NOT mean "trust the measurement with
+    ///  nothing left over"; and with <see cref="AutoCalibrateBody"/> on (the default) the width is
+    ///  overwritten by the measured body (2.47 m on the ATS 6x2), so the pad actually obtained in that
+    ///  example is about 0.285 m/side, not the 0.22 this doc computes from the typed width. Raising
+    ///  this one eats the tracking-error budget.
     /// </summary>
     public double SafetyMarginM { get; set; } = 0.10;
 
@@ -372,10 +374,11 @@ public sealed class AutoParkingSettings
     ///  the project policy that only hotkeys end a maneuver. The tiers are fixed in TargetResolver:
     ///  0.9 mover pair, 0.6 framing-vehicle gap, 0.4 saved spot.
     ///
-    ///  Exemption (owner ruling R36): the gate does not apply to the user-asserted tier. Task 8 is to
-    ///  refuse only when confidence &lt; MinConfidence AND the target's provenance is not the saved-spot
-    ///  tier; TargetResolver emits that provenance with the literal prefix "saved-spot"
-    ///  (Driving/TargetResolver.cs), so key on the provenance, never on the error string. The gate
+    ///  Exemption (owner ruling R36, shipped): the gate does not apply to the user-asserted tier.
+    ///  <c>ValidateStart</c> refuses only when confidence &lt; MinConfidence AND the target's provenance
+    ///  is not the saved-spot tier; TargetResolver emits that provenance with the literal prefix
+    ///  "saved-spot" (Driving/TargetResolver.cs), so the gate keys on the provenance, never on the
+    ///  error string. The gate
     ///  exists to stop the plugin guessing, and a pose a human picked has no detector uncertainty to
     ///  threshold - with the 0.6 default that keeps the fallback <see cref="AutoParkByMarker"/>
     ///  promises reachable. Do not achieve it by lowering this default or ConfSaved.
@@ -400,8 +403,8 @@ public sealed class AutoParkingSettings
     ///  field with the game's own truck-config value configFloat.airPressureEmergency, falling back to
     ///  a floor of 20 when that has not been read. It is independent of MinAirBar - it runs at :649 to
     ///  fall back to the parking brake near the end of the route, and drives the 制动能力 status row at
-    ///  :1989. Task 9's live pass settles the unit by printing air= and airPressureEmergency side by
-    ///  side, engine off and running.
+    ///  :1989. The unit stays unsettled until someone prints air= and airPressureEmergency side by
+    ///  side in game, engine off and running.
     /// </summary>
     public double MinAirBar { get; set; } = 0.0;
 

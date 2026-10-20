@@ -97,11 +97,40 @@ internal static class MemClassifier
     ///  kind left out the planner planned straight through that row - 0 conflicts on a route that sweeps
     ///  the trucks, 27 once they are in the set (§43/§54, R16).
     ///
+    ///  The 0xC17 marker pair is the one exception <paramref name="kind"/> alone cannot express: it
+    ///  shares <see cref="MemKind.Mover"/> with every animated object, and the pair's own 8.75/7.94 m
+    ///  boxes contain the pose the resolver returns (their midpoint). Left in, the goal sat inside two
+    ///  obstacles and the earliest start was refused - see <see cref="IsParkingMarker"/>.
+    ///
     ///  A whitelist, not a blacklist, so a kind the classifier learns later is not a blocker by
     ///  construction; it has to be added here on purpose.
     /// </summary>
-    internal static bool BlocksMemoryRoutes(MemKind kind)
-        => kind is MemKind.Cone or MemKind.Board or MemKind.Mover or MemKind.Building or MemKind.ParkedVehicle;
+    internal static bool BlocksMemoryRoutes(MemKind kind, int type, uint flags)
+        => !IsParkingMarker(type, flags)
+           && kind is MemKind.Cone or MemKind.Board or MemKind.Mover or MemKind.Building or MemKind.ParkedVehicle;
+
+    /// <summary>
+    ///  The game's parking marker: a Mover (0x09) whose flags carry the 0xC17 family. These are the
+    ///  two volumes the game moves from stage to stage (§54, measured 0.44 m apart, each an 8.75/7.94 m
+    ///  cube), and the resolver returns their midpoint as the goal - so their boxes are MARKER volumes,
+    ///  not physical objects, and must not become obstacles or the goal stands inside two of them.
+    ///  Ordinary Movers (flags 0x417 - one bit different) stay blockers.
+    ///
+    ///  Mask, not equality: the resolver decides the same question with this call, so a marker that
+    ///  grows an unrelated flag bit cannot be non-blocking here and invisible there.
+    /// </summary>
+    internal static bool IsParkingMarker(int type, uint flags)
+        => type == 0x09 && (flags & 0xC17u) == 0xC17u;
+
+    /// <summary>
+    ///  What a detected bay's rectangle may exempt from the obstacle set: the bay's own furniture -
+    ///  the 8 × 8 m Mover markings on its centreline plus the wall cones and boards that sit inside
+    ///  the inset rectangle. A parked vehicle is NOT furniture: an occupied bay whose Hookup was also
+    ///  exempted looked empty to the planner, which then planned the insert leg straight through the
+    ///  vehicle standing in it. Kept here (not at the call site) so the harness can assert the rule.
+    /// </summary>
+    internal static bool IsBayFurniture(MemKind kind)
+        => kind is MemKind.Cone or MemKind.Mover or MemKind.Board;
 
     /// <summary>
     ///  The one predicate for "this 0x2F Hookup is a parked vehicle rather than moving traffic":

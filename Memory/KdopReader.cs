@@ -71,7 +71,13 @@ internal sealed class KdopReader
     private const int MaxCachedItems = 20000;
     private static readonly TimeSpan RefreshInterval = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan IdleInterval = TimeSpan.FromSeconds(2);
-    private static readonly string[] GameProcessNames = { "amtrucks", "eurotrucks" };
+    // Process names, matched EXACTLY by Process.GetProcessesByName - it is not a prefix or a
+    // substring search, so "eurotrucks" never finds ETS2. The executable and the process are both
+    // "eurotrucks2" (the host launches eurotrucks2.exe; the sidecar's default is eurotrucks2
+    // too), while ATS really is "amtrucks". Do not "tidy" eurotrucks2 down to eurotrucks: that
+    // spelling finds nothing, the snapshot stays empty, and marker resolution, bay detection,
+    // memory obstacles and body auto-calibration all go silently dead in ETS2.
+    private static readonly string[] GameProcessNames = { "amtrucks", "eurotrucks2" };
 
     private readonly AutoParkingPlugin plugin;
     private readonly object gate = new();
@@ -145,6 +151,12 @@ internal sealed class KdopReader
                 {
                     if (lastOk)
                         Logger.Info("AutoParking: [[内存条目]] 关闭，读取循环待机");
+                    // Publish "no snapshot" rather than the last one from before the switch went off:
+                    // with the layer off, the marker resolver and the obstacle merge would otherwise
+                    // keep acting on a frozen, arbitrarily old world (a stopped truck's snapshot never
+                    // expires on its own). The map already gates on the setting; this makes the state
+                    // itself honest for every reader.
+                    lock (gate) snapshot = null;
                     lastOk = false;
                     Thread.Sleep(IdleInterval);
                     continue;

@@ -29,10 +29,12 @@ namespace AutoParking;
 ///  geometry alone — so a window with no identity data is a degraded result, not a failure, and nothing
 ///  here may stall, throw into, or abort the caller's thread.
 ///
-///  Deployment reality for this feature branch: <c>MemoryProbe.exe</c> is not copied next to the plugin
-///  until Task 9's csproj target exists, so in game this channel currently runs on its
-///  "exe not found" path and the resolver stays on geometry. That is the intended sequence, not a bug
-///  this file hides.
+///  Deployment: the four files that make up the sidecar (apphost + dll + runtimeconfig + deps) are
+///  copied beside the plugin DLL by AutoParking.csproj at build time and deployed with it. When they
+///  are absent the channel runs on its "exe not found" path and the resolver stays on geometry - the
+///  intended degraded mode, announced once at startup. The plugin decides "exe present" once, at
+///  enable (AutoParkingPlugin.InitIdentityChannel): deploying the probe into a running host needs a
+///  plugin reload, because the command line to launch was captured at construction.
 ///
 ///  Hard rules:
 ///    - no host, TruckLib or SCS types, no NuGet: this file is compiled into the plugin AND into
@@ -133,8 +135,8 @@ internal sealed class IdentityChannel : IDisposable
     private DateTime _exeCheckedUtc = DateTime.MinValue;
 
     /// <param name="exePath">Path to <c>MemoryProbe.exe</c>. A path that does not exist is NOT an error
-    ///  here: the constructor stores it and <see cref="TryGet"/> reports "exe not found", because the
-    ///  channel has to be constructible before Task 9 deploys the probe.</param>
+    ///  here: the constructor stores it and <see cref="TryGet"/> reports "exe not found", so a machine
+    ///  without the sidecar still starts the plugin and follows markers on geometry alone.</param>
     /// <param name="gameProcessName">The running game's process name (<c>eurotrucks2</c> /
     ///  <c>amtrucks</c>), passed straight to the probe. Empty means "let the probe use its own
     ///  default", so no empty argument is ever sent.</param>
@@ -581,8 +583,9 @@ internal sealed class IdentityChannel : IDisposable
     private bool ExeAvailableLocked()
     {
         // File.Exists is a syscall and TryGet is called from a tick, so the answer is re-read at most
-        // once per TTL — which also means the probe deployed by Task 9 is picked up within 5 s without
-        // restarting the plugin.
+        // once per TTL. That re-read only covers a probe REMOVED while the host runs; a probe deployed
+        // AFTER the plugin started is not picked up, because the plugin latches "exe present" and
+        // builds the channel once at enable - deploy the sidecar first, then (re)load the plugin.
         DateTime now = DateTime.UtcNow;
         if (now - _exeCheckedUtc >= CacheTtl)
         {

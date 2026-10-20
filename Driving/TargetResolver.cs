@@ -11,7 +11,9 @@ namespace AutoParking;
 ///  the heading axis. Pure math over caller-supplied items so the offline harness can test it
 ///  without a game process; the plugin maps KdopReader.MemItem into Item at the call site.
 ///
-///  Priority: 0xC17 pair (0.9) → framing-vehicle gap (0.6) → SavedSpot (0.4) → null.
+///  Priority: 0xC17 pair (0.9) → framing-vehicle gap (0.6) → SavedSpot (0.4) → null, over the items
+///  within <see cref="LocalWindowM"/> of the truck (a distant row is not this maneuver's business,
+///  and the nearest gap wins over a roomier one further away).
 ///  Confidence below the plugin's MinConfidence gate refuses the start; the caller decides.
 /// </summary>
 public static class TargetResolver
@@ -21,14 +23,23 @@ public static class TargetResolver
     public readonly record struct Target(Pose2 Pose, string Provenance, double Confidence, ulong Uid,
                                          double? LateralClearM, Vector2? GapCenter);
 
-    private const int MoverType = 0x09;
-    private const uint C17Flags = 0xC17;
     private const double PairRadiusM = 2.5;
     private const double RowBandM = 1.5;
     private const double MinGapOverTruckM = 0.4;   // spec §4.5：纵向净长 >= 车长 + 0.4 否则拒绝
     private const double ConfMover = 0.9;
     private const double ConfFraming = 0.6;
     private const double ConfSaved = 0.4;
+
+    /// <summary>
+    ///  How far from the truck an item may sit and still take part in resolution, metres. The number
+    ///  comes from the planner's own reach, not from a preference: the longest candidate it ever
+    ///  builds is <c>max(MaxTakeoverDistanceM, 10) * 2 + EntryDistanceM</c> = 2 × 30 + 12 = 72 m at
+    ///  the defaults (Planner.Plan), so a parked row beyond that could never be a goal this maneuver
+    ///  plans to. 80 m leaves 8 m of slack at the boundary and costs one distance test per item.
+    ///  Deliberately not a setting: raising MaxTakeoverDistanceM does not widen it, and the point is
+    ///  that a distant roomy gap cannot outrank the local row.
+    /// </summary>
+    internal const double LocalWindowM = 80.0;
 
     public static Target? Resolve(IReadOnlyList<Item> items, Pose2 truck, Pose2? savedSpot,
                                   double vehicleLengthM)
@@ -37,13 +48,23 @@ public static class TargetResolver
         List<Item> c17 = new();
         foreach (Item it in items)
         {
-            if (it.Type == MoverType && it.Flags == C17Flags)
+            // The marker predicate lives in MemClassifier because it also decides whether the Mover
+            // blocks a route - one definition, so a pair can never be non-blocking there and
+            // invisible here.
+            if (MemClassifier.IsParkingMarker(it.Type, it.Flags))
                 c17.Add(it);
             else if (MemClassifier.IsParkedHookup(it.Type, it.Flags))
                 parked.Add(it);
         }
 
-        List<(Vector2 a, Vector2 b, double clear, double depth)> gaps = FramingGaps(parked, vehicleLengthM);
+        // Truck-local window, applied here as well as at the plugin's call site: without it a parked
+        // row anywhere in the loaded world is a candidate, and "the widest gap" then outranks the row
+        // the truck is actually standing at. See LocalWindowM for the number.
+        parked.RemoveAll(p => Geometry.Distance(p.Pos, truck.Position) > LocalWindowM);
+        c17.RemoveAll(p => Geometry.Distance(p.Pos, truck.Position) > LocalWindowM);
+
+        List<(Vector2 a, Vector2 b, double clear, double depth)> gaps =
+            FramingGaps(parked, vehicleLengthM, truck.Position);
 
         if (c17.Count > 0)
         {
@@ -85,7 +106,7 @@ public static class TargetResolver
 
         if (gaps.Count > 0)
         {
-            var g = gaps[0]; // FramingGaps already returns the widest first.
+            var g = gaps[0]; // FramingGaps already returns the nearest first.
             Vector2 c = (g.a + g.b) / 2f;
             Pose2 pose = new(c.X, c.Y, RowHeading(parked, c, truck));
             return new Target(pose, $"framing-gap:{g.clear:0.00}m", ConfFraming, 0, g.depth, c);
@@ -103,7 +124,10 @@ public static class TargetResolver
     public static double InsertPad(double lateralClearM, double vehicleWidthM, double safetyMarginM)
         => Math.Clamp((lateralClearM - vehicleWidthM) / 2.0 - safetyMarginM, 0.05, 0.30);
 
-    // Widest-gap-first so Resolve's "take gaps[0]" is deterministic.
+    // Nearest gap first, widest only as the tie-break, so Resolve's "take gaps[0]" is deterministic
+    // AND local: a 20 m gap in a depot 200 m away used to win over the 8.78 m row the truck is
+    // standing at, purely because it was wider - which made the saved-spot tier unreachable wherever
+    // any roomy parked row existed, and could drive a leg to an arbitrary distant bay.
     //
     // GAP PAIRING here is world-X only, and that is deliberate: the sort is on X and two neighbours
     // only count as a gap when the same-Y band test below lets them through, so a row of parked
@@ -117,7 +141,7 @@ public static class TargetResolver
     // snaps to whichever of the two world axes the parked spread is longer along (X or Z), never to
     // an arbitrary angle. An axis-only answer still cannot invent a rotated goal; see RowHeading.
     private static List<(Vector2 a, Vector2 b, double clear, double depth)> FramingGaps(
-        List<Item> parked, double vehicleLengthM)
+        List<Item> parked, double vehicleLengthM, Vector2 truck)
     {
         var result = new List<(Vector2 a, Vector2 b, double clear, double depth)>();
         List<Item> sorted = new(parked);
@@ -131,7 +155,12 @@ public static class TargetResolver
             double depth = (l.Dz + r.Dz) / 2f;
             result.Add((l.Pos, r.Pos, clear, depth));
         }
-        result.Sort((a, b) => b.clear.CompareTo(a.clear));
+        result.Sort((a, b) =>
+        {
+            Vector2 ca = (a.a + a.b) / 2f, cb = (b.a + b.b) / 2f;
+            int nearer = Geometry.Distance(ca, truck).CompareTo(Geometry.Distance(cb, truck));
+            return nearer != 0 ? nearer : b.clear.CompareTo(a.clear);
+        });
         return result;
     }
 

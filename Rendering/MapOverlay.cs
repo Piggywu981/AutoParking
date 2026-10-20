@@ -374,18 +374,12 @@ internal sealed class MapOverlay
                         drawList.AddCircle(at, 3.2f, ColorMemConeEdge, 12, 1f);
                         break;
                     case MemKind.Building:
-                    {
                         // The real footprint, not a fixed marker: a wall run must read as a wall.
                         // Same hue as the static layer's buildings - a building is a building -
                         // with a dark edge so memory-sourced ones stay tellable apart.
-                        Vector2 half = new(MathF.Max(item.Dx, 0.6f) * scale * 0.5f,
-                                           MathF.Max(item.Dz, 0.6f) * scale * 0.5f);
-                        drawList.AddRectFilled(at - half, at + half, ColorBuilding);
-                        drawList.AddRect(at - half, at + half, ColorMemConeEdge, 0f, 0, 1f);
+                        DrawMemFootprint(drawList, at, item, scale, ColorBuilding);
                         break;
-                    }
                     case MemKind.ParkedVehicle:
-                    {
                         // The same treatment in gray: a hookup with a parked flag is a vehicle that is
                         // already standing here, and its k-DOP is that vehicle's real footprint - the
                         // row the target resolver measures its gap between (§54). Gray rather than
@@ -393,12 +387,8 @@ internal sealed class MapOverlay
                         // blocks routes - while both ShowMemoryItems and BlockRouteWithMemoryItems are
                         // on, the same gate as every other memory obstacle (R16) - so this box is
                         // not decoration: it is part of the obstacle set the insert leg must clear.
-                        Vector2 half = new(MathF.Max(item.Dx, 0.6f) * scale * 0.5f,
-                                           MathF.Max(item.Dz, 0.6f) * scale * 0.5f);
-                        drawList.AddRectFilled(at - half, at + half, ColorMemParked);
-                        drawList.AddRect(at - half, at + half, ColorMemConeEdge, 0f, 0, 1f);
+                        DrawMemFootprint(drawList, at, item, scale, ColorMemParked);
                         break;
-                    }
                 }
             }
 
@@ -528,6 +518,21 @@ internal sealed class MapOverlay
 
         DrawScaleBar(drawList, canvasMin, scale);
         HandleMouse(interactive, canvasMin, canvasMax, canvasCenter, truckPlane, scale, settings, geometry);
+    }
+
+    /// <summary>
+    ///  A memory item's real ground footprint, in the fill colour its kind owns. Building and parked
+    ///  vehicle share the shape (a third footprint kind is what made extracting it worthwhile), and
+    ///  every memory box gets the same dark rim so a memory-sourced footprint stays tellable apart
+    ///  from the static layer's own buildings.
+    /// </summary>
+    private static void DrawMemFootprint(ImDrawListPtr drawList, Vector2 at, KdopReader.MemItem item,
+                                         float scale, uint fill)
+    {
+        Vector2 half = new(MathF.Max(item.Dx, 0.6f) * scale * 0.5f,
+                           MathF.Max(item.Dz, 0.6f) * scale * 0.5f);
+        drawList.AddRectFilled(at - half, at + half, fill);
+        drawList.AddRect(at - half, at + half, ColorMemConeEdge, 0f, 0, 1f);
     }
 
     /// <summary>

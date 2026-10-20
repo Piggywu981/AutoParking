@@ -90,12 +90,16 @@
   </ItemGroup>
 
   <!-- The identity sidecar ships beside the DLL. Tools\MemoryProbe is a separate project (excluded
-       from the glob above), so its exe only exists after it has been built once; the copy is
-       conditional so a bare clone still builds. An empty settings.SidecarPath resolves
+       from the glob above), so its output only exists after it has been built once; the copy is
+       conditional so a bare clone still builds. FOUR files are required, not one: MemoryProbe.csproj
+       sets SelfContained=false, so the 162 KB MemoryProbe.exe is only the apphost - the runtime, the
+       app and its dependencies come from MemoryProbe.dll /.runtimeconfig.json /.deps.json beside it.
+       Copying the apphost alone yields an exe that cannot start (measured 2026-10-20 on the
+       deployed current\Plugins\: exe only, child never ran). An empty settings.SidecarPath resolves
        <host exe dir>\Plugins\MemoryProbe.exe, which is exactly this destination (README §1). -->
   <Target Name="CopySidecarProbe" AfterTargets="Build"
           Condition="Exists('Tools\MemoryProbe\bin\Release\net10.0\win-x64\MemoryProbe.exe')">
-    <Copy SourceFiles="Tools\MemoryProbe\bin\Release\net10.0\win-x64\MemoryProbe.exe"
+    <Copy SourceFiles="Tools\MemoryProbe\bin\Release\net10.0\win-x64\MemoryProbe.exe;Tools\MemoryProbe\bin\Release\net10.0\win-x64\MemoryProbe.dll;Tools\MemoryProbe\bin\Release\net10.0\win-x64\MemoryProbe.runtimeconfig.json;Tools\MemoryProbe\bin\Release\net10.0\win-x64\MemoryProbe.deps.json"
           DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
   </Target>
   <Target Name="WarnMissingSidecarProbe" AfterTargets="Build"

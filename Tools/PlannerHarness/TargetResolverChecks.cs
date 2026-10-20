@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Numerics;
 using AutoParking;
 
@@ -35,6 +36,26 @@ internal static class TargetResolverChecks
         new(0x2F, 0x51B24FF0D91C00A2, new Vector2(1008.00f,  995.00f), 7.50f, 3.23f, 0x100),
         new(0x2F, 0x50E5468F7C9C00A3, new Vector2(1008.00f, 1005.00f), 7.50f, 3.23f, 0x10C),
         new(0x2F, 0x50E5468F7C9C00A4, new Vector2(1008.00f, 1015.00f), 7.50f, 3.23f, 0x100),
+    };
+
+    // Two rows the resolver can see at once: the academy's 8.78 m gap ~21 m from the truck and a
+    // roomier 20 m gap ~63 m away, on its own Y band so the two rows cannot pair with each other
+    // (the 1.5 m same-row test). Widest-first used to return the 20 m one - i.e. a leg could be
+    // driven to a bay the truck was not standing at, purely because it was roomier.
+    private static readonly TargetResolver.Item[] NearAndFar =
+    {
+        new(0x2F, 0x50E541F01C9C00B1, new Vector2(2166.19f, 1797.41f), 7.50f, 3.23f, 0x200),
+        new(0x2F, 0x51B24FF0D91C00B2, new Vector2(2182.47f, 1797.42f), 7.50f, 3.23f, 0x100),
+        new(0x2F, 0x50E5468F7C9C00B3, new Vector2(2244.00f, 1805.00f), 7.50f, 3.23f, 0x100),
+        new(0x2F, 0x50E5468F7C9C00B4, new Vector2(2271.50f, 1805.00f), 7.50f, 3.23f, 0x100),
+    };
+
+    // The same roomy row parked 200 m away - outside the truck-local window the resolver and the
+    // plugin both apply (80 m: the planner's longest candidate is 72 m at the defaults).
+    private static readonly TargetResolver.Item[] DistantRow =
+    {
+        new(0x2F, 0x50E5468F7C9C00C1, new Vector2(2400.00f, 1805.00f), 7.50f, 3.23f, 0x100),
+        new(0x2F, 0x50E5468F7C9C00C2, new Vector2(2427.50f, 1805.00f), 7.50f, 3.23f, 0x100),
     };
 
     public static int Run()
@@ -119,6 +140,39 @@ internal static class TargetResolverChecks
         Report(ref failures,
                TargetResolver.Resolve(Array.Empty<TargetResolver.Item>(), Truck, null, 6.5) == null,
                "无对无缺口无存档 → null", "空输入无解（判据 null，调用方据此拒绝起步）");
+
+        // Critical 4, tier 2: the gap must be the one the truck is standing at, not the widest one in
+        // the snapshot. `nearAndFar` keeps both rows in view (~21 m and ~63 m) so this discriminates
+        // the sort itself; `distant` is the same roomy row 200 m away, outside the 80 m local window.
+        TargetResolver.Target? nearest = TargetResolver.Resolve(NearAndFar, Truck, null, 6.5);
+        List<TargetResolver.Item> localPlusDistant = new(NearAndFar.Length + DistantRow.Length);
+        localPlusDistant.AddRange(NearAndFar);
+        localPlusDistant.AddRange(DistantRow);
+        TargetResolver.Target? withinWindow = TargetResolver.Resolve(localPlusDistant, Truck, null, 6.5);
+        Report(ref failures,
+               nearest.HasValue && withinWindow.HasValue
+               && Math.Abs(nearest.Value.Pose.X - 2174.33) < 0.02
+               && Math.Abs(withinWindow.Value.Pose.X - 2174.33) < 0.02
+               && nearest.Value.Provenance.StartsWith("framing-gap:8.78", StringComparison.Ordinal),
+               "缺口取离车最近的一个（近 8.78 m 胜过远处 20 m）",
+               $"近/远同屏 → {(nearest is null ? "无解" : $"({nearest.Value.Pose.X:0.00}, {nearest.Value.Pose.Z:0.00}) {nearest.Value.Provenance}")} · " +
+               $"再加 200 m 外 20 m 缺口 → {(withinWindow is null ? "无解" : $"({withinWindow.Value.Pose.X:0.00}, {withinWindow.Value.Pose.Z:0.00}) {withinWindow.Value.Provenance}")}" +
+               "（判据 X 2174.33 · 出处 framing-gap:8.78）");
+
+        // The saved-spot tier only becomes reachable once the distant row stops counting: with the
+        // local row absent, a 20 m gap 200 m away is not the truck's business and the user-picked
+        // pose must win at its 0.4 confidence (R36 then exempts it from the confidence gate).
+        Pose2 savedPose = new(2194.0, 1800.0, 0.5);
+        TargetResolver.Target? fallback = TargetResolver.Resolve(DistantRow, Truck, savedPose, 6.5);
+        Report(ref failures,
+               fallback.HasValue && fallback.Value.Provenance == "saved-spot"
+               && Math.Abs(fallback.Value.Confidence - 0.4) < 0.001
+               && fallback.Value.Pose.X == savedPose.X && fallback.Value.Pose.Z == savedPose.Z,
+               "只有远处缺口时退到存点（conf 0.4）",
+               fallback is null
+                   ? "无解（判据 出处 saved-spot · conf 0.4）"
+                   : $"{fallback.Value.Provenance} conf {fallback.Value.Confidence:0.00} " +
+                     $"({fallback.Value.Pose.X:0.0}, {fallback.Value.Pose.Z:0.0})（判据 2194.0, 1800.0）");
 
         // The pad is the whole point of the dynamic envelope: truck-wide gaps get nothing, roomy
         // gaps get capped at what the planner was validated in.

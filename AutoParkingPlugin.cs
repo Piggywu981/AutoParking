@@ -75,9 +75,11 @@ public sealed class AutoParkingPlugin : Plugin
 
     /// <summary>
     ///  Optional identity enhancement (spec §4.3): a child process that names the runtime items the
-    ///  geometry layer already sees. It is constructed even when its exe is absent, because Task 9 is
-    ///  what deploys the probe; <see cref="identityExePresent"/> then keeps the missing state to the
-    ///  one construction-time log line instead of a complaint per acquisition.
+    ///  geometry layer already sees. Constructed even when its exe is absent, because the sidecar ships
+    ///  with the plugin build but a bare clone may not have built it; <see cref="identityExePresent"/>
+    ///  then keeps the missing state to the one construction-time log line instead of a complaint per
+    ///  acquisition. Both the path and the flag are latched here at enable, so deploying the probe into
+    ///  a running host needs a plugin reload.
     /// </summary>
     private IdentityChannel? identity;
     private bool identityExePresent;
@@ -431,12 +433,14 @@ public sealed class AutoParkingPlugin : Plugin
     ///
     ///  The kind test is <see cref="MemClassifier.BlocksMemoryRoutes"/>, a whitelist shared with the
     ///  offline harness, so a kind the classifier learns afterwards is not a blocker by construction,
-    ///  and the check that pins this list cannot drift from the list the plugin uses. Trigger stays out
-    ///  on purpose: it is a 10 × 4 × 6.7 m invisible detection volume, not a thing standing on the
-    ///  ground. ParkedVehicle is in - the academy's framing trucks exist only as 0x2F Hookup items
-    ///  (measured: three 7.50 × 3.23 m footprints in the row that bounds the target gap), so a whitelist
-    ///  without it leaves the insert leg's swing unrepresented and free to sweep through one
-    ///  (§43/§54, R16).
+    ///  and the check that pins this list cannot drift from the list the plugin uses. It takes the item
+    ///  type and flags as well, because the game's 0xC17 parking marker shares MemKind.Mover: those two
+    ///  volumes are the pose the resolver returns (their midpoint), so blocking them put the goal inside
+    ///  two 8.75 m boxes and refused the earliest start (Critical 1). Trigger stays out on purpose: it is
+    ///  a 10 × 4 × 6.7 m invisible detection volume, not a thing standing on the ground. ParkedVehicle
+    ///  is in - the academy's framing trucks exist only as 0x2F Hookup items (measured: three
+    ///  7.50 × 3.23 m footprints in the row that bounds the target gap), so a whitelist without it
+    ///  leaves the insert leg's swing unrepresented and free to sweep through one (§43/§54, R16).
     /// </summary>
     private int AddMemoryObstacles(MapGeometry geometry, Vector2 truckPlane, double radiusM)
     {
@@ -450,17 +454,20 @@ public sealed class AutoParkingPlugin : Plugin
         int added = 0;
         foreach (KdopReader.MemItem item in memory.Items)
         {
-            if (!MemClassifier.BlocksMemoryRoutes(item.Kind))
+            if (!MemClassifier.BlocksMemoryRoutes(item.Kind, item.Type, item.Flags))
                 continue;
 
             if (Math.Abs(item.PlanePos.X - truckPlane.X) > radiusM
                 || Math.Abs(item.PlanePos.Y - truckPlane.Y) > radiusM)
                 continue;
 
-            // Anything inside a detected bay is the bay's own furniture, not a blocker. The rectangle is
-            // shrunk by BayInteriorInsetM first so the cone rows that form the bay's walls stay obstacles -
+            // Anything inside a detected bay that is the bay's own furniture is not a blocker - the
+            // 8 × 8 m Mover markings and the wall pieces the inset keeps. The rectangle is shrunk by
+            // BayInteriorInsetM first so the cone rows that form the bay's walls stay obstacles -
             // without the inset the truck would be allowed to drive through the walls it parks between.
-            if (InsideBay(geometry, item.PlanePos))
+            // A parked vehicle is never furniture (MemClassifier.IsBayFurniture): exempting it made an
+            // occupied bay look empty and let the insert leg be planned through the vehicle in it.
+            if (MemClassifier.IsBayFurniture(item.Kind) && InsideBay(geometry, item.PlanePos))
                 continue;
 
             geometry.Obstacles.AddBox(item.PlanePos, item.Dx, item.Dz);
@@ -757,7 +764,8 @@ public sealed class AutoParkingPlugin : Plugin
                         if (!settled)
                             break;
 
-                        if (TryNextMarkerLeg())
+                        string? chainFailure = null;
+                        if (TryNextMarkerLeg(out chainFailure))
                             break; // phase is Following again
 
                         // An abort accepted during that acquisition owns the hand-back: let the
@@ -767,6 +775,11 @@ public sealed class AutoParkingPlugin : Plugin
                         lock (sync) abortedDuringLeg = phase == ParkingPhase.Aborted;
                         if (abortedDuringLeg)
                             break;
+
+                        // A leg the planner refused is a failure to continue, not a finished park:
+                        // CompletePhase announces it as a warning instead of "泊车完成" (Important 6).
+                        CompletePhase(current, chainFailure);
+                        break;
                     }
                 }
 
@@ -860,6 +873,13 @@ public sealed class AutoParkingPlugin : Plugin
 
         lock (sync)
         {
+            // An abort accepted a few microseconds before this lock owns the hand-back. Writing
+            // HoldingBrake here would overwrite Aborted, and the Aborted branch would then announce
+            // "泊车完成。" over a maneuver the driver ended. Decline to touch any state - the brake is
+            // already applied above and the Aborted branch releases it on its own deadline.
+            if (phase == ParkingPhase.Aborted)
+                return;
+
             if (phase == ParkingPhase.Engaging)
                 phase = ParkingPhase.Following;
 
@@ -1157,7 +1177,11 @@ public sealed class AutoParkingPlugin : Plugin
         return markerDriven;
     }
 
-    private void CompletePhase(ParkingPhase from)
+    /// <param name="chainFailure">Non-null when the maneuver reached its checkpoint but the next leg
+    ///  was refused (no usable route / engage throw). The brake hand-back is identical; only the
+    ///  announcement changes, because "泊车完成。" over a refusal is the one message that would send a
+    ///  driver away believing the job is done.</param>
+    private void CompletePhase(ParkingPhase from, string? chainFailure = null)
     {
         output.Release();
         RestoreAssists();
@@ -1177,6 +1201,13 @@ public sealed class AutoParkingPlugin : Plugin
                 planResult = null;
                 legSettings = null;
             }
+        }
+
+        if (chainFailure is not null)
+        {
+            Logger.Warn($"AutoParking: ended at the checkpoint, next leg refused: {chainFailure}");
+            Notify(NotificationLevel.Warning, "已在检查点结束：下一腿无可行路线（见日志）", 8);
+            return;
         }
 
         Notify(NotificationLevel.Success, from == ParkingPhase.HoldingBrake ? "泊车完成。" : "已中止并交还控制。", 6);
@@ -1232,7 +1263,7 @@ public sealed class AutoParkingPlugin : Plugin
     ///  shadow-copies the plugin DLL alone into %TEMP%\ETS2LA\PluginShadow\&lt;name&gt;_&lt;guid&gt;\, so
     ///  AppContext.BaseDirectory holds no exe and can only ever be the last resort. Every candidate is
     ///  logged with whether it exists, because from inside the shadow copy none of these paths is
-    ///  self-evident - and a missing exe is the expected state until Task 9 deploys the probe, so it
+    ///  self-evident - and a missing exe is a supported state (geometry-only), so it
     ///  is reported once, here, at Info rather than on every acquisition.
     /// </summary>
     private void InitIdentityChannel()
@@ -1266,7 +1297,7 @@ public sealed class AutoParkingPlugin : Plugin
         identity = new IdentityChannel(finalPath, settings.GameProcessName);
         Logger.Info($"AutoParking: identity sidecar 候选 {string.Join(" · ", attempts)} " +
                     $"→ chosen={finalPath} exists={(identityExePresent ? "yes" : "no")}" +
-                    (identityExePresent ? "" : "（未部署属预期，Task 9 部署后生效；身份通道降级为纯几何）"));
+                    (identityExePresent ? "" : "（缺失时身份通道降级为纯几何；部署后再重载插件）"));
     }
 
     public override void OnDisable()
@@ -1344,6 +1375,26 @@ public sealed class AutoParkingPlugin : Plugin
         get
         {
             lock (sync) return target;
+        }
+    }
+
+    /// <summary>
+    ///  Where the current aim came from, in the compact form spec §4.6 asks to be DRAWN next to the
+    ///  target pose: "目标 &lt;provenance&gt; conf=0.00" for a pose the marker protocol resolved (the
+    ///  provenance string is the resolver's own - `mover-pair:0x…`, `framing-gap:8.78m`, …), and
+    ///  "目标 saved-spot（手选）" for a pose a map pick put there. Null when nothing is aimed at.
+    ///  Already formatted so the status block and the AR label cannot disagree about the text.
+    /// </summary>
+    public string? TargetProvenance
+    {
+        get
+        {
+            lock (sync)
+            {
+                if (markerTarget is TargetResolver.Target aimed)
+                    return $"目标 {aimed.Provenance} conf={aimed.Confidence:0.00}";
+                return target is not null ? "目标 saved-spot（手选）" : null;
+            }
         }
     }
 
@@ -2112,17 +2163,31 @@ public sealed class AutoParkingPlugin : Plugin
         if (snap == null)
             return null;
 
-        List<TargetResolver.Item> items = new(snap.Items.Count);
-        foreach (KdopReader.MemItem it in snap.Items)
-            items.Add(new TargetResolver.Item(it.Type, it.Uid, it.PlanePos, it.Dx, it.Dz, it.Flags));
-
-        Pose2? saved = settings.HasSavedSpot
-            ? new Pose2(settings.SavedSpotX, settings.SavedSpotZ, settings.SavedSpotHeadingRad)
-            : target;
-
-        // One pose sample for the geometry and the identity request, so the two cannot be answered
-        // against positions a telemetry frame apart.
+        // One pose sample for the window, the geometry and the identity request, so none of the three
+        // can be answered against positions a telemetry frame apart.
         Pose2 truck = CurrentPose;
+
+        // Truck-local window: only items within TargetResolver.LocalWindowM take part. 80 m comes from
+        // the planner's own reach - its longest candidate is 2 × MaxTakeoverDistanceM + EntryDistanceM
+        // = 72 m at the defaults - so nothing beyond it can be a goal this maneuver plans to, while a
+        // whole-snapshot Resolve let a roomy gap anywhere in the loaded world outrank the local row
+        // (and made the saved-spot tier unreachable). Resolve applies the same window; this one keeps
+        // the list small.
+        List<TargetResolver.Item> items = new();
+        foreach (KdopReader.MemItem it in snap.Items)
+            if (Geometry.Distance(it.PlanePos, truck.Position) <= TargetResolver.LocalWindowM)
+                items.Add(new TargetResolver.Item(it.Type, it.Uid, it.PlanePos, it.Dx, it.Dz, it.Flags));
+
+        // Under `sync`, like Replan's sample: the saved spot is rewritten by the settings/render
+        // threads (a map pick) while an acquisition can be running on the tick thread.
+        Pose2? saved;
+        lock (sync)
+        {
+            saved = settings.HasSavedSpot
+                ? new Pose2(settings.SavedSpotX, settings.SavedSpotZ, settings.SavedSpotHeadingRad)
+                : target;
+        }
+
         TargetResolver.Target? resolved = TargetResolver.Resolve(items, truck, saved, settings.VehicleLengthM);
         if (resolved is null)
             return null;
@@ -2287,8 +2352,10 @@ public sealed class AutoParkingPlugin : Plugin
     ///  target starts the next leg; an unchanged one, a missing one or an unusable route leaves the
     ///  caller to complete the maneuver through its existing path. Nothing here aborts anything.
     /// </summary>
-    private bool TryNextMarkerLeg()
+    private bool TryNextMarkerLeg(out string? chainFailure)
     {
+        chainFailure = null;
+
         TargetResolver.Target? previous;
         lock (sync) previous = markerTarget;
         if (previous is null)
@@ -2329,6 +2396,7 @@ public sealed class AutoParkingPlugin : Plugin
         lock (sync) plan = planResult;
         if (plan is not { Ok: true })
         {
+            chainFailure = $"下一腿无可行路线（{plan?.Summary ?? "未规划"}）";
             Logger.Warn($"AutoParking: next marker {next.Value.Provenance} has no usable route " +
                         $"({plan?.Summary ?? "未规划"}), finishing");
             return false;
@@ -2340,6 +2408,7 @@ public sealed class AutoParkingPlugin : Plugin
         }
         catch (Exception ex)
         {
+            chainFailure = $"下一腿接手失败（{ex.GetType().Name}）";
             Logger.Warn($"AutoParking: next-leg engage threw {ex.GetType().Name}: {ex.Message}");
             return false;
         }
@@ -2735,6 +2804,13 @@ public sealed class AutoParkingPlugin : Plugin
                                              (float)latestTelemetry.truckPlacement.coordinate.Z);
                     double distance = Geometry.Distance(truckPlane, target.Value.Position);
                     targetRow = $"{target.Value.X:0.0}, {target.Value.Z:0.0} / {target.Value.YawDegrees:0}° / {distance:0.0} m";
+
+                    // Spec §4.6 requires the provenance to be visible, not only logged: the whole point
+                    // of the tier chain is that a driver can see WHICH tier chose this pose.
+                    string provenance = markerTarget is TargetResolver.Target aimed
+                        ? $"目标 {aimed.Provenance} conf={aimed.Confidence:0.00}"
+                        : "目标 saved-spot（手选）";
+                    targetRow += $" · {provenance}";
                 }
 
                 return new Dictionary<string, string>

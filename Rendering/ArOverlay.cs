@@ -119,7 +119,7 @@ internal sealed class ArOverlay
         DrawFootprint(ar, target.Value, settings.VehicleLengthM, settings.VehicleWidthM, groundY, TargetColor);
         DrawHeadingArrow(ar, target.Value, groundY, TargetColor);
         DrawGroundMark(ar, target.Value.Position, groundY, TargetColor, 0.6f);
-        DrawPoleAndLabel(ar, target.Value, truck, groundY, settings);
+        DrawPoleAndLabel(ar, target.Value, truck, groundY, settings, plugin.TargetProvenance);
         DrawPreviewPath(ar, truck, target.Value, groundY);
     }
 
@@ -166,7 +166,8 @@ internal sealed class ArOverlay
         ar.Draw3DLine(new ARCoordinate(new Vector3(right.X, (float)groundY + 0.05f, right.Y)), to, color, 2.0f);
     }
 
-    private static void DrawPoleAndLabel(ARRenderer ar, Pose2 target, Pose2 truck, double groundY, AutoParkingSettings settings)
+    private static void DrawPoleAndLabel(ARRenderer ar, Pose2 target, Pose2 truck, double groundY,
+                                         AutoParkingSettings settings, string? provenance)
     {
         ARCoordinate basePoint = new(new Vector3((float)target.X, (float)groundY, (float)target.Z));
         ARCoordinate topPoint = new(new Vector3((float)target.X, (float)groundY + 2.2f, (float)target.Z));
@@ -177,6 +178,16 @@ internal sealed class ArOverlay
         double headingErrorDegrees = Math.Abs(Geometry.SmallestAngleDifference(truck.HeadingRad, target.HeadingRad)) * 180.0 / Math.PI;
 
         ar.Draw3DText(topPoint, $"{distance:0.0} m   {headingErrorDegrees:0}°", TargetColor);
+
+        // Spec §4.6: the pose AND its provenance are drawn. The marker tiers exist so the driver can
+        // see which one chose this spot; a conf=0.60 framing-gap guess looks identical to a 0.90
+        // mover-pair answer without this line. The plugin formats both labels, so the AR text and
+        // the status table cannot disagree.
+        if (!string.IsNullOrEmpty(provenance))
+        {
+            ARCoordinate provenancePoint = new(new Vector3((float)target.X, (float)groundY + 3.0f, (float)target.Z));
+            ar.Draw3DText(provenancePoint, provenance, TargetColor);
+        }
     }
 
     /// <summary>
