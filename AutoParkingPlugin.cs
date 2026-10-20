@@ -421,8 +421,8 @@ public sealed class AutoParkingPlugin : Plugin
     }
 
     /// <summary>
-    ///  Memory items become planner obstacles: cones, boards, movers and buildings inside the
-    ///  sampled radius go into <see cref="MapGeometry.Obstacles"/> as their own k-DOP ground
+    ///  Memory items become planner obstacles: cones, boards, movers, buildings and parked vehicles
+    ///  inside the sampled radius go into <see cref="MapGeometry.Obstacles"/> as their own k-DOP ground
     ///  boxes, so Planner, Follower, the route-cost log and the map's red obstacle polygons all
     ///  treat them like any other blocker (owner decision §43 - near-lot objects must not be hit
     ///  whatever exactly they are). Merging here means the engaged maneuver's captured geometry
@@ -430,10 +430,11 @@ public sealed class AutoParkingPlugin : Plugin
     ///  every tick - the same freshness split the traffic obstacles already live with.
     ///
     ///  The kind test below is a whitelist, so a kind the classifier learns afterwards is not a
-    ///  blocker by construction. That is deliberate for Trigger (an invisible volume) and
-    ///  ParkedVehicle (the game's own framing vehicles, which the target resolver reads as the gap
-    ///  the truck is asked to use): making either of them block needs its own evidence, not a
-    ///  rename (§54).
+    ///  blocker by construction. Trigger stays out on purpose: it is a 10 × 4 × 6.7 m invisible
+    ///  detection volume, not a thing standing on the ground. ParkedVehicle is in - the academy's
+    ///  framing trucks exist only as 0x2F Hookup items (measured: three 7.50 × 3.23 m footprints in
+    ///  the row that bounds the target gap), so a whitelist without it leaves the insert leg's swing
+    ///  unrepresented and free to sweep through one (§43/§54, R16).
     /// </summary>
     private int AddMemoryObstacles(MapGeometry geometry, Vector2 truckPlane, double radiusM)
     {
@@ -448,7 +449,7 @@ public sealed class AutoParkingPlugin : Plugin
         foreach (KdopReader.MemItem item in memory.Items)
         {
             if (item.Kind is not (MemKind.Cone or MemKind.Board
-                or MemKind.Mover or MemKind.Building))
+                or MemKind.Mover or MemKind.Building or MemKind.ParkedVehicle))
                 continue;
 
             if (Math.Abs(item.PlanePos.X - truckPlane.X) > radiusM
@@ -757,6 +758,14 @@ public sealed class AutoParkingPlugin : Plugin
 
                         if (TryNextMarkerLeg())
                             break; // phase is Following again
+
+                        // An abort accepted during that acquisition owns the hand-back: let the
+                        // Aborted branch run its brake deadline instead of completing this leg as
+                        // a success. Nothing here starts an abort; it only declines to overwrite one.
+                        bool abortedDuringLeg;
+                        lock (sync) abortedDuringLeg = phase == ParkingPhase.Aborted;
+                        if (abortedDuringLeg)
+                            break;
                     }
                 }
 
@@ -2258,6 +2267,15 @@ public sealed class AutoParkingPlugin : Plugin
             if (!hadAssistSnapshot)
                 TakeOverAssists();
 
+            // M4: the abort key may have been accepted while the plan was being acquired (tens of ms,
+            // once per maneuver). Committing Engaging here would overwrite Aborted and drive on under
+            // a "已中止" banner. This check only declines to start; it never initiates an abort.
+            if (phase == ParkingPhase.Aborted)
+            {
+                Logger.Info("AutoParking: abort accepted during engage, not starting the follower");
+                return;
+            }
+
             phase = ParkingPhase.Engaging;
             warnedNoAir = false;
         }
@@ -2327,6 +2345,15 @@ public sealed class AutoParkingPlugin : Plugin
 
         lock (sync)
         {
+            // M4: same race as EngageFollower's own guard, one step later - an abort accepted while
+            // the next marker was being acquired must not be turned back into Following. Decline the
+            // leg; the Aborted branch owns the brake and the hand-back.
+            if (phase == ParkingPhase.Aborted)
+            {
+                Logger.Info("AutoParking: abort accepted during next-leg acquisition, leg not started");
+                return false;
+            }
+
             phase = ParkingPhase.Following;
             warnedNoAir = false;
         }

@@ -191,6 +191,10 @@ Console.WriteLine("标记跟随控制器（腿数 / 标记位移 / 落地窗口�
 int controllerFailures = AutoParkControllerChecks.Run();
 
 Console.WriteLine();
+Console.WriteLine("停放车作为障碍（驾校 framing 车只有 0x2F Hookup 一种表示，R16）：");
+int parkedObstacleFailures = ParkedObstacleChecks.Run();
+
+Console.WriteLine();
 Console.WriteLine("prefab 轮廓（只能由控制点取凸包，所以是近似）：");
 Vector2[] hullSquare = Geometry.ConvexHull(new[]
 {
@@ -213,6 +217,7 @@ return report.Failures.Count == 0 && simPassed == 5 && keptGoing && stagedLeg.Re
     && pointFailures == 0 && trustFailures == 0 && footprintFailures == 0 && wheelbaseFailures == 0
     && headingFailures == 0 && bayFailures == 0 && smoothFailures == 0 && targetFailures == 0
     && classifierFailures == 0 && identityFailures == 0 && controllerFailures == 0
+    && parkedObstacleFailures == 0
     && hullDropsInterior && hullDegenerates && hullPairSafe ? 0 : 1;
 
 // The recession watchdog needs states that make the distance grow. Nothing in the closed loop does

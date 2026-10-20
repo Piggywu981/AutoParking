@@ -389,7 +389,9 @@ internal sealed class MapOverlay
                         // The same treatment in gray: a hookup with a parked flag is a vehicle that is
                         // already standing here, and its k-DOP is that vehicle's real footprint - the
                         // row the target resolver measures its gap between (§54). Gray rather than
-                        // ColorBuilding so a parked row cannot be misread as a run of walls.
+                        // ColorBuilding so a parked row cannot be misread as a run of walls. It also
+                        // blocks routes while BlockRouteWithMemoryItems is on (R16), so this box is
+                        // not decoration: it is part of the obstacle set the insert leg must clear.
                         Vector2 half = new(MathF.Max(item.Dx, 0.6f) * scale * 0.5f,
                                            MathF.Max(item.Dz, 0.6f) * scale * 0.5f);
                         drawList.AddRectFilled(at - half, at + half, ColorMemParked);

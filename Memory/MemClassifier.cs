@@ -32,7 +32,8 @@ internal enum MemKind
     Trigger,
     /// <summary>A Hookup item flagged as parked rather than moving traffic (§54): a vehicle already
     ///  standing in the lot. Its k-DOP is the real footprint of that vehicle, which is what bounds
-    ///  the gap the truck has to fit into.</summary>
+    ///  the gap the truck has to fit into. Drawn as a gray footprint and, unlike Trigger, it does
+    ///  block routes while <c>BlockRouteWithMemoryItems</c> is on (R16).</summary>
     ParkedVehicle,
     /// <summary>Any other small item class; drawn nowhere, blocks nothing.</summary>
     Other

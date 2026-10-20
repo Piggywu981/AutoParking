@@ -29,6 +29,7 @@
     <Compile Include="MemClassifierChecks.cs" />
     <Compile Include="IdentityChannelChecks.cs" />
     <Compile Include="AutoParkControllerChecks.cs" />
+    <Compile Include="ParkedObstacleChecks.cs" />
     <Compile Include="$(PluginRoot)Geometry.cs" />
     <Compile Include="$(PluginRoot)Settings.cs" />
     <Compile Include="$(PluginRoot)Driving\ParkingBay.cs" />

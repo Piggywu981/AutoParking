@@ -226,9 +226,10 @@ internal sealed class KdopReader
                 // The two runtime kinds the marker feature is built on: the 0x22 goal volume that sits
                 // on the 0xC17 pair (its own game-side state string reads park_trigger_on_stopped),
                 // and the 0x2F hookups standing in the row around it. Counted apart from Other because
-                // this string is the only in-game evidence that the new rules fire at all - neither
-                // kind is otherwise tellable on the map, one being invisible and the other a gray
-                // footprint that looks like every other parked box.
+                // this string is the only in-game evidence that the new rules fire at all - the
+                // trigger is invisible to every map layer, so it is otherwise untellable there. A
+                // trigger wider than the 20 m pre-filter is dropped before classification, so a
+                // "触发 0" reading cannot distinguish "no marker" from "too big to publish".
                 case MemKind.Trigger: triggers++; break;
                 case MemKind.ParkedVehicle: parked++; break;
             }

@@ -37,8 +37,16 @@ internal static class MemClassifierChecks
 
         // Regressions - the three kinds the planner and the map already block and draw on. A cone is a
         // Sign whose ground box is near-square and knee-high; both bounds come from the archive +
-        // runtime samples in §38/§41.
-        Expect(ref failures, "锥桶形状 Sign → Cone（回归）", 0x24, 0x0, 0.84f, 1.11f, 0.84f, MemKind.Cone);
+        // runtime samples in §38/§41. The board fixture is the other half of the same 0x24 branch and
+        // the one a widened cone window would silently steal: a measured 1.71 × 2.96 × 0.36 m gantry
+        // sign sits outside every cone bound, and turning it into a Cone would feed the bay detector
+        // and the obstacle set a shape that is not there. Folded into this existing line on purpose -
+        // the branch has two outcomes and one Report line is enough to pin both.
+        bool coneShaped = MemClassifier.Classify(0x24, 0x0, 0.84f, 1.11f, 0.84f) == MemKind.Cone;
+        bool boardShaped = MemClassifier.Classify(0x24, 0x0, 1.71f, 2.96f, 0.36f) == MemKind.Board;
+        Report(ref failures, coneShaped && boardShaped, "锥桶形状 Sign → Cone / 大牌 → Board（回归）",
+               $"cone={coneShaped} · board={boardShaped}（判据 0.84×1.11×0.84 与 1.71×2.96×0.36）");
+
         Expect(ref failures, "0x09 → Mover（回归）", 0x09, 0xC17, 8.75f, 8.75f, 8.75f, MemKind.Mover);
         Expect(ref failures, "0x02 → Building（回归）", 0x02, 0x20, 29.89f, 0.25f, 10.70f, MemKind.Building);
 
