@@ -68,7 +68,7 @@ internal static class MemClassifier
             return MemKind.Mover;
         if (type == 0x22)
             return MemKind.Trigger;
-        if (type == 0x2F && (flags & 0x300u) != 0)
+        if (IsParkedHookup(type, flags))
             return MemKind.ParkedVehicle;
         if (type == 0x24)
         {
@@ -80,4 +80,16 @@ internal static class MemClassifier
         }
         return MemKind.Other;
     }
+
+    /// <summary>
+    ///  The one predicate for "this 0x2F Hookup is a parked vehicle rather than moving traffic":
+    ///  type 0x2F plus any bit of the parked flags family 0x300. It exists once because
+    ///  <see cref="Classify"/> and <c>TargetResolver.Resolve</c> both need exactly this test, and two
+    ///  copies of a protocol constant drift apart silently - the classifier would draw a gap the
+    ///  resolver no longer reads, or worse, one would accept live traffic as a bay wall (R17).
+    ///  Meaning is unchanged from both former copies: measured live samples read 0x100 / 0x10C /
+    ///  0x200 / 0x3100 / 0x21120, all of which carry a bit inside 0x300 (§54).
+    /// </summary>
+    public static bool IsParkedHookup(int type, uint flags)
+        => type == 0x2F && (flags & 0x300u) != 0;
 }

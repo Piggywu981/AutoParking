@@ -352,7 +352,18 @@ internal sealed class IdentityChannel : IDisposable
         // cannot be evicted by its own scheduling.
         PruneLocked();
 
-        Task.Run(() => Refresh(key)); // the caller's thread stops here
+        try
+        {
+            Task.Run(() => Refresh(key)); // the caller's thread stops here
+        }
+        catch
+        {
+            // A launch failure would otherwise leave this key in _refreshing for good, consuming one
+            // of the two global slots until Dispose: two such leaks brick the channel, and the
+            // exception would land on the tick thread. Refresh is the only other place that removes
+            // a key, and it can never run if the task never started (R30).
+            _refreshing.Remove(key);
+        }
     }
 
     /// <summary>Keeps <see cref="_cache"/> inside the bound its declaration states. Two cheap deterministic

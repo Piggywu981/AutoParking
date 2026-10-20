@@ -22,7 +22,6 @@ public static class TargetResolver
                                          double? LateralClearM, Vector2? GapCenter);
 
     private const int MoverType = 0x09;
-    private const int HookupType = 0x2F;
     private const uint C17Flags = 0xC17;
     private const double PairRadiusM = 2.5;
     private const double RowBandM = 1.5;
@@ -40,7 +39,7 @@ public static class TargetResolver
         {
             if (it.Type == MoverType && it.Flags == C17Flags)
                 c17.Add(it);
-            else if (it.Type == HookupType && (it.Flags & 0x300u) != 0)
+            else if (MemClassifier.IsParkedHookup(it.Type, it.Flags))
                 parked.Add(it);
         }
 

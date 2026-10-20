@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
+using System.IO;
 using System.IO.MemoryMappedFiles;
 using System.Numerics;
 using ETS2LA.Backend.Events;
@@ -73,6 +74,41 @@ public sealed class AutoParkingPlugin : Plugin
     private KdopReader? kdopReader;
 
     /// <summary>
+    ///  Optional identity enhancement (spec §4.3): a child process that names the runtime items the
+    ///  geometry layer already sees. It is constructed even when its exe is absent, because Task 9 is
+    ///  what deploys the probe; <see cref="identityExePresent"/> then keeps the missing state to the
+    ///  one construction-time log line instead of a complaint per acquisition.
+    /// </summary>
+    private IdentityChannel? identity;
+    private bool identityExePresent;
+    private bool identityStatusLogged;
+
+    /// <summary>
+    ///  The pure multi-leg state machine (design doc §54): which marker the current leg follows, how
+    ///  many legs have been acquired, when the current one arrived and whether the game moved the
+    ///  marker since the last accepted sample. The plugin owns the clocks and the IO; this owns the
+    ///  rules, so the harness can drive the same object offline.
+    /// </summary>
+    private readonly AutoParkController markerLoop = new();
+
+    /// <summary>
+    ///  The target the current maneuver was acquired from, or null for a hand-picked spot. Distinct
+    ///  from <see cref="target"/>, which is only a pose: this keeps provenance, confidence and the
+    ///  measured lateral clear that sizes the reverse leg's envelope.
+    /// </summary>
+    private TargetResolver.Target? markerTarget;
+
+    /// <summary>
+    ///  The per-leg settings clone <see cref="Replan"/> built (only when marker-following is on).
+    ///  <see cref="EngageFollower"/> and the follower's own replan closure read it, so the first plan
+    ///  and every in-flight re-plan use the same envelope.
+    /// </summary>
+    private AutoParkingSettings? legSettings;
+
+    /// <summary>Earliest time the ~1 Hz marker-drift poll may run again.</summary>
+    private DateTime nextMarkerCheckUtc = DateTime.MinValue;
+
+    /// <summary>
     ///  Control terms for the last ~17 s of tracking. Owned by the plugin, written by the follower on
     ///  the tick thread, read by <see cref="controlPlot"/> on the overlay thread; the trace locks
     ///  itself so nothing here has to.
@@ -122,6 +158,7 @@ public sealed class AutoParkingPlugin : Plugin
     private DateTime lastGearProbeUtc = DateTime.MinValue;
     private int lastReplanCount;
     private string lastCostSignature = "";
+    private string lastEnvelopeSignature = "";
     private bool warnedNoAir;
 
     // Reverse distance inside which the parking brake may be used to stop the truck.
@@ -158,6 +195,14 @@ public sealed class AutoParkingPlugin : Plugin
 
         return latestTelemetry.truckFloat.airPressure > (emergency > 0.0f ? emergency : 20.0f);
     }
+
+    /// <summary>
+    ///  The one expression for "this run must not publish control". Dry-run and shadow mode are two
+    ///  switches with the same output-boundary consequence, so every site assigns <c>output.DryRun</c>
+    ///  from this property and a future path cannot accidentally honour only one of them (R44).
+    ///  Neither flag pauses or aborts anything: only the hotkeys end a maneuver.
+    /// </summary>
+    private bool DryRunActive => settings.DryRun || settings.ShadowMode;
 
     /// <summary>
     ///  Which transport the host used for our pedals during this run. The two are different memory
@@ -269,6 +314,7 @@ public sealed class AutoParkingPlugin : Plugin
         controlPlot.SetVisible(settings.ShowControlPlot);
         kdopReader = new KdopReader(this);
         kdopReader.Start();
+        InitIdentityChannel();
 
         ControlsBackend.Current.On(toggleControl.Id, OnToggleKeyPressed);
         ControlsBackend.Current.On(abortControl.Id, OnAbortKeyPressed);
@@ -515,22 +561,59 @@ public sealed class AutoParkingPlugin : Plugin
     {
         Pose2? spot;
         AutoParkingSettings snapshot;
+        TargetResolver.Target? marker;
 
         lock (sync)
         {
             spot = target;
             snapshot = settings;
+            marker = markerTarget;
         }
 
         if (spot == null)
         {
-            lock (sync) planResult = null;
+            lock (sync)
+            {
+                planResult = null;
+                legSettings = null;
+            }
             return;
         }
 
-        PlanResult result = Planner.Plan(CurrentPose, spot.Value, snapshot, geometry.Obstacles, geometry.Trust);
+        // Per-leg envelope (spec §4.5). A clone, never the live settings, and the SAME clone is stored
+        // for EngageFollower and the follower's own replan closure, so the first plan and an in-flight
+        // re-plan cannot disagree about how wide the truck may be. A reverse leg into a measured gap
+        // uses the gap's lateral clear; the approach leg keeps the fixed wide-lane pad.
+        AutoParkingSettings legCfg = snapshot;
+        if (snapshot.AutoParkByMarker)
+        {
+            legCfg = snapshot.Clone();
+            if (snapshot.DynamicEnvelope && marker?.LateralClearM is double clear)
+            {
+                // InsertPad is the total per side: EnvelopeWidth = width + 2*(pad + margin), so the
+                // margin already inside EnvelopePadM has to come back out of the pad.
+                double pad = TargetResolver.InsertPad(clear, snapshot.VehicleWidthM, snapshot.SafetyMarginM);
+                legCfg.EnvelopePadM = Math.Clamp(pad - legCfg.ObstacleMarginM, 0.0, 1.0);
+                string signature = $"insert:{pad:0.000}:{clear:0.000}";
+                if (signature != lastEnvelopeSignature)
+                {
+                    lastEnvelopeSignature = signature;
+                    Logger.Info($"AutoParking: insert envelope {pad:0.00} m/side (clear {clear:0.00})");
+                }
+            }
+            else
+            {
+                legCfg.EnvelopePadM = Math.Clamp(snapshot.ApproachEnvelopeM - legCfg.ObstacleMarginM, 0.0, 1.0);
+            }
+        }
 
-        lock (sync) planResult = result;
+        PlanResult result = Planner.Plan(CurrentPose, spot.Value, legCfg, geometry.Obstacles, geometry.Trust);
+
+        lock (sync)
+        {
+            planResult = result;
+            legSettings = ReferenceEquals(legCfg, snapshot) ? null : legCfg;
+        }
 
         LogCandidateCosts(result);
     }
@@ -615,8 +698,34 @@ public sealed class AutoParkingPlugin : Plugin
                 // Keep the brake applied while the deadline runs, then hand back.
                 output.Apply(new ControlDemand(0f, 0f, 0.6f, settings.HandbrakeOnFinish || current == ParkingPhase.Aborted,
                                                GearRequest.None, false));
-                if (DateTime.UtcNow >= phaseDeadlineUtc)
-                    CompletePhase(current);
+                if (DateTime.UtcNow < phaseDeadlineUtc)
+                    break;
+
+                // Multi-leg chaining. The handback deadline is the earliest the next marker may be
+                // resolved, but the settle window is the real gate: the game moves the marker only
+                // after it decides the stage is done, and asking earlier returns the old one. Failing
+                // to settle keeps holding the brake - it never pauses or aborts (M4).
+                if (current == ParkingPhase.HoldingBrake && settings.AutoParkByMarker)
+                {
+                    bool markerLegActive;
+                    bool settled;
+                    lock (sync)
+                    {
+                        markerLegActive = markerLoop.Active is not null;
+                        settled = markerLoop.Settled(DateTime.UtcNow, settings.SettleTimeS);
+                    }
+
+                    if (markerLegActive)
+                    {
+                        if (!settled)
+                            break;
+
+                        if (TryNextMarkerLeg())
+                            break; // phase is Following again
+                    }
+                }
+
+                CompletePhase(current);
                 break;
         }
     }
@@ -624,6 +733,12 @@ public sealed class AutoParkingPlugin : Plugin
     private void StepManeuver()
     {
         Follower? active = follower;
+
+        // The output boundary is set before ANY early-return path below can apply a demand: a stale
+        // telemetry sample still publishes a handbrake, and that must not escape a shadow run whose
+        // previous assignment came from a real one.
+        output.DryRun = DryRunActive;
+
         if (active == null)
             return;
 
@@ -638,8 +753,15 @@ public sealed class AutoParkingPlugin : Plugin
         VehicleState state = ReadVehicleState();
         ObstacleSnapshot obstacles = MapGeometrySnapshot?.Obstacles ?? new ObstacleSnapshot();
 
-        output.DryRun = settings.DryRun;
         output.Weight = (float)settings.ControlWeight;
+
+        // Has the game moved the marker this leg follows? Runs before the step so a re-plan can
+        // replace the follower, and then step the one the plugin actually owns now.
+        PollMarkerDrift(state, obstacles);
+        active = follower;
+        if (active == null)
+            return;
+
         ControlDemand demand = active.Step(state, obstacles);
 
         // Below the emergency threshold the service brake has nothing to act on - the pedal is
@@ -705,6 +827,9 @@ public sealed class AutoParkingPlugin : Plugin
 
             if (demand.Finished)
             {
+                // The leg is reached. Stamp it before anything reads Settled; the controller ignores
+                // the call when no marker leg is active (R43).
+                markerLoop.OnArrived(DateTime.UtcNow);
                 phase = ParkingPhase.HoldingBrake;
                 phaseDeadlineUtc = DateTime.UtcNow.AddSeconds(2.0);
             }
@@ -804,7 +929,10 @@ public sealed class AutoParkingPlugin : Plugin
     /// </summary>
     private void CheckPedalFallback(ControlDemand demand, VehicleState state)
     {
-        if (pedalFallbackEngaged || settings.DryRun)
+        // Shadow mode publishes nothing, so a full brake demand that fails to slow the truck is not
+        // evidence of a dead pedal - it would flip the whole session to the legacy channel for a test
+        // that never ran.
+        if (pedalFallbackEngaged || DryRunActive)
             return;
 
         // Only the memory write can fail silently this way; the legacy gamepad's health shows up
@@ -968,6 +1096,13 @@ public sealed class AutoParkingPlugin : Plugin
         {
             follower = null;
             phase = ParkingPhase.Idle;
+
+            // The maneuver is over: no leg may survive into the next one, and no stale provenance
+            // may reach the next start's confidence gate.
+            markerLoop.Reset();
+            markerTarget = null;
+            legSettings = null;
+            nextMarkerCheckUtc = DateTime.MinValue;
         }
 
         Notify(NotificationLevel.Success, from == ParkingPhase.HoldingBrake ? "泊车完成。" : "已中止并交还控制。", 6);
@@ -1016,6 +1151,50 @@ public sealed class AutoParkingPlugin : Plugin
             Abort("快捷键中止");
     }
 
+    /// <summary>
+    ///  Resolve the sidecar executable and build the identity channel. The chain is explicit
+    ///  <see cref="AutoParkingSettings.SidecarPath"/> → "&lt;host exe dir&gt;\Plugins\MemoryProbe.exe" →
+    ///  <see cref="AppContext.BaseDirectory"/> (R7). The middle candidate is the real one: the host
+    ///  shadow-copies the plugin DLL alone into %TEMP%\ETS2LA\PluginShadow\&lt;name&gt;_&lt;guid&gt;\, so
+    ///  AppContext.BaseDirectory holds no exe and can only ever be the last resort. Every candidate is
+    ///  logged with whether it exists, because from inside the shadow copy none of these paths is
+    ///  self-evident - and a missing exe is the expected state until Task 9 deploys the probe, so it
+    ///  is reported once, here, at Info rather than on every acquisition.
+    /// </summary>
+    private void InitIdentityChannel()
+    {
+        List<string> attempts = new();
+        string? chosen = null;
+
+        void Consider(string source, string path)
+        {
+            bool exists = path.Length > 0 && File.Exists(path);
+            attempts.Add($"{source}={path}({(exists ? "yes" : "no")})");
+            if (chosen is null && exists)
+                chosen = path;
+        }
+
+        if (!string.IsNullOrWhiteSpace(settings.SidecarPath))
+            Consider("SidecarPath", settings.SidecarPath);
+
+        string hostDir = Path.GetDirectoryName(Environment.ProcessPath) ?? "";
+        Consider("hostPlugins", Path.Combine(hostDir, "Plugins", "MemoryProbe.exe"));
+        Consider("shadowDir", Path.Combine(AppContext.BaseDirectory, "MemoryProbe.exe"));
+
+        // Nothing on the machine yet: keep the first candidate the user could act on, which is the
+        // explicit path when set and the deployed location otherwise.
+        string fallback = !string.IsNullOrWhiteSpace(settings.SidecarPath)
+            ? settings.SidecarPath
+            : Path.Combine(hostDir, "Plugins", "MemoryProbe.exe");
+        string finalPath = chosen ?? fallback;
+
+        identityExePresent = finalPath.Length > 0 && File.Exists(finalPath);
+        identity = new IdentityChannel(finalPath, settings.GameProcessName);
+        Logger.Info($"AutoParking: identity sidecar 候选 {string.Join(" · ", attempts)} " +
+                    $"→ chosen={finalPath} exists={(identityExePresent ? "yes" : "no")}" +
+                    (identityExePresent ? "" : "（未部署属预期，Task 9 部署后生效；身份通道降级为纯几何）"));
+    }
+
     public override void OnDisable()
     {
         base.OnDisable();
@@ -1036,6 +1215,10 @@ public sealed class AutoParkingPlugin : Plugin
         kdopReader?.Stop();
         kdopReader = null;
 
+        // Kills any in-flight probe child; disposing a Process alone does not.
+        identity?.Dispose();
+        identity = null;
+
         Events.Current.Unsubscribe<GameTelemetryData>(GameTelemetry.Current.EventString, OnTelemetry);
         GameTelemetry.Current.ReadTrailerData = previousReadTrailerData;
 
@@ -1046,6 +1229,10 @@ public sealed class AutoParkingPlugin : Plugin
         lock (sync)
         {
             phase = ParkingPhase.Idle;
+            markerLoop.Reset();
+            markerTarget = null;
+            legSettings = null;
+            nextMarkerCheckUtc = DateTime.MinValue;
         }
     }
 
@@ -1627,7 +1814,7 @@ public sealed class AutoParkingPlugin : Plugin
         bool allowed;
         lock (sync)
         {
-            allowed = follower == null && phase == ParkingPhase.Idle && !settings.DryRun;
+            allowed = follower == null && phase == ParkingPhase.Idle && !DryRunActive;
             data = latestTelemetry;
             if (allowed)
             {
@@ -1637,14 +1824,14 @@ public sealed class AutoParkingPlugin : Plugin
             else
             {
                 lastActionFailed = true;
-                lastActionMessage = "换挡自检只能在未启用车库、且关掉 Dry-run 时按";
+                lastActionMessage = "换挡自检只能在未启用车库、且关掉 Dry-run 与影子模式时按";
             }
         }
 
         if (!allowed)
             return;
 
-        output.DryRun = settings.DryRun;
+        output.DryRun = DryRunActive;
         output.PulseGear(request);
 
         Logger.Info($"AutoParking: 换挡自检 {request}：按下前 gear={data.truckInt.gear}/{data.truckInt.gearDashboard} " +
@@ -1685,55 +1872,86 @@ public sealed class AutoParkingPlugin : Plugin
     {
         Logger.Info("AutoParking: start requested");
 
+        ParkingPhase current;
+        lock (sync) current = phase;
+
+        bool starting = current is ParkingPhase.Idle or ParkingPhase.Selecting;
+
+        if (starting)
+        {
+            // Refuse a start the same way as before, but do it BEFORE asking the marker protocol for
+            // a target: with the game closed the memory snapshot is empty, and "no marker" would be
+            // the wrong story to tell a user whose actual problem is a dead SDK.
+            string? readiness;
+            lock (sync) readiness = ValidateStartReadiness();
+            if (readiness != null)
+                return RejectStart(readiness);
+
+            bool needTarget;
+            lock (sync)
+            {
+                needTarget = settings.AutoParkByMarker && target == null;
+
+                // A fresh maneuver: leg count, marker identity and settle window all start over.
+                // Done before acquisition, which counts leg 1, and never while a maneuver runs.
+                markerLoop.Reset();
+                markerTarget = null;
+                legSettings = null;
+                nextMarkerCheckUtc = DateTime.MinValue;
+            }
+
+            if (needTarget)
+            {
+                TargetResolver.Target? acquired;
+                try
+                {
+                    acquired = AcquireMarkerTarget();
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warn($"AutoParking: marker resolution threw {ex.GetType().Name}: {ex.Message}");
+                    acquired = null;
+                }
+
+                if (acquired is null)
+                {
+                    string message = "自动解析目标失败：无标记、无可用缺口（开地图手动选点，或开回有标记的场景）";
+                    lock (sync)
+                    {
+                        lastActionFailed = true;
+                        lastActionMessage = message;
+                    }
+
+                    Notify(NotificationLevel.Warning, message, 6);
+                    Logger.Warn($"AutoParking: marker resolution failed: {message}");
+                    return message;
+                }
+            }
+        }
+
         lock (sync)
         {
             string? rejection = ValidateStart();
             if (rejection != null)
             {
-                lastRejectReason = rejection;
-                lastActionFailed = true;
-                lastActionMessage = "开始被拒绝：" + rejection;
-                Notify(NotificationLevel.Warning, rejection, 6);
-                Logger.Warn($"AutoParking: start rejected: {rejection}");
-                return rejection;
+                // The acquisition above may have counted a leg for a maneuver that never started;
+                // undo it so the first real start is leg 1.
+                if (starting)
+                    markerLoop.Reset();
+                return RejectStart(rejection);
             }
 
             lastRejectReason = "";
 
             try
             {
-                Pose2 spot = target.Value;
-                AutoParkingSettings cfg = settings;
-
-                // Captured once: a map rebuild mid-maneuver must not leave the closure comparing a new
-                // route against a different trust grid than the one the engaged route was measured on.
-                GroundTrust? planTrust = mapGeometry?.Trust;
-
-                follower = new Follower(planResult!.Path!, settings, settings.WheelbaseM,
-                    (from, field) =>
-                    {
-                        // Ask the planner the same question we asked at engage time, only from the
-                        // pose we are actually standing at now. Null when there is nothing usable,
-                        // which leaves the follower on the route it already has.
-                        PlanResult next = Planner.Plan(from, spot, cfg, field, planTrust);
-                        return next.Ok ? next.Path : null;
-                    })
-                {
-                    Trace = controlTrace
-                };
-
-                // A fresh timeline per maneuver: leaving the previous run in the buffer makes the
-                // plot a smear across two different routes and hides the thing being tuned.
-                controlTrace.Reset();
-
-                TakeOverAssists();
-                phase = ParkingPhase.Engaging;
-                warnedNoAir = false;
+                EngageFollower();
             }
             catch (Exception ex)
             {
                 follower = null;
                 phase = ParkingPhase.Idle;
+                markerLoop.Reset();
                 lastActionFailed = true;
                 lastActionMessage = $"启动异常：{ex.GetType().Name}: {ex.Message}";
                 Logger.Warn($"AutoParking: engage threw {ex}");
@@ -1741,18 +1959,311 @@ public sealed class AutoParkingPlugin : Plugin
             }
 
             lastActionFailed = false;
-            // Progress comes from the real vehicle position, so a Dry-run engagement shows the
+            // Progress comes from the real vehicle position, so a dry-run/shadow engagement shows the
             // demands for the current sample and then holds there; it does not walk the route.
-            lastActionMessage = settings.DryRun
-                ? $"已开始（Dry-run）：{planResult!.Summary} —— 不发控制，车不动，路径进度停在起点，看控制器行确认拟发数值"
+            lastActionMessage = DryRunActive
+                ? $"已开始（{(settings.DryRun ? "Dry-run" : "影子模式")}）：{planResult!.Summary} —— 不发控制，车不动，路径进度停在起点，看控制器行确认拟发数值"
                 : $"已开始：{planResult!.Summary}";
         }
 
-        output.DryRun = settings.DryRun;
-        string mode = settings.DryRun ? "（Dry-run：只演算不输出）" : "";
+        output.DryRun = DryRunActive;
+        string mode = DryRunActive ? "（只演算不输出）" : "";
         Notify(NotificationLevel.Information, $"开始泊车：{planResult!.Summary}{mode}", 6);
-        Logger.Info($"AutoParking: engaged: {planResult.Summary}, dry-run={settings.DryRun}");
+        Logger.Info($"AutoParking: engaged: {planResult.Summary}, dry-run={DryRunActive}");
         return "";
+    }
+
+    /// <summary>One refusal path for every pre-start gate: record it, tell the user, hand it back.</summary>
+    private string RejectStart(string rejection)
+    {
+        lock (sync)
+        {
+            lastRejectReason = rejection;
+            lastActionFailed = true;
+            lastActionMessage = "开始被拒绝：" + rejection;
+        }
+
+        Notify(NotificationLevel.Warning, rejection, 6);
+        Logger.Warn($"AutoParking: start rejected: {rejection}");
+        return rejection;
+    }
+
+    /// <summary>
+    ///  Where the game wants the truck parked, from the runtime memory items: 0xC17 mover pair →
+    ///  framing-vehicle gap → the saved spot (design doc §54). On success this sets the pose the
+    ///  planner and the map draw, re-plans through <see cref="Replan"/> and counts the leg exactly
+    ///  once - a repeat acquisition of the target already being followed is not a new leg (R43).
+    ///  Null means "nothing to resolve"; identity enrichment can only degrade, never block.
+    /// </summary>
+    private TargetResolver.Target? AcquireMarkerTarget()
+    {
+        KdopReader.Snapshot? snap = MemoryItemSnapshot;
+        if (snap == null)
+            return null;
+
+        List<TargetResolver.Item> items = new(snap.Items.Count);
+        foreach (KdopReader.MemItem it in snap.Items)
+            items.Add(new TargetResolver.Item(it.Type, it.Uid, it.PlanePos, it.Dx, it.Dz, it.Flags));
+
+        Pose2? saved = settings.HasSavedSpot
+            ? new Pose2(settings.SavedSpotX, settings.SavedSpotZ, settings.SavedSpotHeadingRad)
+            : target;
+
+        // One pose sample for the geometry and the identity request, so the two cannot be answered
+        // against positions a telemetry frame apart.
+        Pose2 truck = CurrentPose;
+        TargetResolver.Target? resolved = TargetResolver.Resolve(items, truck, saved, settings.VehicleLengthM);
+        if (resolved is null)
+            return null;
+
+        // Identity channel: an enrichment, never a dependency (spec §4.3). TryGet does not block; a
+        // false answer means "no identity yet, geometry is the answer", so it may be logged verbatim
+        // but never parsed.
+        if (identity is not null && identityExePresent)
+        {
+            if (identity.TryGet(truck.Position, 90.0,
+                                out IReadOnlyList<IdentityChannel.ItemIdentity>? ids, out string? err)
+                && ids is not null)
+            {
+                foreach (IdentityChannel.ItemIdentity id in ids)
+                {
+                    if (id.Strings.Contains("state park_trigger_on_stopped", StringComparison.Ordinal))
+                        Logger.Info($"AutoParking: identity confirms stop-zone trigger at ({id.Pos.X:0.0},{id.Pos.Y:0.0})");
+                }
+            }
+            else if (err is not null && !identityStatusLogged)
+            {
+                identityStatusLogged = true;
+                Logger.Info($"AutoParking: identity channel not ready: {err}");
+            }
+        }
+
+        TargetResolver.Target acquired = resolved.Value;
+
+        lock (sync)
+        {
+            target = acquired.Pose;
+            markerTarget = acquired;
+        }
+
+        MapGeometry? geometry;
+        lock (sync) geometry = mapGeometry;
+        if (geometry is not null)
+            Replan(geometry);
+        else
+            lock (sync) planResult = null;
+
+        // Count exactly one acquisition per leg (R43). A repeat resolution of the target already
+        // being followed is not a new leg, so the next-leg hand-back can ask "unchanged?" without
+        // inflating the count. The read and the count share the lock the other marker-state writers use.
+        lock (sync)
+        {
+            TargetResolver.Target? previous = markerLoop.Active;
+            bool newLeg = previous is null
+                          || previous.Value.Uid != acquired.Uid
+                          || Vector2.Distance(previous.Value.Pose.Position, acquired.Pose.Position)
+                             > settings.MarkerMoveToleranceM;
+            if (newLeg)
+                markerLoop.OnAcquired(acquired);
+        }
+
+        Logger.Info($"AutoParking: acquired {acquired.Provenance} conf={acquired.Confidence:0.00} legs={markerLoop.Legs}");
+        return acquired;
+    }
+
+    /// <summary>
+    ///  Build the follower for the current plan and switch to Engaging. Extracted from StartParking so
+    ///  a second marker leg and a marker-moved re-plan engage through exactly the same path as the
+    ///  first one. The trace resets here because it is a per-leg timeline, and the assist snapshot is
+    ///  taken only once per maneuver - re-snapshotting mid-maneuver would record our own "assists
+    ///  off" as the state to restore at the end.
+    /// </summary>
+    private void EngageFollower()
+    {
+        lock (sync)
+        {
+            if (target is not Pose2 spot || planResult?.Path is not ParkingPath path)
+                throw new InvalidOperationException("没有可执行的目标或路径");
+
+            AutoParkingSettings cfg = legSettings ?? settings;
+
+            // Captured once: a map rebuild mid-maneuver must not leave the closure comparing a new
+            // route against a different trust grid than the one the engaged route was measured on.
+            GroundTrust? planTrust = mapGeometry?.Trust;
+
+            follower = new Follower(path, cfg, settings.WheelbaseM,
+                (from, field) =>
+                {
+                    // Ask the planner the same question we asked at engage time, only from the pose
+                    // we are actually standing at now. Null when there is nothing usable, which
+                    // leaves the follower on the route it already has.
+                    PlanResult next = Planner.Plan(from, spot, cfg, field, planTrust);
+                    return next.Ok ? next.Path : null;
+                })
+            {
+                Trace = controlTrace
+            };
+
+            // A fresh timeline per leg: leaving the previous run in the buffer makes the plot a
+            // smear across two different routes and hides the thing being tuned.
+            controlTrace.Reset();
+
+            if (!hadAssistSnapshot)
+                TakeOverAssists();
+
+            phase = ParkingPhase.Engaging;
+            warnedNoAir = false;
+        }
+    }
+
+    /// <summary>
+    ///  The settle window after a leg elapsed: ask the game where the marker is now. A different
+    ///  target starts the next leg; an unchanged one, a missing one or an unusable route leaves the
+    ///  caller to complete the maneuver through its existing path. Nothing here aborts anything.
+    /// </summary>
+    private bool TryNextMarkerLeg()
+    {
+        TargetResolver.Target? previous;
+        lock (sync) previous = markerTarget;
+        if (previous is null)
+            return false;
+
+        TargetResolver.Target? next;
+        try
+        {
+            next = AcquireMarkerTarget();
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"AutoParking: next-marker resolution threw {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+
+        if (next is null)
+        {
+            Logger.Info("AutoParking: no next marker, finishing");
+            return false;
+        }
+
+        // AcquireMarkerTarget counted this acquisition only if it is a new target (one OnAcquired per
+        // leg, R43), so an unchanged marker must not start a leg here either.
+        if (next.Value.Uid == previous.Value.Uid
+            && Vector2.Distance(next.Value.Pose.Position, previous.Value.Pose.Position)
+               <= settings.MarkerMoveToleranceM)
+        {
+            Logger.Info($"AutoParking: marker unchanged after settle, finishing (legs={markerLoop.Legs})");
+            return false;
+        }
+
+        PlanResult? plan;
+        lock (sync) plan = planResult;
+        if (plan is not { Ok: true })
+        {
+            Logger.Warn($"AutoParking: next marker {next.Value.Provenance} has no usable route " +
+                        $"({plan?.Summary ?? "未规划"}), finishing");
+            return false;
+        }
+
+        try
+        {
+            EngageFollower();
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"AutoParking: next-leg engage threw {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+
+        lock (sync)
+        {
+            phase = ParkingPhase.Following;
+            warnedNoAir = false;
+        }
+
+        Logger.Info($"AutoParking: leg {markerLoop.Legs} -> {next.Value.Provenance}");
+        return true;
+    }
+
+    /// <summary>
+    ///  The ~1 Hz marker-drift poll. Runs only with a leg that has a marker identity: a framing-gap
+    ///  target carries Uid 0 and matches no item, so it is skipped rather than matched by position.
+    ///  A move re-plans in place from where the truck stands and starts the next leg; it never pauses
+    ///  or ends the maneuver (M4). MarkerMoved advances the accepted position itself, so a failed
+    ///  re-plan is not retried on the same displacement every second.
+    /// </summary>
+    private void PollMarkerDrift(VehicleState state, ObstacleSnapshot obstacles)
+    {
+        if (!settings.AutoParkByMarker || DateTime.UtcNow < nextMarkerCheckUtc)
+            return;
+
+        ulong uid;
+        lock (sync)
+        {
+            // A framing-gap target has Uid 0 and matches no runtime item, so it is skipped rather
+            // than matched by position.
+            if (markerLoop.Active is null || markerLoop.MarkerUid == 0)
+                return;
+            uid = markerLoop.MarkerUid;
+        }
+
+        nextMarkerCheckUtc = DateTime.UtcNow.AddSeconds(1.0);
+
+        KdopReader.Snapshot? snap = MemoryItemSnapshot; // background cache: reading it does not block
+        if (snap is null)
+            return;
+
+        foreach (KdopReader.MemItem it in snap.Items)
+        {
+            if (it.Uid != uid)
+                continue;
+
+            if (!markerLoop.MarkerMoved(it.PlanePos, settings.MarkerMoveToleranceM))
+                return;
+
+            try
+            {
+                Pose2 from = state.Pose;
+                TargetResolver.Target? current;
+                AutoParkingSettings cfg;
+                GroundTrust? trust;
+                lock (sync)
+                {
+                    current = markerTarget;
+                    cfg = legSettings ?? settings;
+                    trust = mapGeometry?.Trust;
+                }
+
+                Pose2 goal = new(it.PlanePos.X, it.PlanePos.Y,
+                                 current?.Pose.HeadingRad ?? from.HeadingRad);
+                PlanResult next = Planner.Plan(from, goal, cfg, obstacles, trust);
+                if (!next.Ok)
+                {
+                    Logger.Warn($"AutoParking: marker moved but re-plan failed: {next.Reason}");
+                    return;
+                }
+
+                TargetResolver.Target moved = new(goal, "marker-moved", current?.Confidence ?? 0.6,
+                                                  uid, current?.LateralClearM, current?.GapCenter);
+
+                lock (sync)
+                {
+                    planResult = next;
+                    target = goal;
+                    markerLoop.OnAcquired(moved);
+                    markerTarget = markerLoop.Active;
+                }
+
+                EngageFollower(); // reads planResult/legSettings under the same lock
+                Logger.Warn($"AutoParking: marker 0x{uid:X} moved, re-planned leg {markerLoop.Legs}");
+            }
+            catch (Exception ex)
+            {
+                // A failed re-plan leaves the current follower and route running; it is not an abort.
+                Logger.Warn($"AutoParking: marker-drift re-plan threw {ex.GetType().Name}: {ex.Message}");
+            }
+
+            return;
+        }
     }
 
     /// <summary>
@@ -1868,16 +2379,18 @@ public sealed class AutoParkingPlugin : Plugin
         return report.Summary;
     }
 
-    private string? ValidateStart()
+    /// <summary>
+    ///  The start gates that do not depend on a resolved target. Split out so a marker acquisition
+    ///  runs only after the game is known to be there; otherwise a dead SDK would be reported as
+    ///  "no marker" because the memory snapshot is empty for the same reason.
+    /// </summary>
+    private string? ValidateStartReadiness()
     {
         if (phase == ParkingPhase.Paused)
             return "有一个已暂停的泊车任务，先按主热键继续或按中止键放弃";
 
         if (phase != ParkingPhase.Idle && phase != ParkingPhase.Selecting)
             return "已有一个泊车任务在跑";
-
-        if (target == null)
-            return "还没在平面地图上选择车位";
 
         if (telemetryStale)
             return "遥测超时，请确认游戏在运行且 SDK 已连接";
@@ -1887,6 +2400,20 @@ public sealed class AutoParkingPlugin : Plugin
 
         if (settings.RefuseWithTrailer && IsTrailerAttached())
             return "本版本不支持带挂车，请先摘挂";
+
+        return null;
+    }
+
+    private string? ValidateStart()
+    {
+        string? readiness = ValidateStartReadiness();
+        if (readiness != null)
+            return readiness;
+
+        // Marker-following is allowed to start without a map pick: AcquireMarkerTarget, which ran
+        // just before this, guarantees a target when the feature is on.
+        if (target == null && !settings.AutoParkByMarker)
+            return "还没在平面地图上选择车位";
 
         if (planResult == null)
             return "还没有规划结果（地图数据未就绪？）";
@@ -1898,6 +2425,51 @@ public sealed class AutoParkingPlugin : Plugin
 
         if (planResult.Path!.Length > settings.MaxTakeoverDistanceM * 2.0 + settings.EntryDistanceM)
             return "路径过长，请先把车开到车位附近";
+
+        // Start gates for real control only. Dry-run and shadow mode publish no command at all, so
+        // gating them on engine speed or brake air would block the one use they are for: watching a
+        // plan while parked with the engine off.
+        bool realControl = !settings.DryRun && !settings.ShadowMode;
+
+        if (realControl && latestTelemetry.truckFloat.engineRpm < 200.0)
+            return "发动机未启动（转速过低）";
+
+        if (realControl && Math.Abs(latestTelemetry.truckFloat.speed) >= 0.5)
+            return "车速过高，请先停稳";
+
+        // Two independent air refusals, both start-only (a running maneuver is never touched):
+        // MinAirBar is the tunable floor (field unit unresolved, shipped as 0 = disabled); HasBrakeAir
+        // is the game's own emergency threshold. Neither message may claim the other check is off.
+        if (realControl && settings.MinAirBar > 0.0
+            && latestTelemetry.truckFloat.airPressure < settings.MinAirBar)
+        {
+            return $"气压 {latestTelemetry.truckFloat.airPressure:0.0} 低于可调起步门槛 " +
+                   $"MinAirBar={settings.MinAirBar:0.0}（该字段单位未定，默认 0=关闭）";
+        }
+
+        if (realControl && !HasBrakeAir())
+        {
+            float emergency = latestTelemetry.configFloat.airPressureEmergency;
+            float threshold = emergency > 0.0f ? emergency : 20.0f;
+            return $"气压 {latestTelemetry.truckFloat.airPressure:0.0} 不高于游戏应急阈值 {threshold:0.0}" +
+                   (emergency > 0.0f ? "" : "（未读到 airPressureEmergency，按 20 兜底）") +
+                   "，制动踏板此刻物理无效";
+        }
+
+        if (string.IsNullOrEmpty(latestTelemetry.configString.shifterType))
+            return "档位配置未知";
+
+        // Confidence gate (R36): refusal only, strict <, and 0 disables it. The user-asserted
+        // saved-spot tier is exempt - a human chose that pose, so there is no detector uncertainty
+        // left to threshold. Keyed on the provenance prefix, never on an error string.
+        if (markerTarget is TargetResolver.Target marker
+            && settings.MinConfidence > 0.0
+            && marker.Confidence < settings.MinConfidence
+            && !marker.Provenance.StartsWith("saved-spot", StringComparison.Ordinal))
+        {
+            return $"目标置信度 {marker.Confidence:0.00} 低于门槛 {settings.MinConfidence:0.00}" +
+                   $"（{marker.Provenance}）";
+        }
 
         return null;
     }
@@ -2008,7 +2580,8 @@ public sealed class AutoParkingPlugin : Plugin
                     { "地图数据", mapStatus },
                     { "地图内容", mapGeometry?.Probe.Summary ?? "未构建（平面地图窗口要开着）" },
                     { "规划自检", selfTestSummary },
-                    { "输出", settings.DryRun ? "Dry-run（不发控制）" : "真实输出" },
+                    { "输出", settings.DryRun ? "Dry-run（不发控制）"
+                        : settings.ShadowMode ? "影子模式（规划全跑，不发控制）" : "真实输出" },
                     { "最近一次拒绝/中止", lastRejectReason == "" ? "-" : lastRejectReason }
                 };
             }
