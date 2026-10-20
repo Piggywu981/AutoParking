@@ -273,9 +273,14 @@ public sealed class AutoParkingSettings
     ///  Run the whole chain - resolve the game's marker, plan, draw the target pose and the route on
     ///  the map - while sending no control commands at all. The rule is a conjunction, not this flag
     ///  alone: the effective dry-run value is <see cref="DryRun"/> || <see cref="ShadowMode"/>, so the
-    ///  truck only receives pedals, wheel, gearbox and handbrake when BOTH are off - the expression
-    ///  Task 8 writes at the control-output boundary, and until that wiring lands both flags are
-    ///  inert, as the header above says. Since
+    ///  truck only receives pedals, wheel, gearbox and handbrake when BOTH are off. That expression -
+    ///  output.DryRun = settings.DryRun || settings.ShadowMode - is Task 8's to write at the
+    ///  control-output boundary, and until it lands only THIS flag is inert: <see cref="DryRun"/> is
+    ///  already read by shipping code and already gates the output on its own (output.DryRun =
+    ///  settings.DryRun at AutoParkingPlugin.cs:641, :1647 and :1751; the pedal-fallback, brake and
+    ///  gear probes plus the gear self-test return early on it at :807, :879, :941 and :1630; and
+    ///  Driving/Follower.cs:341 trusts it while waiting for a gear), so the protection that exists
+    ///  today is live, not prose. Since
     ///  <see cref="DryRun"/> also defaults to true, turning this off is necessary but not sufficient -
     ///  the Dry-run switch is the other half and sits at the top of the same settings page. On by
     ///  default because the marker protocol is new and the first passes are meant to be watched rather
@@ -376,15 +381,27 @@ public sealed class AutoParkingSettings
     public double MinConfidence { get; set; } = 0.6;
 
     /// <summary>
-    ///  The service brake runs on an air circuit, so below this pressure a brake demand is physically
-    ///  inert (§24: read air= before concluding a brake did nothing). The gate in refusal form: refuse
-    ///  the start when air &lt; MinAirBar. Strict &lt;, which is what makes the documented "0 = this
-    ///  check is off" true - at 0 nothing can be below it, whereas air &lt;= 0 would refuse forever on
-    ///  an unfired engine, and a tier/reading exactly equal to the threshold passes. Starting a
-    ///  parking maneuver we cannot stop is the only thing this guards, and it is checked once at
-    ///  start - it does not watch a running maneuver, and only the hotkeys end one.
+    ///  Tunable start-refusal floor, OFF by default. The gate in refusal form: refuse the start when
+    ///  air &lt; MinAirBar. Strict &lt;, so 0 disables this tunable floor (nothing can be below 0) and
+    ///  a reading exactly equal to the threshold passes. Checked once at start only - it does not
+    ///  watch a running maneuver, and only the hotkeys end one.
+    ///
+    ///  The unit of truckFloat.airPressure is UNRESOLVED in this repo, so the default is 0 rather than
+    ///  a number. The two call sites that print it call it bar (AutoParkingPlugin.cs:654 and :1988); a
+    ///  constant read off the same field is named psi (PedalFallbackMinAirDropPsi, :142, used at :843);
+    ///  and this repo's own logs read 114-123 in that field (docs/2026-09-30-autoparking-design.md
+    ///  §17 :637 and :716, §39 :1742, §40 :1758) - a value that only makes sense as psi. A 4.0 floor
+    ///  on the reported scale would essentially never fire, so do not set this from a unit assumption.
+    ///  Clamp() bounds it to [0, 200], wide enough for either scale.
+    ///
+    ///  The shipped, unit-safe air check is NOT this key: HasBrakeAir() (:155-160) compares the same
+    ///  field with the game's own truck-config value configFloat.airPressureEmergency, falling back to
+    ///  a floor of 20 when that has not been read. It is independent of MinAirBar - it runs at :649 to
+    ///  fall back to the parking brake near the end of the route, and drives the 制动能力 status row at
+    ///  :1989. Task 9's live pass settles the unit by printing air= and airPressureEmergency side by
+    ///  side, engine off and running.
     /// </summary>
-    public double MinAirBar { get; set; } = 4.0;
+    public double MinAirBar { get; set; } = 0.0;
 
     /// <summary>
     ///  While a marker-following leg executes, if the 0xC17 marker we planned to has moved more than
@@ -457,7 +474,7 @@ public sealed class AutoParkingSettings
         SafetyMarginM = Math.Clamp(SafetyMarginM, 0.0, 0.30);
         SettleTimeS = Math.Clamp(SettleTimeS, 1.0, 10.0);
         MinConfidence = Math.Clamp(MinConfidence, 0.0, 1.0);
-        MinAirBar = Math.Clamp(MinAirBar, 0.0, 10.0);
+        MinAirBar = Math.Clamp(MinAirBar, 0.0, 200.0);
         MarkerMoveToleranceM = Math.Clamp(MarkerMoveToleranceM, 0.1, 5.0);
         ObstacleLookaheadM = Math.Clamp(ObstacleLookaheadM, 1.5, 15.0);
         MaxReplans = Math.Clamp(MaxReplans, 0, 8);

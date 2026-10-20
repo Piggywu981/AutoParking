@@ -13,7 +13,7 @@
     else
     {
         <Switch Title="Dry-run"
-                Description="Plan and display everything, but never send throttle, brake, steering or gear commands. Keep this on until the first real test in your own game. It is one half of a pair: the effective gate is DryRun || ShadowMode, so the truck only receives commands when this switch and 影子模式 (further down, in the 通用泊车 section) are both off."
+                Description="Plan and display everything, but never send throttle, brake, steering or gear commands. Keep this on until the first real test in your own game. It is one half of a pair: the effective gate is DryRun || ShadowMode, so the truck only receives commands when this switch and 影子模式 (further down, in the 通用泊车 section) are both off. That conjunction is pending Task 8: this build still reads only this switch, and ShadowMode is not wired yet."
                 Value="@Plugin.Settings.DryRun"
                 ValueChanged="@((bool value) => Plugin.HandleAction("dryRun", value))" />
         <Slider Title="控制权重"
@@ -45,7 +45,7 @@
                 Value="@Plugin.Settings.AutoParkByMarker"
                 ValueChanged="@((bool value) => Plugin.HandleAction("autoParkByMarker", value))" />
         <Switch Title="影子模式"
-                Description="全链路解析 + 规划，并把目标与路线画在地图上，但不发任何控制命令：油门、刹车、转向、挡位、手刹一个都不发。生效门是 DryRun || ShadowMode，也就是本页顶部的 Dry-run 与这里两个开关必须都关掉，卡车才会收到命令——只关掉影子模式而 Dry-run 还开着，车不会动。实车前先用它核对规划线。影子模式本身不会暂停也不会中止——只有热键能结束动作。"
+                Description="全链路解析 + 规划，并把目标与路线画在地图上，但不发任何控制命令：油门、刹车、转向、挡位、手刹一个都不发。生效门是 DryRun || ShadowMode，也就是本页顶部的 Dry-run 与这里两个开关必须都关掉，卡车才会收到命令——只关掉影子模式而 Dry-run 还开着，车不会动。尚未接线（Task 8）：本版还没读这个开关，output.DryRun 目前只取 Dry-run，只关掉 Dry-run 而这里仍开着时命令照样会发；上面那个合取生效门要等 Task 8 接上才成立。实车前先用它核对规划线。影子模式本身不会暂停也不会中止——只有热键能结束动作。"
                 Value="@Plugin.Settings.ShadowMode"
                 ValueChanged="@((bool value) => Plugin.HandleAction("shadowMode", value))" />
         <Switch Title="倒库腿动态包络"
@@ -67,14 +67,15 @@
                 Min="@(1f)" Max="@(10f)" Step="@(0.5f)"
                 Value="@(Convert.ToSingle(Plugin.Settings.SettleTimeS))"
                 ValueChanged="@((float value) => Plugin.HandleAction("settleTimeS", value))" />
+        @* 下面两个 Description 里「< 」后的空格是必需的：Description 走 Tooltip 的 Markdown.ToHtml，`<` 后紧跟字母（如写成 `<MinAirBar`）会被当成 HTML 标签，把该行后面整句一起吞掉；别去掉空格，也别改成 &lt;。 *@
         <Slider Title="起步置信度门槛"
                 Description="起步门，拒绝式：目标置信度 < MinConfidence 就不起步（严格小于，所以 0 = 关掉这一项，等于门槛的值能过）。只在起步时门控，不会中止在跑的机动。各档置信度固定：0.9 = 标记对，0.6 = 车间隙，0.4 = 手动存点。手动存点那一档不受这道门约束（TargetResolver 的出处前缀就是 saved-spot）——点是人自己选的，没有识别不确定性可拦，所以默认 0.6 下「跟随标记退回到你存的点」照样可用；这道门只拦插件猜出来的目标。"
                 Min="@(0f)" Max="@(1f)" Step="@(0.05f)"
                 Value="@(Convert.ToSingle(Plugin.Settings.MinConfidence))"
                 ValueChanged="@((float value) => Plugin.HandleAction("minConfidence", value))" />
-        <Slider Title="起步气压门槛 (bar)"
-                Description="起步门，拒绝式：气压 < MinAirBar 就不起步——低于这个气压行车制动走的气路不够，制动踏板物理无效。严格小于，所以 0 = 关掉这一项（未点火时气压读 0，用小于等于就会永远拒绝）。只在起步时检查一次，仅门控，不会中止在跑的机动。"
-                Min="@(0f)" Max="@(10f)" Step="@(0.5f)"
+        <Slider Title="起步气压门槛（单位未定）"
+                Description="起步门，拒绝式：气压 < MinAirBar 就不起步（严格小于，所以 0 = 关掉这一道可调门槛，等于门槛的值能过）。但 0 关掉的只是这道可调门槛，不是全部气压检查：现役的空压检查是 HasBrakeAir()，拿同一个字段和游戏自己的 airPressureEmergency 比（读不到配置时下限 20），与本项无关、一直在跑。本项默认 0，因为 truckFloat.airPressure 的单位在本仓库里没有定论：两个调用点按 bar 打印（AutoParkingPlugin.cs:654、:1988），同一字段上的常量却叫 psi（PedalFallbackMinAirDropPsi，:142），而本仓库自己的日志在这个字段上读到 114–123（设计文档 §17 :637、:716，§39 :1742，§40 :1758）——只有 psi 说得通，按 bar 设成 4.0 这类值几乎永远不会触发。单位由 Task 9 的实车一轮定案：引擎熄火与运转两种状态下并排打印 air= 与 airPressureEmergency。只在起步时检查一次，仅门控，不会中止在跑的机动。"
+                Min="@(0f)" Max="@(200f)" Step="@(0.5f)"
                 Value="@(Convert.ToSingle(Plugin.Settings.MinAirBar))"
                 ValueChanged="@((float value) => Plugin.HandleAction("minAirBar", value))" />
         <Slider Title="标记移动重规划阈值 (m)"
