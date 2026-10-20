@@ -1376,6 +1376,42 @@ public sealed class AutoParkingPlugin : Plugin
                     settings.MaxTakeoverDistanceM = ToDouble(value, settings.MaxTakeoverDistanceM);
                     changed = true;
                     break;
+                case "autoParkByMarker":
+                    settings.AutoParkByMarker = ToBool(value, settings.AutoParkByMarker);
+                    changed = true;
+                    break;
+                case "shadowMode":
+                    settings.ShadowMode = ToBool(value, settings.ShadowMode);
+                    changed = true;
+                    break;
+                case "dynamicEnvelope":
+                    settings.DynamicEnvelope = ToBool(value, settings.DynamicEnvelope);
+                    changed = true;
+                    break;
+                case "approachEnvelopeM":
+                    settings.ApproachEnvelopeM = ToDouble(value, settings.ApproachEnvelopeM);
+                    changed = true;
+                    break;
+                case "safetyMarginM":
+                    settings.SafetyMarginM = ToDouble(value, settings.SafetyMarginM);
+                    changed = true;
+                    break;
+                case "settleTimeS":
+                    settings.SettleTimeS = ToDouble(value, settings.SettleTimeS);
+                    changed = true;
+                    break;
+                case "minConfidence":
+                    settings.MinConfidence = ToDouble(value, settings.MinConfidence);
+                    changed = true;
+                    break;
+                case "minAirBar":
+                    settings.MinAirBar = ToDouble(value, settings.MinAirBar);
+                    changed = true;
+                    break;
+                case "markerMoveToleranceM":
+                    settings.MarkerMoveToleranceM = ToDouble(value, settings.MarkerMoveToleranceM);
+                    changed = true;
+                    break;
                 case "showMapWindow":
                     settings.ShowMapWindow = ToBool(value, settings.ShowMapWindow);
                     changed = true;

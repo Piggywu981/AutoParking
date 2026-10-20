@@ -36,6 +36,53 @@
                 Value="@(Convert.ToSingle(Plugin.Settings.MaxTakeoverDistanceM))"
                 ValueChanged="@((float value) => Plugin.HandleAction("maxTakeoverDistance", value))" />
 
+        <Separator Label="通用泊车（跟随游戏标记）" />
+        @* SidecarPath / GameProcessName 只能在 AutoParking.json 里改：宿主设置页只有 Slider/Switch/
+           Dropdown，没有文本输入组件，所以这两项故意没有控件、HandleAction 里也故意没有 case（不是
+           漏掉，加了也永远走不到）。README 里写明 JSON 路径。 *@
+        <Switch Title="跟随游戏标记（通用泊车）"
+                Description="按热键后自动解析游戏要求的停车位置（0xC17 Mover 对 → 停放车间隙 → 已存点）并执行。关掉则回到必须在地图上手动选点的旧行为。"
+                Value="@Plugin.Settings.AutoParkByMarker"
+                ValueChanged="@((bool value) => Plugin.HandleAction("autoParkByMarker", value))" />
+        <Switch Title="影子模式"
+                Description="全链路解析 + 规划，并把目标与路线画在地图上，但不发任何控制命令：油门、刹车、转向、挡位、手刹一个都不发。实车前先用它核对规划线；关掉它才是让车真正动起来的动作。影子模式本身不会暂停也不会中止——只有热键能结束动作。"
+                Value="@Plugin.Settings.ShadowMode"
+                ValueChanged="@((bool value) => Plugin.HandleAction("shadowMode", value))" />
+        <Switch Title="倒库腿动态包络"
+                Description="按停放车缺口的实测横向净宽收缩障碍包络；关闭则两条腿都用固定值。"
+                Value="@Plugin.Settings.DynamicEnvelope"
+                ValueChanged="@((bool value) => Plugin.HandleAction("dynamicEnvelope", value))" />
+        <Slider Title="接近腿包络 (m/侧)"
+                Description="宽车道段用的固定包络：那条腿的冲突判定扫 车宽 + 2×此值。只在车道明显宽于车身时用 0.30；窄巷请按实测收紧。与「包络基础外扩」是两条腿各自的值，不相加。"
+                Min="@(0.05f)" Max="@(0.50f)" Step="@(0.01f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.ApproachEnvelopeM))"
+                ValueChanged="@((float value) => Plugin.HandleAction("approachEnvelopeM", value))" />
+        <Slider Title="动态包络安全边 (m)"
+                Description="从缺口横向净宽反推包络时每侧预留的安全边：生效外扩 = clamp((净宽 − 车宽)/2 − 此值, 0.05, 0.30)。实测驾校侧方缺口净宽 3.24 m、手填车宽 2.60 m → 默认 0.10 得 0.22 m/侧。省下来的都是跟踪误差预算。"
+                Min="@(0f)" Max="@(0.30f)" Step="@(0.01f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.SafetyMarginM))"
+                ValueChanged="@((float value) => Plugin.HandleAction("safetyMarginM", value))" />
+        <Slider Title="停稳判定 (s)"
+                Description="到达目标后需要连续保持静止多少秒才算停稳，之后才重新解析下一个标记（多腿衔接）或宣告完成。它只决定「什么时候算到位」，不会自己暂停或中止动作——结束动作仍然只有热键。"
+                Min="@(1f)" Max="@(10f)" Step="@(0.5f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.SettleTimeS))"
+                ValueChanged="@((float value) => Plugin.HandleAction("settleTimeS", value))" />
+        <Slider Title="起步置信度门槛"
+                Description="目标解析置信度低于此值拒绝起步（0.9 = 标记对，0.6 = 车间隙，0.4 = 手动存点），只在起步时门控，不会中止在跑的机动。注意默认 0.6 会把「手动存点」那一档挡在外面：要用已存点请把它降到 0.4，或直接关掉上面的跟随开关回到旧流程。"
+                Min="@(0f)" Max="@(1f)" Step="@(0.05f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.MinConfidence))"
+                ValueChanged="@((float value) => Plugin.HandleAction("minConfidence", value))" />
+        <Slider Title="起步气压门槛 (bar)"
+                Description="低于此气压制动踏板物理无效（行车制动走气路），所以拒绝实车起步。只在起步时检查一次，仅门控，不会中止在跑的机动。0 = 关掉这一项。"
+                Min="@(0f)" Max="@(10f)" Step="@(0.5f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.MinAirBar))"
+                ValueChanged="@((float value) => Plugin.HandleAction("minAirBar", value))" />
+        <Slider Title="标记移动重规划阈值 (m)"
+                Description="执行中当前 0xC17 标记的位移超过此值则就地重规划。重规划是继续动作，不是暂停也不是中止。调小会更早跟上新标记，但更容易用完「重算次数上限」——用完后退回定死路线继续跑，仍然只有热键能结束。"
+                Min="@(0.1f)" Max="@(5f)" Step="@(0.1f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.MarkerMoveToleranceM))"
+                ValueChanged="@((float value) => Plugin.HandleAction("markerMoveToleranceM", value))" />
+
         <Separator Label="可视化" />
         <Switch Title="平面地图窗口"
                 Description="在 ETS2LA 悬浮层里显示 AutoParking Map 窗口，点选车位就在这里。点选时需要按住 RightAlt 进入交互模式。"

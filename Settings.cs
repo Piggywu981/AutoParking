@@ -261,6 +261,109 @@ public sealed class AutoParkingSettings
     public double SavedSpotZ { get; set; }
     public double SavedSpotHeadingRad { get; set; }
 
+    // Marker-following auto-park. Defaults and clamp ranges come from spec §6 of
+    // docs/superpowers/specs/2026-10-19-universal-autoparking-design.md. Nothing reads these yet:
+    // the consumers arrive with the target-resolution wiring later in the same plan, so until then
+    // this is inert configuration and the current maneuver behaves exactly as before.
+
+    /// <summary>
+    ///  Run the whole chain - resolve the game's marker, plan, draw the target pose and the route on
+    ///  the map - while sending no control commands at all: the effective dry-run flag becomes
+    ///  <see cref="DryRun"/> || this. On by default, because the marker protocol is new and the first
+    ///  passes are meant to be watched rather than driven; letting the truck move is the explicit act
+    ///  of turning this off. Shadow mode neither pauses nor aborts anything - only the hotkeys end a
+    ///  maneuver - it only withholds the pedals, the wheel, the gearbox and the handbrake.
+    /// </summary>
+    public bool ShadowMode { get; set; } = true;
+
+    /// <summary>
+    ///  Resolve where the game wants the truck parked from the runtime memory items (0xC17 mover pair
+    ///  → framing-vehicle gap → <see cref="SavedSpotX"/>) instead of demanding a map pick. Off
+    ///  restores the previous behavior outright: no picked spot means the start is refused, which is
+    ///  how the manual workflow stays reachable. With it on, a hand-picked spot is still only taken
+    ///  when <see cref="MinConfidence"/> lets the 0.4 tier through.
+    /// </summary>
+    public bool AutoParkByMarker { get; set; } = true;
+
+    /// <summary>
+    ///  Path to the sidecar executable that reads the game process for the identity channel. Empty
+    ///  means MemoryProbe.exe next to the plugin DLL. JSON-only knob on purpose: the host settings
+    ///  page ships Slider/Switch/Dropdown and has no text input, so there is no control to add and
+    ///  no HandleAction case (it would be unreachable). Edit AutoParking.json; documented in README.
+    /// </summary>
+    public string SidecarPath { get; set; } = "";
+
+    /// <summary>
+    ///  Process name the sidecar is pointed at. It defaults to amtrucks, so ETS2 has to be named
+    ///  explicitly. JSON-only for the same reason as <see cref="SidecarPath"/>: no text-input
+    ///  component exists on the settings page, hence no control and no HandleAction case by design.
+    /// </summary>
+    public string GameProcessName { get; set; } = "eurotrucks2";
+
+    /// <summary>
+    ///  On the reverse leg, size the obstacle envelope from the measured lateral clear of the
+    ///  framing-vehicle gap (see <see cref="SafetyMarginM"/>) instead of the fixed per-side padding,
+    ///  which is a highway number and rejects every route in a 3.4 m bay (§53). Off keeps both legs
+    ///  on the fixed values.
+    /// </summary>
+    public bool DynamicEnvelope { get; set; } = true;
+
+    /// <summary>
+    ///  Per-side envelope used on the wide-lane approach leg: the corridor check sweeps
+    ///  VehicleWidthM + 2*this there, so this is a stand-in for EnvelopePadM + ObstacleMarginM and
+    ///  does not add to them. 0.30/side is only sane where the lane is visibly much wider than the
+    ///  truck; narrow aisles need the measured value, which is what the reverse leg uses.
+    /// </summary>
+    public double ApproachEnvelopeM { get; set; } = 0.30;
+
+    /// <summary>
+    ///  What is still reserved per side when the reverse-leg envelope is back-computed from the gap:
+    ///  pad = clamp((lateral clear - VehicleWidthM)/2 - this, 0.05, 0.30). Measured lateral clear of
+    ///  the practice-course gap is 3.24 m, so with the typed 2.60 m width the default 0.10 yields
+    ///  0.22 m/side. Raising it eats the tracking-error budget; the floor of 0 means "trust the
+    ///  measurement with nothing left over", which is only defensible at crawling speed.
+    /// </summary>
+    public double SafetyMarginM { get; set; } = 0.10;
+
+    /// <summary>
+    ///  How long the truck has to stay stationary at the target before the leg counts as settled -
+    ///  only then is the next marker resolved (multi-leg chaining) or the maneuver declared done.
+    ///  It decides when something is considered arrived and nothing else: it never pauses or aborts,
+    ///  and ending a maneuver stays the job of the hotkeys.
+    /// </summary>
+    public double SettleTimeS { get; set; } = 3.0;
+
+    /// <summary>
+    ///  A resolved target below this confidence refuses the start (refusal to start, never an abort -
+    ///  see the project policy that only hotkeys end a maneuver). The tiers are fixed in TargetResolver:
+    ///  0.9 mover pair, 0.6 framing-vehicle gap, 0.4 saved spot. The 0.6 default therefore excludes
+    ///  the saved-spot tier: drop it to 0.4 to let a hand-picked spot through the marker path, or
+    ///  turn <see cref="AutoParkByMarker"/> off to keep the old pick-only flow untouched.
+    /// </summary>
+    public double MinConfidence { get; set; } = 0.6;
+
+    /// <summary>
+    ///  The service brake runs on an air circuit, so below this pressure a brake demand is physically
+    ///  inert (§24: read air= before concluding a brake did nothing). Starting a parking maneuver we
+    ///  cannot stop is the only thing this guards, and it is checked once at start - it does not
+    ///  watch a running maneuver. 0 turns the check off.
+    /// </summary>
+    public double MinAirBar { get; set; } = 4.0;
+
+    /// <summary>
+    ///  While a marker-following leg executes, if the 0xC17 marker we planned to has moved more than
+    ///  this, the leg is re-planned in place. Re-planning continues the maneuver; it does not pause
+    ///  or end it. Small values churn through <see cref="MaxReplans"/> (which then falls back to the
+    ///  frozen route, still running), large ones let the truck chase a stale target.
+    /// </summary>
+    public double MarkerMoveToleranceM { get; set; } = 0.5;
+
+    /// <summary>
+    ///  Shallow copy, used to hand the settings writer and the per-leg config a snapshot. The clamp
+    ///  range of every key above lives in <see cref="Clamp"/> rather than in the setters, so a clone
+    ///  is NOT re-normalized: whatever mutates a clone (the per-leg overrides do) has to keep its own
+    ///  explicit Math.Clamp on the values it writes, or the copy escapes its documented range.
+    /// </summary>
     public AutoParkingSettings Clone() => (AutoParkingSettings)MemberwiseClone();
 
     public double EffectiveMapPixelsPerMeter => Math.Clamp(MapScalePxPerM * MapZoom, 0.25, 6.0);
@@ -314,6 +417,12 @@ public sealed class AutoParkingSettings
 
         ObstacleMarginM = Math.Clamp(ObstacleMarginM, 0.05, 1.5);
         EnvelopePadM = Math.Clamp(EnvelopePadM, 0.0, 1.0);
+        ApproachEnvelopeM = Math.Clamp(ApproachEnvelopeM, 0.05, 0.50);
+        SafetyMarginM = Math.Clamp(SafetyMarginM, 0.0, 0.30);
+        SettleTimeS = Math.Clamp(SettleTimeS, 1.0, 10.0);
+        MinConfidence = Math.Clamp(MinConfidence, 0.0, 1.0);
+        MinAirBar = Math.Clamp(MinAirBar, 0.0, 10.0);
+        MarkerMoveToleranceM = Math.Clamp(MarkerMoveToleranceM, 0.1, 5.0);
         ObstacleLookaheadM = Math.Clamp(ObstacleLookaheadM, 1.5, 15.0);
         MaxReplans = Math.Clamp(MaxReplans, 0, 8);
 
