@@ -2529,7 +2529,39 @@ flags 从来不当识别依据（§50 已经写过这条），它只是"在这�
 Task 8 之前那条 CS8629 是可空流改写带来的合法消失，不是被压制）。**已知边界**：`ParkingBays` 仍只认世界
 轴向的排（§50），斜车位静默不报；`Trigger` 依旧不拦路。
 
-**部署**：`bin\Release\AutoParking.dll` 与 `MemoryProbe.exe` 已拷入 `current\Plugins\`（2026-10-20），
+**影子的含义（写清楚，否则清单会自相矛盾）**：影子模式**什么都不发**——车要你自己开到检查点，
+插件只负责解析、规划和画图。清单里的"开到 stopmid 停稳"是给车主自己开的动作，不是插件会替你做的事。
+
+**终审修复轮**（同一分支，4 个 Critical + 4 个 Important，全部离线可断言）：四条 Critical 都是
+"合起来正好把整条链路堵死"的缺陷——
+
+1. **0xC17 对自身的盒子把第一腿堵死**。`MemKind.Mover` 在拦路白名单里，而解析出来的目标是这对
+   Mover 的**中点**，于是目标落在两个 8.75/7.94 m 的盒子里；冲突判据只豁免首 2 m / 末 1 m，清不掉
+   4.4 m 的半盒，默认设置下 leg 1 永远 `Ok=false`。修复：`MemClassifier.IsParkingMarker(type, flags)`
+   （0x09 且 flags 覆盖 0xC17），`BlocksMemoryRoutes` 收 type/flags 并为它返回 false；普通 Mover
+   （0x417）照旧拦路。
+2. **`KdopReader` 找不到 ETS2**。进程名表写着 `eurotrucks`，而 `Process.GetProcessesByName` 是
+   **精确匹配**，ETS2 的进程是 `eurotrucks2`——快照永远为空，标记解析、车位识别、内存障碍、车体
+   自动标定全部静默失效。修复：表里加 `eurotrucks2`，并在常量旁写明"精确匹配，别把名字改短"。
+3. **部署的 sidecar 起不来**。`MemoryProbe.csproj` 是 `SelfContained=false`，exe 只是 apphost；
+   只拷 exe 时子进程报"找不到框架/DLL"。修复：csproj 拷四个文件（apphost + dll + runtimeconfig +
+   deps），部署同样四个；用假进程名跑部署后的 exe，能走到探针自己的 `process '…' not running` 才算过。
+4. **framing 缺口档是世界范围且偏好最宽**。整个快照参与解析、`gaps[0]` 取最宽，于是任何地方的停放
+   排都能压过本地排，存点档几乎不可达，`TryNextMarkerLeg` 还可能把腿开去远处的库。修复：只取车附近
+   **80 m**（规划器最长候选 = 2×30+12 = **72 m**，按默认值）内的条目，并按离车**最近**取缺口、最宽
+   只做平手裁决。
+
+Importants：库内豁免原来连**停放车**一起豁免（占用中的库看起来是空的）→ 只有
+`IsBayFurniture`（锥桶/施工板/Mover）可豁免；被拒的接续腿原来播报"泊车完成"→ 改为警告
+"已在检查点结束：下一腿无可行路线（见日志）"，刹车交还不变；影子清单自相矛盾 → 见上；出处（provenance）
+原来只进日志 → 状态表"目标车位"行与 AR 立杆都画出 `目标 <provenance> conf=0.00`（spec §4.6）。
+
+**修复轮验证**：harness **154 → 156 ✓**（新增"最近缺口胜过远处更宽"与"只有远处缺口时退到存点"两条，
+四次变异——标记谓词恒 false、按最宽排序、去掉 80 m 窗口、把停放车算作库内家具——各翻一条 ✗），
+三条固定 ✗ 逐字不变；构建 0 error / 12 distinct warning。
+
+**部署**：`bin\Release\AutoParking.dll` 与 sidecar 的**四个文件**（`MemoryProbe.exe` /
+`MemoryProbe.dll` / `.runtimeconfig.json` / `.deps.json`）已拷入 `current\Plugins\`（2026-10-20 修复轮后），
 **需重启宿主**（插件是影子复制加载的）。另外，§45/§46/§52 里引用的 `conflicts=` 是 `Tools\RouteSearch`
 的光栅读数，而任务 3 改了分排之后它的障碍集已经不同（> 22 m 的空档现在会被切开）——那些数在重跑之前
 **不能再引用**。
@@ -2539,8 +2571,9 @@ Task 8 之前那条 CS8629 是可空流改写带来的合法消失，不是被�
 1. **影子跑**（`ShadowMode=true`，默认）：book1_2_09 全程是否两腿、目标出处是否正确、规划线肉眼是否
    可接受、日志里腿数是否 1→2。
 2. **有停放车时的进库腿实际结局**：0/27 是**默认 6.5 m 车体**的离线数。实车开着 `AutoCalibrateBody`
-   会换成实测 8.43 m 车体，包络随之变化，进库腿可能从"能解"变成"拒绝起步"。被拒绝是安全侧，但必须
-   记下实际是哪一种，并确认拒绝原因是冲突而不是别的门。
+   会换成实测 8.43 m 车体，包络随之变化，进库腿可能从"能解"变成"被拒"。**这个拒绝发生在接近腿走完
+   之后的检查点，不是起步时**（接续腿没有可行路线就停在检查点，警告"已在检查点结束"，不会谎报完成）；
+   必须记下实际是哪一种，并确认拒绝原因是冲突而不是别的门。
 3. **气压字段的单位**：熄火与运转两种状态下并排打印 `air=` 与 `airPressureEmergency`，`MinAirBar` 才
    敢从 0（关闭）挪走；在此之前它只是一个默认关闭的可调门槛，真正在跑的是 `HasBrakeAir()`。
 

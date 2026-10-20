@@ -68,13 +68,17 @@ transmission) / braking / steering** to back the tractor into the spot.
    ```
    dotnet build Tools/MemoryProbe -c Release
    ```
-   The plugin's build then copies `MemoryProbe.exe` from
-   `Tools\MemoryProbe\bin\Release\net10.0\win-x64\` beside `AutoParking.dll`, and both files are
-   deployed together. It is optional in the literal sense: without it the plugin still starts and still
-   follows the marker using geometry alone, but it loses the **identity strings** — nothing can confirm
-   that the vehicle it treats as "parked" is really `academy.parked.truck`, or that a trigger is the
-   parking trigger. A missing exe is announced by a build warning and by one startup log line; the
-   identity channel reports itself as degraded rather than failing the maneuver.
+   The plugin's build then copies **four** files from
+   `Tools\MemoryProbe\bin\Release\net10.0\win-x64\` beside `AutoParking.dll` — `MemoryProbe.exe`,
+   `MemoryProbe.dll`, `MemoryProbe.runtimeconfig.json` and `MemoryProbe.deps.json` — and all four are
+   deployed together. The exe is only the apphost: on its own it cannot start, because the probe is
+   built `SelfContained=false` and loads the runtime and the app from the other three. It is optional
+   in the literal sense: without it the plugin still starts and still follows the marker using
+   geometry alone; what is lost is the sidecar's one log line confirming the stop-zone trigger
+   (`state park_trigger_on_stopped`). "Parked vehicle" is decided from the item type and flags, not
+   from an identity string, so marker following works either way. A missing exe is announced by a
+   build warning and by one startup log line; the identity channel reports itself as degraded rather
+   than failing the maneuver.
 
 Dependencies: the plugin references `ETS2LA.*.dll`, `TruckLib*.dll`, and `Hexa.NET.ImGui.dll`
 under `current\` directly, so it **must live in the same install tree as the ETS2LA host**.
@@ -184,8 +188,16 @@ place. Re-planning continues a maneuver; it is not a pause and not an abort.
 
 **Shadow mode is on by default and sends nothing.** It runs the whole chain — resolve, plan, draw the
 target and the route on the map — and publishes no throttle, brake, steering, gear or handbrake
-command. Commands flow only when **both** Dry-run and Shadow mode are off; turning Shadow mode off
-while Dry-run is still on moves nothing.
+command. **Shadow sends nothing — drive the truck to the checkpoint yourself; the plugin only
+resolves, plans and draws.** Commands flow only when **both** Dry-run and Shadow mode are off;
+turning Shadow mode off while Dry-run is still on moves nothing.
+
+Which tier chose the pose is drawn, not only logged (spec §4.6): the "目标车位" status row ends with
+`目标 <provenance> conf=0.00` (e.g. `目标 mover-pair:0x… conf=0.90`, or `目标 saved-spot（手选）`),
+and the AR pole prints the same line above the distance. Tier 2 only considers parked rows within
+80 m of the truck and prefers the nearest gap, so a roomy row elsewhere in the map can no longer
+outrank the one you are standing at — which is also what makes the map-pick fallback (0.4) reachable
+when there is no local row at all.
 
 Start gates (refusals, checked once when you press the key — never a mid-maneuver interruption):
 no target from any tier of the resolver, trailer attached (`RefuseWithTrailer`), a route the planner
@@ -216,9 +228,11 @@ These are measured or reasoned, not hedged. Read them before trusting the featur
   only as `0x2F Hookup` items, so they used to be invisible to the planner. With the measured academy
   scene, the same route scores **0 conflicts without the framing trucks and 27 with them**, at the
   **default 6.5 m body**. The honest outcome is that an insert leg can now be *refused* rather than
-  driven through a truck — and that number belongs to the default body: a live run with
-  `AutoCalibrateBody` on swaps in the measured 8.43 m body, which changes the envelope and can change
-  whether a route resolves.
+  driven through a truck — and that refusal lands **after** the approach leg, at the checkpoint, not
+  at start: the maneuver ends with the warning "已在检查点结束：下一腿无可行路线（见日志）" instead of
+  claiming success. The 0/27 number belongs to the default body: a live run with `AutoCalibrateBody`
+  on swaps in the measured 8.43 m body, which changes the envelope and can change whether a route
+  resolves.
 - **`MinAirBar` ships as 0 / disabled, and its unit is unresolved in this repo.** The two call sites
   that print `truckFloat.airPressure` call it bar; a constant read off the same field is named psi; and
   this repo's own logs read 114–123 in it. Only the shipped `HasBrakeAir()` check (against the game's
@@ -250,17 +264,17 @@ These are measured or reasoned, not hedged. Read them before trusting the featur
 | | `TerminalStraightM` | 1.5 | Length of the straight leg driven into the spot. An arc only reaches the correct heading at its very end, so stopping 0.35 m short leaves the bay turned by exactly that much |
 | | `PathSampleM` | 0.25 | Path sampling step |
 | Tolerance | `ToleranceLateralM` / `ToleranceHeadingDeg` | 0.20 / 4.0 | What counts as "in place" |
-| | `ObstacleMarginM` | 0.5 | Per-side dynamic margin of the obstacle envelope |
-| | `EnvelopePadM` | 0.25 | Per-side base padding of the obstacle envelope. Width = `VehicleWidthM` + 2×(this + `ObstacleMarginM`) = **4.1 m** by default on the 2.6 m default width (§46 wrote 4.0 m from a 2.5 m body - §51). Tight practice-course bays: 0.05 + margin 0.2 → 3.1 m, or 2.96 m once the width is measured from the wheels |
+| | `ObstacleMarginM` | 0.05 | Per-side dynamic margin of the obstacle envelope |
+| | `EnvelopePadM` | 0.05 | Per-side base padding of the obstacle envelope. Width = `VehicleWidthM` + 2×(this + `ObstacleMarginM`) = **2.8 m** on the typed 2.6 m width (length 6.5 + 0.1 + 0.2 = 6.8 m). With `AutoCalibrateBody` on (the default) the measured 2.47 m body gives 2.67 × 8.73 m, which leaves ~0.38 m/side in the 3.44 m practice-course bay mouth. The two defaults were lowered from §46's 0.25/0.5 (and from its recommended 0.05 pad + 0.2 margin) to 0.05/0.05 by §51, after the ATS course sweep showed the wider box refused every route (§51, design doc §53) |
 | | `ObstacleLookaheadM` | 4.0 | Only conflicts this far ahead stop the truck. Note the swept footprint is ~8 m long, so a blocker registers about 7.5 m out regardless of this number |
 | Re-planning | `ReplanWhileStopped` | true | Re-solve the route **only while the vehicle is stopped** — at a gear change, after 2 s held by a blocker, or when the distance to the spot starts growing instead of shrinking (a second-segment correction). Never mid-drive: a new route shares the pose but not the arc length, and the progress estimator cannot tell the two references apart |
 | | `MaxReplans` | 3 | Cap on swaps; after it the route is frozen again. Hitting the cap does **not** abort — only the hotkey ends the maneuver |
 | Finish | `HandbrakeOnFinish` / `RestoreAssistsOnFinish` | true | Apply handbrake and restore driver assists on completion |
 | Visualization | `MapScalePxPerM` / `MapZoom` / `MapViewRadiusM` / `SnapToNavCurve` | 1.25 / 1.0 / 120 / true | |
 | | `LockMapWindow` | false | Freeze the map panel's rect while picking (§8) |
-| | `ShowMemoryItems` | true | Draw runtime-spawned cones, read read-only from the game process (§41/§42) |
-| | `BlockRouteWithMemoryItems` | true | Feed memory items (cones/boards/movers/buildings) into the planner's obstacle set - routes avoid them or the start is rejected (§43). Failure mode unchanged: a fully blocked lot falls back to the frozen route after MaxReplans; only the hotkey ends that |
-| | `SnapToParkingBay` | true | Read the game's parking bay out of the cone layout (two facing rows, capped at one end, open at the other), draw it, snap a pick inside it to the bay centre with the nose pointing in through the opening - and stop treating anything **inside** the bay as an obstacle, because the bay's own markings are two 8×8 m movers that otherwise refuse the very spot the job asks for (§50). The wall cones stay obstacles: the test is inset by 0.6 m |
+| | `ShowMemoryItems` | true | Draw runtime-spawned cones, boards, movers, buildings and parked vehicles, read read-only from the game process (§41/§42) |
+| | `BlockRouteWithMemoryItems` | true | Feed memory items (cones/boards/movers/buildings/parked vehicles) into the planner's obstacle set - routes avoid them or the start is rejected (§43). The game's own `0xC17` parking-marker pair is exempt: those boxes are the aim point, not objects. Failure mode unchanged: a fully blocked lot falls back to the frozen route after MaxReplans; only the hotkey ends that |
+| | `SnapToParkingBay` | true | Read the game's parking bay out of the cone layout (two facing rows, capped at one end, open at the other), draw it, snap a pick inside it to the bay centre with the nose pointing in through the opening - and stop treating the bay's **own furniture** inside it as an obstacle (cone rows, boards, the two 8×8 m movers), because those otherwise refuse the very spot the job asks for (§50). A parked vehicle inside the bay is NOT exempt: an occupied bay stays occupied. The wall cones stay obstacles either way: the test is inset by 0.6 m |
 | | `ConfirmedCorridorHalfWidthM` | 5.0 | How far a nav curve or lane vouches for the ground beside it (§6.6) |
 | | `ArGroundTrimM` | 0.0 | AR ground trim (manual offset beyond the wheel-contact-point estimate) |
 

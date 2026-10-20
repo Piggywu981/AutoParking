@@ -139,8 +139,8 @@ SettingsPage 加对应控件（镜像现有滑杆/开关风格）。
 
 ## 10. 部署
 
-- sidecar 部署：`AutoParking.csproj` 加一个 build 后 Target——若 `Tools\MemoryProbe\bin\Release\net10.0\win-x64\MemoryProbe.exe` 存在就拷进插件输出目录（找不到只警告不报错，裸 clone 不带预编译 exe 时插件降级纯几何模式照样能编能跑）。`build_all.ps1` 不用改。
-- 按"改完即部署"惯例：插件源码改动 → `dotnet build -c Release` → DLL 拷 `current\Plugins\`（重启 ETS2LA 生效）。
+- sidecar 部署：`AutoParking.csproj` 加一个 build 后 Target——若 `Tools\MemoryProbe\bin\Release\net10.0\win-x64\MemoryProbe.exe` 存在就把它和 `MemoryProbe.dll`、`MemoryProbe.runtimeconfig.json`、`MemoryProbe.deps.json` **四个文件**一起拷进插件输出目录（找不到只警告不报错，裸 clone 不带预编译 exe 时插件降级纯几何模式照样能编能跑）。只拷 exe 不行：探针是 `SelfContained=false` 构建的，exe 只是 apphost。`build_all.ps1` 不用改。
+- 按"改完即部署"惯例：插件源码改动 → `dotnet build -c Release` → DLL 连同四个 sidecar 文件拷 `current\Plugins\`（重启 ETS2LA 生效）。
 
 ## 11. 明确不做
 
@@ -160,9 +160,12 @@ SettingsPage 加对应控件（镜像现有滑杆/开关风格）。
 | `:84` | "`ShadowMode=false` 需在 SettingsPage 显式关" | 生效门是**合取** `DryRun \|\| ShadowMode`：两个开关都关掉才发命令 | `DryRun` 默认 true；只关影子模式车不会动。三处输出点共用 `DryRunActive`（Task 8） |
 | `:68`、`:103` | sidecar 路径默认"插件 DLL 同目录" | **候选链**：显式 `SidecarPath` → `<宿主 exe 目录>\Plugins\MemoryProbe.exe` → 插件自身目录（`AppContext.BaseDirectory`），每一条都连同"存不存在"写日志 | R7：宿主只把 DLL 影子复制进 `%TEMP%\ETS2LA\PluginShadow\<name>_<guid>\`，运行时 DLL 目录里没有 exe |
 | `:109` | `MinAirBar` 默认 4.0 | 默认 **0（关闭）**，夹取 `[0, 200]` | 该字段单位在本仓库没有定论（两个调用点按 bar 打印、一个常量命名为 psi、日志读数 114–123）。单位安全的是 `HasBrakeAir()`，与 `MinAirBar` 是两道互相独立的起步拒绝 |
+| `:57` | framing 缺口"依赖修好的 `ParkingBays.Detect`" | 实际**不调用** `ParkingBays`：缺口由停放车 Hookup 排自己配对得出（同 Y 带内相邻两台，净长 ≥ 车长 + 0.4）；车位识别只用于吸附选点和豁免库内家具。解析链还加了**车附近 80 m 窗口 + 取最近缺口**（规划器最长候选 72 m，按默认值算） | 60 行级的解析器不需要锥排：驾校缺口本来就是停放车 kdop 之间算出来的；世界级快照会让别处更宽的排压过本地排，使存点档不可达 |
 
 两处已在实现时就地改过（不在本表内）：`:82` 的气压门原写作 `>`，与"0 = 关闭"自相矛盾，Task 6 改成
-严格 `<` 的拒绝式（R37）；`§4.5` 的 `MinGapOverTruckM` 在计划里写成 1.0，实现取 0.4（R2，见计划文的
+严格 `<` 的拒绝式（R37）；`:142` 的 sidecar 部署从"拷一个 exe"改为"四个文件"，因为探针是
+`SelfContained=false`，部署目录里只有 exe 时子进程起不来（2026-10-20 实测）；`§4.5` 的
+`MinGapOverTruckM` 在计划里写成 1.0，实现取 0.4（R2，见计划文的
 "Superseded during execution"）。
 
 实现位置：`AutoParkingPlugin.ValidateStart`（两道路径、置信度门的出处前缀）、

@@ -914,7 +914,7 @@ if (settings.AutoParkByMarker && activeMarkerUid != 0 && DateTime.UtcNow >= next
 - [ ] **Step 9: 验证（三层）**
 1. `dotnet build -c Release` → 0 错误。
 2. `dotnet run --project Tools/PlannerHarness -c Release` → exit 1、✓ ≥151、三条固定 ✗ 原样。
-3. 影子实车清单（车主执行，写进提交信息）：游戏内驾校 book1_2_09 → `ShadowMode=true` → 主热键 → 地图上应出现目标点（出处=mover-pair）与规划线 → 开到 stopmid 停稳 → 3 s 后目标应跳到缺口（framing-gap 或新 mover-pair）→ 第二段规划线出现。全程方向盘不动（影子）。日志应有 `acquired ... conf=0.90 legs=1` → `leg 2 -> ...`。
+3. 影子实车清单（车主执行，写进提交信息）：游戏内驾校 book1_2_09 → `ShadowMode=true` → 主热键 → 地图上应出现目标点（出处=mover-pair）与规划线 → **影子不发任何指令，车要你自己开**：把车开到 stopmid 停稳 → 3 s 后目标应跳到缺口（framing-gap 或新 mover-pair）→ 第二段规划线出现。全程只有你在动车，插件只负责解析、规划和画图。日志应有 `acquired ... conf=0.90 legs=1` → `leg 2 -> ...`。
 
 - [ ] **Step 10: Commit**
 ```bash
@@ -985,5 +985,10 @@ git commit -m "docs: ship the sidecar probe, document marker following and the d
 | `:745` | sidecar 路径由 `AppContext.BaseDirectory` + `SidecarPath` 组成 | **候选链**：显式 `SidecarPath` → `<宿主 exe 目录>\Plugins\MemoryProbe.exe` → 插件自身目录，逐条记日志 | R7：宿主影子复制只带走 DLL，`AppContext.BaseDirectory` 是临时目录 |
 | `:754` | 气压门 = `if (realControl && !HasBrakeAir())` 一处 | **两道独立拒绝**：可调门槛 `air < MinAirBar`（仅当 `MinAirBar > 0`）+ `HasBrakeAir()`（游戏自己的应急阈值）；两条消息互不冒充 | R37/R41：`HasBrakeAir()` 比的是应急气压，不是本键；`MinAirBar=0` 时前者惰性、后者照常，这个不对称是对的 |
 | `:758` | 置信度门只写 `Confidence < MinConfidence` | **按出处判**：`saved-spot` 前缀豁免，其余档照旧 | R36：人自己选的位姿没有识别不确定性，0.6 默认下"退回存点"必须可用 |
-| `:916`、`:952` | `✓ ≥151` | **floor 是 154**（`✗` 仍是三条固定项） | R3：判据按**增量**核（131→137→143→144→147→152→154），绝对值只是当时的快照 |
+| `:916`、`:952` | `✓ ≥151` | **floor 是 154**（`✗` 仍是三条固定项）；修复轮后为 **156**（同一场景里多加两条"最近缺口/存点可达"判据） | R3：判据按**增量**核（131→137→143→144→147→152→154→156），绝对值只是当时的快照 |
+| `:766` | marker 获取条件是 `AutoParkByMarker && target == null` | 键在 **`markerTarget is null`**，`target` 不参与；完成/拒绝时清掉 marker 产出的 `target`（手选点保留） | R45：`target` 会活过一次动作，按它判会让每次之后的起步都跳过解析与置信度门 |
+| `:842` | 每腿都克隆 `legCfg` 并写 `legSettings`（含手选车位） | 只有 marker 产出的位姿（出处不是 `saved-spot`）克隆包络；手选车位保留用户的 `EnvelopePadM`，且 `legSettings` 只在 `Replan` 提交时写、与 `planResult` 同生同灭 | R46：手选窄库位按接近腿包络放宽会被自己拒掉 |
+| `:863` | "标记是否没动"用 `uid 相同 && 位置差 ≤ 容差` | 只比**位置**（`Vector2.Distance ≤ MarkerMoveToleranceM`），不比 uid | R4 的存点兜底会把已退休的标记解析到当前位姿：uid 判定把"没动"误报成新腿，"无可行路线"的 Warn 指向了错误的原因 |
+| `:917` | 影子清单同时写"全程方向盘不动（影子）"和"开到 stopmid 停稳" | 影子**什么都不发**，清单改为"车要你自己开到检查点，插件只解析、规划、画图" | 自相矛盾：影子连油门刹车都不发，不可能自己开到检查点 |
+| `:955` | 部署只拷 `AutoParking.dll` 与 `MemoryProbe.exe` | 拷 DLL + **四个** sidecar 文件（exe/dll/runtimeconfig/deps） | 探针是 `SelfContained=false`，只有 exe 时子进程起不来（2026-10-20 实测） |
 
