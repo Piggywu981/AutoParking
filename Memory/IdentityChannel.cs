@@ -5,7 +5,6 @@ using System.Globalization;
 using System.IO;
 using System.Numerics;
 using System.Text;
-using System.Threading;
 using System.Threading.Tasks;
 
 namespace AutoParking;
@@ -18,9 +17,10 @@ namespace AutoParking;
 ///  but a runtime <c>kdop_item_t</c> carries no name — the identity strings (<c>academy.parked.truck</c>,
 ///  <c>state park_trigger_on_stopped</c>) only appear in the bytes its own fields point at, and
 ///  collecting them takes the 0.3–0.6 s a full <c>Tools\MemoryProbe --deep-tsv</c> walk needs (design doc
-///  §38/§41, Task 4). That is three orders of magnitude too slow for a tick, so the scan runs out of
-///  process, its machine-readable stdout is cached here, and <see cref="TryGet"/> hands the resolver a
-///  snapshot in microseconds.
+///  §38/§41, Task 4) — measured end to end at 0.88 s of wall clock for a 90 m window on 2026-10-20, once
+///  the child's own process start is included. That is 25–50 ticks of a 30 Hz follow loop, so the scan
+///  runs out of process, its machine-readable stdout is cached here, and <see cref="TryGet"/> hands the
+///  resolver a snapshot in microseconds.
 ///
 ///  What that costs, and the rule it buys: <b>TryGet never waits on a process.</b> A cold cache says
 ///  "warming up" and kicks a background refresh; a stale cache serves the previous result and refreshes
@@ -64,8 +64,10 @@ internal sealed class IdentityChannel : IDisposable
     ///  seconds, and the identity of an item sitting still does not change underneath us.</summary>
     private static readonly TimeSpan CacheTtl = TimeSpan.FromSeconds(5);
 
-    /// <summary>How long a child gets to answer before it is killed. The measured walk is 0.3–0.6 s,
-    ///  so 3 s is already 5× the slowest sample; past that the process is hung, not slow.</summary>
+    /// <summary>How long a child gets to answer before it is killed. Measured end to end on 2026-10-20,
+    ///  <c>eurotrucks2 --deep-tsv 2194 1804 90</c> (395 ITEM + 820 STR rows) cost 0.88 s of wall clock,
+    ///  .NET process start included, and the walk itself is the 0.3-0.6 s the comment above is about —
+    ///  so 3 s is already 3.4× the slowest real sample and past that the child is hung, not slow.</summary>
     private const int ProcessTimeoutMs = 3000;
 
     private readonly string _exePath;
@@ -130,9 +132,9 @@ internal sealed class IdentityChannel : IDisposable
 
             // --- Branch 2: we have data, but it is older than the TTL → serve the OLD data anyway and
             // refresh in the background. This is the branch that keeps a tick honest: the alternative,
-            // waiting for the probe, is a 0.3-0.6 s stall on the thread that claims the controls. The
-            // caller is not told anything is wrong, because the geometry it receives is real — at worst
-            // one bay behind, and the resolver treats identity as an enhancement either way.
+            // waiting for the probe, is the measured 0.88 s stall landing on the thread that claims the
+            // controls. The caller is not told anything is wrong, because the geometry it receives is
+            // real — at worst one bay behind, and the resolver treats identity as an enhancement anyway.
             if (entry is { Items: { Count: > 0 } stale })
             {
                 items = stale;
