@@ -81,6 +81,39 @@ internal static class ParkingBayChecks
                "两个锥桶不成排", "0 个");
         Report(ref failures, ParkingBays.Detect(Array.Empty<Vector2>()).Count == 0, "空输入不崩", "0 个");
 
+        failures += FarRowDoesNotPolluteNearBay();
+
+        return failures;
+    }
+
+    /// <summary>
+    ///  §54's miss, reproduced with the measured numbers: the sampled radius reaches a distant cone run
+    ///  that shares the lateral coordinates of the bay's own rows, so the band used to become one 58 m
+    ///  row, the overlap came out longer than MaxBayLengthM, and the near bay was reported as nothing.
+    ///  Rows are now segmented along the axis, so the 42 m empty gap ends a row. Each run keeps one wall
+    ///  a cone longer than the other: two equal rows are capped at both ends, which is a yard (asserted
+    ///  above) and no amount of row splitting turns a yard into a bay.
+    /// </summary>
+    private static int FarRowDoesNotPolluteNearBay()
+    {
+        int failures = 0;
+
+        List<Vector2> cones = new();
+        // 近处真库位：两条 X 向排，z=103.7 跨 10→18，z=100 跨 8→18（口朝 −X）
+        for (int i = 0; i < 5; i++) cones.Add(At(10 + i * 2, 103.7));
+        for (int i = 0; i < 6; i++) cones.Add(At(8 + i * 2, 100));
+        // 远排：同 z=100 与 z=103.7，x=60→68 / 60→70（42 m 空档，两条带上都是 42）
+        for (int i = 0; i < 5; i++) cones.Add(At(60 + i * 2, 103.7));
+        for (int i = 0; i < 6; i++) cones.Add(At(60 + i * 2, 100));
+
+        List<ParkingBay> bays = ParkingBays.Detect(cones);
+        bool near = bays.Exists(b => Math.Abs(b.Center.X - 14) < 0.5 && Math.Abs(b.Center.Y - 101.85) < 0.5);
+        bool distant = bays.Exists(b => Math.Abs(b.Center.X - 64) < 0.5 && Math.Abs(b.Center.Y - 101.85) < 0.5);
+
+        Report(ref failures, near && distant, "42 m 空档断排，近处库位仍可检出",
+               $"{bays.Count} 个（判据 2）· 近排 (14, 101.85) {(near ? "检出" : "漏判")} · " +
+               $"远排 (64, 101.85) {(distant ? "检出" : "漏判")}");
+
         return failures;
     }
 

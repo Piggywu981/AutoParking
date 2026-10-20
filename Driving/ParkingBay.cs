@@ -168,16 +168,33 @@ public static class ParkingBays
 
                 if (i - start >= MinConesPerRow)
                 {
-                    double minAlong = double.MaxValue, maxAlong = double.MinValue, sumPerp = 0;
+                    // Lateral proximity alone does not make one row: the sampled radius reaches cone runs
+                    // tens of metres past the bay, and merging them into a single span makes every bay
+                    // between them too long to be a bay. So the band is segmented along the axis first -
+                    // a gap wider than the longest bay ends the row - and each segment is judged on its own.
+                    List<(double along, double perp)> band = new();
                     for (int k = start; k < i; k++)
-                    {
-                        minAlong = Math.Min(minAlong, projected[k].along);
-                        maxAlong = Math.Max(maxAlong, projected[k].along);
-                        sumPerp += projected[k].perp;
-                    }
+                        band.Add(projected[k]);
+                    band.Sort((l, r) => l.along.CompareTo(r.along));
 
-                    if (maxAlong - minAlong >= MinRowSpanM)
-                        rows.Add(new Row(alongX, sumPerp / (i - start), minAlong, maxAlong, i - start));
+                    int seg = 0;
+                    for (int g = 1; g <= band.Count; g++)
+                    {
+                        if (g < band.Count && band[g].along - band[g - 1].along <= MaxBayLengthM)
+                            continue;
+
+                        if (g - seg >= MinConesPerRow)
+                        {
+                            double minAlong = band[seg].along, maxAlong = band[g - 1].along, sumPerp = 0;
+                            for (int k = seg; k < g; k++)
+                                sumPerp += band[k].perp;
+
+                            if (maxAlong - minAlong >= MinRowSpanM)
+                                rows.Add(new Row(alongX, sumPerp / (g - seg), minAlong, maxAlong, g - seg));
+                        }
+
+                        seg = g;
+                    }
                 }
 
                 start = i;
