@@ -28,10 +28,12 @@
     <Compile Include="TargetResolverChecks.cs" />
     <Compile Include="MemClassifierChecks.cs" />
     <Compile Include="IdentityChannelChecks.cs" />
+    <Compile Include="AutoParkControllerChecks.cs" />
     <Compile Include="$(PluginRoot)Geometry.cs" />
     <Compile Include="$(PluginRoot)Settings.cs" />
     <Compile Include="$(PluginRoot)Driving\ParkingBay.cs" />
     <Compile Include="$(PluginRoot)Driving\TargetResolver.cs" />
+    <Compile Include="$(PluginRoot)Driving\AutoParkController.cs" />
     <Compile Include="$(PluginRoot)Memory\MemClassifier.cs" />
     <Compile Include="$(PluginRoot)Memory\IdentityChannel.cs" />
     <Compile Include="$(PluginRoot)Driving\GroundTrust.cs" />
