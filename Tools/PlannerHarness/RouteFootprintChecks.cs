@@ -14,18 +14,34 @@ internal static class RouteFootprintChecks
         AutoParkingSettings settings = new();
         (double length, double width) = RouteFootprint.EnvelopeSize(settings);
 
-        bool sameAsCollision = Math.Abs(length - (settings.VehicleLengthM + 0.6 + 2 * settings.ObstacleMarginM)) < 1e-9
-                               && Math.Abs(width - (settings.VehicleWidthM + 0.5 + 2 * settings.ObstacleMarginM)) < 1e-9;
+        bool sameAsCollision = Math.Abs(length - settings.EnvelopeLengthM) < 1e-9
+                               && Math.Abs(width - settings.EnvelopeWidthM) < 1e-9;
         Report(ref failures, sameAsCollision, "包络=冲突判定用的那个包络",
             $"{length:0.00} × {width:0.00} m（和 CountCorridorConflicts 一致）");
+
+        // The §46 regression this guards: the footprint carried the pre-§46 constants (+0.6 / +0.5 and
+        // no EnvelopePadM), which happened to agree with the planner at defaults only. Tighten the pad
+        // for a practice course and the meter quietly reported a bigger box than the checker used.
+        AutoParkingSettings padTight = new() { EnvelopePadM = 0.05, ObstacleMarginM = 0.2 };
+        (double tightLength, double tightWidth) = RouteFootprint.EnvelopeSize(padTight);
+        Report(ref failures, Math.Abs(tightWidth - 3.1) < 1e-9 && Math.Abs(tightLength - 7.1) < 1e-9,
+               "收紧外扩后仪表与判据仍同包络", $"{tightLength:0.00} × {tightWidth:0.00} m（判据 7.10 × 3.10）");
 
         ParkingPath straight = Route(new Pose2(0, 0, 0), new Pose2(10, 0, 0), DriveDirection.Forward, settings);
         GroundTrust wide = Trust(-20, 20, 5.0, 120);
 
         RouteFootprint.Measure(straight, settings, wide);
-        double expected = (10.0 + length) * width;
-        Report(ref failures, straight.SweptAreaM2 >= expected * 0.85 && straight.SweptAreaM2 <= expected * 1.20,
-            "直线段占地≈长×宽", $"{straight.SweptAreaM2:0} m²（参照 {expected:0} m²，栅格量化允许 ±15/20%）");
+        // The rasteriser stamps 1 m cells at their centres, so a straight run's reported area is the
+        // analytic one quantised to whole cells on BOTH axes - up to one cell of error per side, in
+        // whichever direction the vehicle happens to sit. At the old 4.1 m envelope that was 2 %; at the
+        // §53 defaults (2.8 m) the same centre test drops a whole row and reports 1.9 m of effective
+        // width, so a percentage band is not the right bar here - a cell band is. The structural
+        // assertions above are what catch footprint and collision checker disagreeing.
+        double low = (10.0 + length - 1.0) * Math.Max(0.0, width - 1.0);
+        double high = (10.0 + length + 1.0) * (width + 1.0);
+        Report(ref failures, straight.SweptAreaM2 >= low && straight.SweptAreaM2 <= high,
+            "直线段占地≈长×宽",
+            $"{straight.SweptAreaM2:0} m²（允许 {low:0}…{high:0} m²，= ({10.0 + length:0.0}×{width:0.0}) ± 一格/边）");
 
         // Out and back over the same ground must not double-count: cell sets, not sums.
         ParkingPath thereAndBack = Route(new Pose2(0, 0, 0), new Pose2(10, 0, 0), DriveDirection.Forward, settings,

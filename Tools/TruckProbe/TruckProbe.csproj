@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Developer-only offline reader: it opens the game's own .scs archives and answers, from the files
+    rather than from a guess, what the truck actually is - which def unit, which model path, and what
+    bounding box that model carries. The plugin cannot read these at runtime cheaply, and "how big is
+    the truck" is a fact about the files, so it does not need the game running.
+
+    Under Tools\: the plugin .csproj carves Tools\ out of its default globs, and
+    ThirdPartyPlugins\build_all.ps1 only collects csproj files one level down.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>TruckProbe</AssemblyName>
+    <HostDir>..\..\..\..\ETS2LA-win-release-Portable\current\</HostDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="TruckLib.Core">
+      <HintPath>$(HostDir)TruckLib.Core.dll</HintPath>
+    </Reference>
+    <Reference Include="TruckLib.HashFs">
+      <HintPath>$(HostDir)TruckLib.HashFs.dll</HintPath>
+    </Reference>
+    <Reference Include="TruckLib.Models">
+      <HintPath>$(HostDir)TruckLib.Models.dll</HintPath>
+    </Reference>
+    <Reference Include="TruckLib.Sii">
+      <HintPath>$(HostDir)TruckLib.Sii.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>

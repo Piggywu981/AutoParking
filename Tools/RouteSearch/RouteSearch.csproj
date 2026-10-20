@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Developer-only prototype: Hybrid A* over the live scene dumped by Tools/MemoryProbe in viz mode.
+    Answers "why can't the analytic planner route around the cones" with a working search: the
+    plugin's Planner composes direct maneuvers between two fixed poses (straight / Reeds-Shepp /
+    two-leg) and cannot produce intermediate waypoints; Hybrid A* searches over intermediate
+    states, which is the textbook answer (Dolgov and Thrun 2008 to 2010; state-lattice planners)
+    and the de-facto standard in automated-parking stacks. Pure managed code, no game, no host DLLs.
+
+    Input: the TSV from MemoryProbe's viz mode (TRUCK line + ITEM lines).
+    Output: a route file (x, z, headingRad, gear) for the matplotlib plot, plus stats.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The bay reader, linked rather than referenced so the tool reports exactly what the plugin
+         would detect from the same cone positions. -->
+    <Compile Include="$(ProjectDir)..\..\Geometry.cs" />
+    <Compile Include="$(ProjectDir)..\..\Driving\ParkingBay.cs" />
+  </ItemGroup>
+
+</Project>

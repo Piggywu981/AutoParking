@@ -39,6 +39,12 @@ public sealed class MapGeometry
     public readonly List<Vector2[]> DriveableCurves = new();
 
     /// <summary>
+    ///  Parking bays read out of the cone layout (<see cref="ParkingBays"/>). Filled by the plugin
+    ///  once the memory snapshot is in, because cones only reach this far through game memory.
+    /// </summary>
+    public readonly List<ParkingBay> Bays = new();
+
+    /// <summary>
     ///  Ground geometry of every map item class that has any, one entry per item: a point for
     ///  single-node items, a segment for polyline items, a chain for path items, a closed ring for
     ///  polygon items. <see cref="StaticShape.Kind"/> is the map item type, so the renderer can tell
@@ -46,7 +52,14 @@ public sealed class MapGeometry
     /// </summary>
     public readonly List<StaticShape> StaticShapes = new();
 
-    public readonly record struct StaticShape(Vector2[] Points, string Kind, string Token, bool Collision, bool Closed);
+    /// <summary>
+    ///  <see cref="Label"/> is what the token resolves to through <see cref="MapItemIdentity"/>
+    ///  (锥桶/护栏/墙/… or 未分类). It is part of the shape rather than a side table because the
+    ///  renderer, the inventory line and the planner all have to agree on what an object is - and the
+    ///  planner may only block on a label it can name.
+    /// </summary>
+    public readonly record struct StaticShape(Vector2[] Points, string Kind, string Token, bool Collision, bool Closed,
+                                             string Label, bool Blocks);
 
     /// <summary>
     ///  Convex hull of a prefab's control nodes. The map publishes no footprint for a prefab, so this
@@ -145,6 +158,18 @@ public sealed class MapGeometryBuilder
     private readonly HashSet<string> prefabModelsWithoutDescriptor = new();
     private object? boundFileSystem;
 
+    /// <summary>
+    ///  Short code → what the object is. Fills incrementally (see <see cref="MapItemIdentity"/>); until a
+    ///  unit is known its items are drawn but never block, because an unnamed object is not evidence.
+    /// </summary>
+    private readonly MapItemIdentity identity = new();
+
+    /// <summary>Meters of curve length sampled per rebuild, so a depot full of barrier chains cannot stall the tick.</summary>
+    private const double MaxCurveSampledLengthM = 4000;
+
+    /// <summary>Files of /def/world/*.sii parsed per rebuild while the table is still filling.</summary>
+    private const int IdentityFilesPerBuild = 6;
+
     public MapData? FindMapData(out string status)
     {
         try
@@ -169,6 +194,7 @@ public sealed class MapGeometryBuilder
                 if (fileSystem != null && !ReferenceEquals(fileSystem, boundFileSystem))
                 {
                     PpdFileHandler.Current.SetFileSystem(fileSystem);
+                    identity.Bind(fileSystem);
                     boundFileSystem = fileSystem;
                 }
 
@@ -218,6 +244,10 @@ public sealed class MapGeometryBuilder
 
         try
         {
+            // Fill the identity table a bit at a time on every rebuild; the walk below labels whatever it
+            // already knows and leaves the rest unclassified rather than blocking the tick for ten seconds.
+            identity.Step(IdentityFilesPerBuild);
+
             // Within(minX, minZ, maxX, maxZ). The ground plane is carried as Vector2 (X, Z), so the
             // map's Z axis really is .Y here and .Y is not a height - every caller builds it as
             // new Vector2(coordinate.X, coordinate.Z). Nodes are the only spatially indexed map
@@ -235,6 +265,10 @@ public sealed class MapGeometryBuilder
             // Attached before any of the drawing work runs: if one odd road throws later, the
             // inventory of what was already walked is still the thing we came here to read.
             geometry.Probe = probe;
+
+            // Traffic and parked vehicles first: the static pass below appends to the same snapshot, and a
+            // named map object has to be able to block the route the way a parked trailer already does.
+            geometry.Obstacles = ObstacleScanner.Scan(center, radiusM);
 
             HashSet<Road> roads = new();
             HashSet<Prefab> prefabs = new();
@@ -257,8 +291,6 @@ public sealed class MapGeometryBuilder
                 AddPrefab(prefab, geometry);
                 AddPrefabOutline(prefab, geometry);
             }
-
-            geometry.Obstacles = ObstacleScanner.Scan(center, radiusM);
 
             // Same walk, same lists: the corridors drawn as navigation curves are what vouches for the
             // ground, and the items the map flags collidable take that voucher back. Read-only for now —
@@ -335,14 +367,28 @@ public sealed class MapGeometryBuilder
     /// <summary>
     ///  Counts one map item and pulls whatever is drawable out of it, then steps inside compounds.
     /// </summary>
-    private static void Visit(IMapObject? item, Node reachedVia, MapGeometry geometry, MapItemProbe probe,
-                              HashSet<ulong> staticTaken, bool nested)
+    private void Visit(IMapObject? item, Node reachedVia, MapGeometry geometry, MapItemProbe probe,
+                       HashSet<ulong> staticTaken, bool nested)
     {
         if (!MapItemSurface.Describe(item, out string itemType, out string? token, out bool collision))
             return;
 
-        probe.Add(item!.Uid, itemType, token, collision, MapItemSurface.GroundPosition(item, reachedVia), nested);
-        CollectShape(item, itemType, token, collision, geometry, staticTaken);
+        // The map only stores a short code (`dlc_fr_219`), and the code is not unique across classes -
+        // the same string is a barrier column as bld_model.*, a transformer as model.* and a building
+        // scheme as bld_scheme.*. The identity table resolves code + class to the model file, which is
+        // the only place the object's real name exists.
+        string label = "";
+        bool hard = false;
+        if (item is MapItem && !string.IsNullOrEmpty(token)
+            && identity.TryDescribe(itemType, token!, out string resolved, out _, out bool resolvesHard))
+        {
+            label = resolved;
+            hard = resolvesHard;
+        }
+
+        probe.Add(item!.Uid, itemType, token, collision, MapItemSurface.GroundPosition(item, reachedVia), nested,
+                  label.Length > 0 ? label : null);
+        CollectShape(item, itemType, token, collision, label, hard, geometry, staticTaken);
 
         // A compound keeps its children in its own dictionaries - CompoundSerializer fills
         // comp.MapItems/comp.Nodes and never the map's - so a walk that stops at the compound reports
@@ -360,14 +406,23 @@ public sealed class MapGeometryBuilder
 
     /// <summary>
     ///  Pulls the drawable ground geometry out of the item classes the probe only counts. Every one
-    ///  of these is reached twice (once from each end node), hence the UID set. Nothing collected
-    ///  here feeds the planner yet - 建筑线段和点位现在只是画出来给人看的.
+    ///  of these is reached twice (once from each end node), hence the UID set.
+    ///
+    ///  Anything allowed to block takes its footprint from the map's own k-DOP instead of a guessed
+    ///  size: the sector file already carries the box the game collides with, so a cone measures
+    ///  0.6 × 0.6 m here and nothing has to be invented. Unnamed or unreadable objects draw, never block.
     /// </summary>
-    private static void CollectShape(IMapObject item, string kind, string? token, bool collision,
-                                     MapGeometry geometry, HashSet<ulong> taken)
+    private void CollectShape(IMapObject item, string kind, string? token, bool collision, string label, bool hard,
+                              MapGeometry geometry, HashSet<ulong> taken)
     {
         if (SkippedShapeKinds.Contains(kind) || !taken.Add(item.Uid))
             return;
+
+        if (item is Curve curve)
+        {
+            CollectCurveInstances(curve, kind, token ?? "", collision, label, geometry);
+            return;
+        }
 
         if (!MapItemSurface.TryShape(item, out Vector2[]? points, out bool closed) || points == null)
             return;
@@ -378,8 +433,110 @@ public sealed class MapGeometryBuilder
             return;
         }
 
-        geometry.StaticShapes.Add(new MapGeometry.StaticShape(points, kind, token ?? "", collision, closed));
+        bool blocks = false;
+        if (collision && hard && points.Length == 1 && TryFootprint((MapItem)item, out Vector2[]? ring))
+        {
+            blocks = AddObstacle(geometry, ring!);
+        }
+
+        geometry.StaticShapes.Add(new MapGeometry.StaticShape(points, kind, token ?? "", collision, closed, label, blocks));
     }
+
+    /// <summary>
+    ///  One point per instance along a barrier / cone / prop chain. A Curve is a single map item whose two
+    ///  nodes can sit hundreds of meters apart while one model repeats between them, so drawing the
+    ///  endpoints rendered 76k barrier chains as one long straight line. The chain is walked through the
+    ///  item's own locator nodes as chords - the game uses a spline, so instances land slightly inside a
+    ///  bend. Chains are drawn here and deliberately not turned into obstacles yet: their per-instance
+    ///  width is not in the map file, only the box of the whole chain.
+    /// </summary>
+    private void CollectCurveInstances(Curve curve, string kind, string token, bool collision, string label,
+                                       MapGeometry geometry)
+    {
+        List<Vector2> path = new();
+        if (curve.Node != null)
+            path.Add(Geometry.ToPlane(curve.Node.Position));
+        foreach (INode? locator in curve.Locators)
+        {
+            if (locator != null)
+                path.Add(Geometry.ToPlane(locator.Position));
+        }
+        if (curve.ForwardNode != null)
+            path.Add(Geometry.ToPlane(curve.ForwardNode.Position));
+        if (path.Count < 2)
+            return;
+
+        float step = curve.Subcurves.FirstOrDefault(s => s != null)?.FixedStep ?? 0f;
+        if (step <= 0.05f)
+            step = token.Length > 0 ? identity.CurveStep(token) : 0f;
+        if (step <= 0.05f)
+            step = 2f;   // nothing says the spacing: two meters draws a plausible row without claiming precision
+
+        double length = 0;
+        for (int i = 0; i + 1 < path.Count; i++)
+            length += Geometry.Distance(path[i], path[i + 1]);
+
+        int instances = (int)Math.Clamp(length / step, 0, 400);
+        int emitted = 0;
+        for (int segment = 0; segment + 1 < path.Count && emitted < instances; segment++)
+        {
+            Vector2 from = path[segment];
+            Vector2 to = path[segment + 1];
+            double segmentLength = Geometry.Distance(from, to);
+            if (segmentLength < 0.001)
+                continue;
+
+            Vector2 direction = (to - from) / (float)segmentLength;
+            for (double along = 0; along < segmentLength && emitted < instances; along += step)
+            {
+                if (geometry.StaticShapes.Count >= MaxStaticShapes)
+                {
+                    geometry.StaticTruncated = true;
+                    return;
+                }
+
+                geometry.StaticShapes.Add(new MapGeometry.StaticShape(
+                    new[] { from + direction * (float)along }, kind, token, collision, true, label, false));
+                emitted++;
+            }
+        }
+    }
+
+    /// <summary>
+    ///  The item's own ground rectangle out of its k-DOP (see <see cref="MapItemSurface.TryGroundBox"/>).
+    ///  Refuses anything wider than 60 m: a box that large means the entry is an area (a whole building
+    ///  scheme, a long wall run) and fencing it in would fence off the lot being parked in.
+    /// </summary>
+    private static bool TryFootprint(MapItem item, out Vector2[]? ring)
+    {
+        ring = null;
+        if (!MapItemSurface.TryGroundBox(item, out Vector2 min, out Vector2 max))
+            return false;
+
+        if (max.X - min.X > 60 || max.Y - min.Y > 60)
+            return false;
+
+        ring = new[]
+        {
+            new Vector2(min.X, min.Y), new Vector2(max.X, min.Y),
+            new Vector2(max.X, max.Y), new Vector2(min.X, max.Y),
+        };
+        return true;
+    }
+
+    private static bool AddObstacle(MapGeometry geometry, Vector2[] ring)
+    {
+        if (geometry.Obstacles.Polygons.Count >= MaxStaticObstacles)
+        {
+            geometry.StaticTruncated = true;
+            return false;
+        }
+
+        geometry.Obstacles.Polygons.Add(ring);
+        return true;
+    }
+
+    private const int MaxStaticObstacles = 600;
 
     /// <summary>
     ///  A prefab's footprint, approximated as the convex hull of its control nodes: those are the only

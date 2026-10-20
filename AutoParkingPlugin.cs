@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
+using System.IO.MemoryMappedFiles;
 using System.Numerics;
 using ETS2LA.Backend.Events;
 using ETS2LA.Controls;
@@ -65,12 +66,34 @@ public sealed class AutoParkingPlugin : Plugin
     private ArOverlay? arOverlay;
 
     /// <summary>
+    ///  Reads the game's runtime-spawned map items (roadwork cones above all) from the game
+    ///  process on its own background task - never on this tick thread (§39/§40) and never on the
+    ///  render thread. Read-only, degrade-to-status-line by design; see Memory\KdopReader.cs.
+    /// </summary>
+    private KdopReader? kdopReader;
+
+    /// <summary>
     ///  Control terms for the last ~17 s of tracking. Owned by the plugin, written by the follower on
     ///  the tick thread, read by <see cref="controlPlot"/> on the overlay thread; the trace locks
     ///  itself so nothing here has to.
     /// </summary>
     private readonly ControlTrace controlTrace = new();
     private ControlPlot? controlPlot;
+
+    /// <summary>
+    ///  Last wheel layout read out of telemetry, plus the signature it was read from. The signature
+    ///  is what makes a truck swap in a garage show up as new data instead of a stale measurement.
+    /// </summary>
+    private string wheelbaseSignature = "";
+
+    /// <summary>
+    ///  Must never stay <c>default</c>: the record struct's reference member (Axles) is null in a
+    ///  default value, and StatusRows reads it unconditionally - opening the settings page before
+    ///  the first telemetry event crashed the host (hit for real 2026-10-16, both sessions in the
+    ///  log, always right after a restart). Invalid("尚未测量") carries an empty Axles list and a
+    ///  Reason the status table can show as-is.
+    /// </summary>
+    private WheelbaseMeasurement wheelbaseMeasurement = WheelbaseMeasurement.Invalid("尚未测量");
     private string mapStatus = "尚未构建";
     private PlanResult? planResult;
     private string selfTestSummary = "尚未运行";
@@ -81,6 +104,21 @@ public sealed class AutoParkingPlugin : Plugin
     private Follower? follower;
     private DateTime phaseDeadlineUtc = DateTime.MinValue;
     private DateTime lastBrakeProbeUtc = DateTime.MinValue;
+    private double lastProbeSpeed;
+    private DateTime lastProbeSpeedUtc = DateTime.MinValue;
+    private DateTime lastControlTickUtc = DateTime.MinValue;
+    private double maxControlGapSinceProbeMs;
+    private string lastOverrideState = "";
+
+    // The game-side plugin publishes whether it is currently overriding the truck at
+    // Local\ETS2LAPluginStatus (int version, bool steering, bool acceleration, 6 bytes -
+    // core.hpp:15-21), and nothing in the host reads it. It is the only direct answer to "does the
+    // truck listen to our pedal right now": the user*/game* echoes cannot say it, because under the
+    // memory transport our values are not on the device surface the echoes are sampled from.
+    private const string PluginStatusMapName = "Local\\ETS2LAPluginStatus";
+    private MemoryMappedFile? statusFile;
+    private MemoryMappedViewAccessor? statusAccessor;
+    private bool statusTried;
     private DateTime lastGearProbeUtc = DateTime.MinValue;
     private int lastReplanCount;
     private string lastCostSignature = "";
@@ -88,6 +126,26 @@ public sealed class AutoParkingPlugin : Plugin
 
     // Reverse distance inside which the parking brake may be used to stop the truck.
     private const double ParkingBrakeStopDistanceM = 2.0;
+
+    // Pedal fallback: the memory transport writes the game's input-mix output value, which the
+    // game re-evaluates every frame, and a write that stops reaching the truck is not reported
+    // anywhere - the game side keeps its override claim on the timestamp alone (core.cpp:213-239),
+    // so the status map still says 踏板on while the wheels see nothing. Measured 2026-10-15:
+    // full brake at 5.1 km/h for minutes, a实测≈0, air pinned at 123.25 psi, game_brake=0.00,
+    // the truck creeping on the automatic's idle. The one proof available is physical: a full
+    // brake demand that neither slows the truck nor drains the service line is a pedal that
+    // never reached it.
+    private const double PedalFallbackMinSpeedKph = 2.0;
+    private const float PedalFallbackBrakeDemand = 0.5f;
+    private const double PedalFallbackWindowSeconds = 2.0;
+    private const double PedalFallbackMinDecelMps2 = 0.4;
+    private const float PedalFallbackMinAirDropPsi = 2.0f;
+    private const float PedalFallbackMinEchoBrake = 0.1f;
+
+    private DateTime pedalSuspicionUtc = DateTime.MinValue;
+    private float pedalSuspicionSpeedKph;
+    private float pedalSuspicionAir;
+    private bool pedalFallbackEngaged;
 
     /// <summary>
     ///  Is there enough air for the service brake to do anything? The emergency threshold comes
@@ -209,6 +267,8 @@ public sealed class AutoParkingPlugin : Plugin
         mapOverlay.Register(settings.ShowMapWindow);
         arOverlay.Register();
         controlPlot.SetVisible(settings.ShowControlPlot);
+        kdopReader = new KdopReader(this);
+        kdopReader.Start();
 
         ControlsBackend.Current.On(toggleControl.Id, OnToggleKeyPressed);
         ControlsBackend.Current.On(abortControl.Id, OnAbortKeyPressed);
@@ -278,14 +338,95 @@ public sealed class AutoParkingPlugin : Plugin
         double radius = settings.MapDataRadiusM(MapOverlay.WindowHeight);
         MapGeometry geometry = geometryBuilder.Build(map, truck.Position, radius,
                                                       settings.ConfirmedCorridorHalfWidthM);
+        int bayCount = DetectParkingBays(geometry);
+        int memoryObstacles = AddMemoryObstacles(geometry, truck.Position, radius);
 
         lock (sync)
         {
             mapGeometry = geometry;
-            mapStatus = $"{geometry.Status} · {geometry.BuildMilliseconds:0} ms";
+            mapStatus = $"{geometry.Status} · {geometry.BuildMilliseconds:0} ms" +
+                        (bayCount > 0 ? $" · 车位 {bayCount}" : "") +
+                        (memoryObstacles > 0 ? $" · 内存障碍 {memoryObstacles}" : "");
         }
 
         Replan(geometry);
+    }
+
+    /// <summary>
+    ///  Reads the parking bays out of the cones the memory reader already collected, before the
+    ///  obstacle merge: a bay's own markings sit inside the bay, and merging them first would refuse
+    ///  the very spot the game asks for (design doc §50).
+    /// </summary>
+    private int DetectParkingBays(MapGeometry geometry)
+    {
+        KdopReader.Snapshot? memory = MemoryItemSnapshot;
+        if (memory == null || !settings.ShowMemoryItems)
+            return 0;
+
+        List<Vector2> cones = new();
+        foreach (KdopReader.MemItem item in memory.Items)
+            if (item.Kind == KdopReader.MemKind.Cone)
+                cones.Add(item.PlanePos);
+
+        geometry.Bays.AddRange(ParkingBays.Detect(cones));
+        return geometry.Bays.Count;
+    }
+
+    /// <summary>
+    ///  Memory items become planner obstacles: cones, boards, movers and buildings inside the
+    ///  sampled radius go into <see cref="MapGeometry.Obstacles"/> as their own k-DOP ground
+    ///  boxes, so Planner, Follower, the route-cost log and the map's red obstacle polygons all
+    ///  treat them like any other blocker (owner decision §43 - near-lot objects must not be hit
+    ///  whatever exactly they are). Merging here means the engaged maneuver's captured geometry
+    ///  carries the set from its last rebuild (≤0.5 s old), while HandleObstacles sees fresh data
+    ///  every tick - the same freshness split the traffic obstacles already live with.
+    /// </summary>
+    private int AddMemoryObstacles(MapGeometry geometry, Vector2 truckPlane, double radiusM)
+    {
+        if (!settings.ShowMemoryItems || !settings.BlockRouteWithMemoryItems)
+            return 0;
+
+        KdopReader.Snapshot? memory = MemoryItemSnapshot;
+        if (memory == null)
+            return 0;
+
+        int added = 0;
+        foreach (KdopReader.MemItem item in memory.Items)
+        {
+            if (item.Kind is not (KdopReader.MemKind.Cone or KdopReader.MemKind.Board
+                or KdopReader.MemKind.Mover or KdopReader.MemKind.Building))
+                continue;
+
+            if (Math.Abs(item.PlanePos.X - truckPlane.X) > radiusM
+                || Math.Abs(item.PlanePos.Y - truckPlane.Y) > radiusM)
+                continue;
+
+            // Anything inside a detected bay is the bay's own furniture, not a blocker. The rectangle is
+            // shrunk by BayInteriorInsetM first so the cone rows that form the bay's walls stay obstacles -
+            // without the inset the truck would be allowed to drive through the walls it parks between.
+            if (InsideBay(geometry, item.PlanePos))
+                continue;
+
+            geometry.Obstacles.AddBox(item.PlanePos, item.Dx, item.Dz);
+            added++;
+        }
+
+        return added;
+    }
+
+    /// <summary>
+    ///  How far inside the bay's own cone rows an item has to sit before it counts as the bay's
+    ///  furniture. The rows are ON the rectangle's edge, so an inset smaller than half a cone footprint
+    ///  would delete the wall the truck is supposed to stop against.
+    /// </summary>
+    private const double BayInteriorInsetM = 0.6;
+
+    private static bool InsideBay(MapGeometry geometry, Vector2 point)
+    {
+        foreach (ParkingBay bay in geometry.Bays)
+            if (bay.Contains(point, -BayInteriorInsetM))
+                return true;
+        return false;
     }
 
     /// <summary>
@@ -511,6 +652,30 @@ public sealed class AutoParkingPlugin : Plugin
         }
 
         output.Apply(demand);
+
+        // Publish cadence is what the game side's 0.2 s freshness gate actually measures, so the gap
+        // between two of our own publishes is the first suspect when it drops the override. The probe
+        // reports the worst gap since its last line, not the instantaneous one.
+        DateTime controlUtc = DateTime.UtcNow;
+        if (lastControlTickUtc != DateTime.MinValue)
+        {
+            double gap = (controlUtc - lastControlTickUtc).TotalMilliseconds;
+            if (gap > maxControlGapSinceProbeMs)
+                maxControlGapSinceProbeMs = gap;
+        }
+        lastControlTickUtc = controlUtc;
+
+        // Worth its own line whenever it moves: losing the pedal claim mid-maneuver is invisible in
+        // every other field, and the brake probe only fires while a brake demand is out.
+        string controlState = ReadOverrideState();
+        if (controlState != lastOverrideState)
+        {
+            lastOverrideState = controlState;
+            Logger.Info($"AutoParking: {controlState}（v={Math.Abs(state.SignedSpeed) * 3.6:0.0} km/h " +
+                        $"sent={output.LastAcceleration:0.00} 剩={active.RemainingDistance:0.0} m · {active.Status}）");
+        }
+
+        CheckPedalFallback(demand, state);
         ProbeBrakeChannel(demand, state, active);
         ProbeGearChannel(demand, state, active);
 
@@ -589,10 +754,119 @@ public sealed class AutoParkingPlugin : Plugin
     }
 
     /// <summary>
+    ///  What the game-side plugin says it is controlling, read straight out of its status mapping.
+    ///  Missing mapping (plugin not loaded, or not on Windows) reports `?` rather than failing the run.
+    /// </summary>
+    private string ReadOverrideState()
+    {
+        if (!statusTried && OperatingSystem.IsWindows())
+        {
+            statusTried = true;
+            try
+            {
+                statusFile = MemoryMappedFile.OpenExisting(PluginStatusMapName);
+                statusAccessor = statusFile.CreateViewAccessor(0, 6, MemoryMappedFileAccess.Read);
+            }
+            catch
+            {
+                statusFile = null;
+                statusAccessor = null;
+            }
+        }
+
+        if (statusAccessor == null)
+            return "接管=?";
+
+        try
+        {
+            return $"接管=转向{(statusAccessor.ReadBoolean(4) ? "on" : "off")} 踏板{(statusAccessor.ReadBoolean(5) ? "on" : "off")}";
+        }
+        catch
+        {
+            return "接管=?";
+        }
+    }
+
+    /// <summary>
+    ///  Watches the brake path for the one failure the status map cannot show: the game-side plugin
+    ///  claiming the pedal while the write never reaches the wheels. Any of the three physical
+    ///  echoes (deceleration, service-line pressure drop, game-side brake echo) clears the
+    ///  suspicion window; none of them for the whole window with a full brake demand out and the
+    ///  truck still moving is a dead memory channel, and we degrade to the legacy virtual gamepad
+    ///  for the rest of the session. That device is already trusted with the gear and handbrake
+    ///  pulses, and the switch costs nothing - the memory pedal was doing nothing anyway.
+    /// </summary>
+    private void CheckPedalFallback(ControlDemand demand, VehicleState state)
+    {
+        if (pedalFallbackEngaged || settings.DryRun)
+            return;
+
+        // Only the memory write can fail silently this way; the legacy gamepad's health shows up
+        // in the same echoes and the gear channel has been riding it all along.
+        if (!ETS2LA.Game.GameSettings.Current.EnableModernOutputForPedals)
+            return;
+
+        float speedKph = (float)(Math.Abs(state.SignedSpeed) * 3.6);
+        if (demand.Brake < PedalFallbackBrakeDemand || speedKph < PedalFallbackMinSpeedKph)
+        {
+            // No demand, or already stopped - the healthy end state, not evidence of a dead pedal.
+            pedalSuspicionUtc = DateTime.MinValue;
+            return;
+        }
+
+        float gameBrake, air;
+        lock (sync)
+        {
+            gameBrake = latestTelemetry.truckFloat.gameBrake;
+            air = latestTelemetry.truckFloat.airPressure;
+        }
+
+        if (pedalSuspicionUtc == DateTime.MinValue)
+        {
+            pedalSuspicionUtc = state.Utc;
+            pedalSuspicionSpeedKph = speedKph;
+            pedalSuspicionAir = air;
+            return;
+        }
+
+        double seconds = (state.Utc - pedalSuspicionUtc).TotalSeconds;
+        if (seconds < 0.05)
+            return;
+
+        double decelMps2 = (pedalSuspicionSpeedKph - speedKph) / 3.6 / seconds;
+        bool airDropped = pedalSuspicionAir - air > PedalFallbackMinAirDropPsi;
+        bool echoPresent = gameBrake >= PedalFallbackMinEchoBrake;
+
+        if (decelMps2 > PedalFallbackMinDecelMps2 || airDropped || echoPresent)
+        {
+            pedalSuspicionUtc = state.Utc;
+            pedalSuspicionSpeedKph = speedKph;
+            pedalSuspicionAir = air;
+            return;
+        }
+
+        if (seconds < PedalFallbackWindowSeconds)
+            return;
+
+        pedalFallbackEngaged = true;
+        pedalSuspicionUtc = DateTime.MinValue;
+
+        // Deliberately not GameSettings.Save(): this is a session-long degradation of a channel
+        // that just proved dead, not a preference change. The user's saved choice comes back on
+        // the next app start, and the host picks the new value up on its next output tick.
+        ETS2LA.Game.GameSettings.Current.EnableModernOutputForPedals = false;
+
+        Logger.Warn($"AutoParking: 满刹车 {PedalFallbackWindowSeconds:0}s 无减速（a={decelMps2:0.00} m/s²）、" +
+                    $"气压 {pedalSuspicionAir:0.0}→{air:0.0}、game_brake={gameBrake:0.00}，判定 memory 踏板通道未生效，" +
+                    $"已切回 legacy 虚拟手柄（本次运行有效，重启后恢复你的设置）");
+        Notify(NotificationLevel.Danger, "检测到 memory 踏板未生效（满刹车无减速），已自动切换到 legacy 虚拟手柄。", 10);
+    }
+
+    /// <summary>
     ///  Samples the brake path while we are asking for full braking. A demand that does not slow
     ///  the vehicle is the one failure the status table cannot show after the fact - the maneuver
-    ///  is over by then - so it goes to the log as it happens. sent_brake high with game_brake
-    ///  near zero means the abackward axis is not the brake pedal.
+    ///  is over by then - so it goes to the log as it happens. The sent value against a实测 and the
+    ///  game-side claim is what settles whether the pedal reached the wheels at all.
     /// </summary>
     private void ProbeBrakeChannel(ControlDemand demand, VehicleState state, Follower active)
     {
@@ -620,12 +894,29 @@ public sealed class AutoParkingPlugin : Plugin
             gear = latestTelemetry.truckInt.gear;
         }
 
+        double sampleSpeed = Math.Abs(state.SignedSpeed);
+        double probeGap = (state.Utc - lastProbeSpeedUtc).TotalSeconds;
+        string measured = probeGap > 0.05 && probeGap < 2.0
+            ? $"a实测={(sampleSpeed - lastProbeSpeed) / probeGap:0.00} m/s²"
+            : "a实测=-";
+        lastProbeSpeed = sampleSpeed;
+        lastProbeSpeedUtc = state.Utc;
+
         // Measured on the legacy transport: the SCS virtual controller arrives as a player device, so
         // game_brake stayed zero no matter how hard we braked and user_brake was the echo to read.
         // Under `memory` output that has not been re-measured, which is why the transport is printed
         // here. Air pressure is transport-independent - it falls only when the brake is actually
         // applied at the wheels, so it stays the hardest evidence of the three.
+        // a实测 is the tie-breaker between those: sent -1.0 with a实测 near 0 while air falls and the
+        // discs heat means the pedal is moving somewhere that is not this truck's wheels.
+        // 接管 and stall then say which half failed: 踏板off with a small stall is the host or the
+        // game-side reader losing the claim, 踏板off with a stall over ~200 ms is our own tick.
+        string overrideState = ReadOverrideState();
+        double stallMs = maxControlGapSinceProbeMs;
+        maxControlGapSinceProbeMs = 0.0;
+
         Logger.Info($"AutoParking: 制动探针 transport={PedalTransport} v={Math.Abs(state.SignedSpeed) * 3.6:0.0} km/h " +
+                    $"{measured} {overrideState} stall={stallMs:0}ms 已发={output.Published} 屏蔽={output.Suppressed} " +
                     $"sent_accel={output.LastAcceleration:0.00} (brake={demand.Brake:0.00} throttle={demand.Throttle:0.00}) " +
                     $"steer={output.LastSteer:0.00} 剩={active.RemainingDistance:0.0} 横={active.CrossTrackErrorMeters:0.00} " +
                     $"航向差={active.HeadingErrorDegrees:0.0} " +
@@ -736,6 +1027,8 @@ public sealed class AutoParkingPlugin : Plugin
         arOverlay = null;
         controlPlot?.SetVisible(false);
         controlPlot = null;
+        kdopReader?.Stop();
+        kdopReader = null;
 
         Events.Current.Unsubscribe<GameTelemetryData>(GameTelemetry.Current.EventString, OnTelemetry);
         GameTelemetry.Current.ReadTrailerData = previousReadTrailerData;
@@ -793,6 +1086,12 @@ public sealed class AutoParkingPlugin : Plugin
             lock (sync) return mapGeometry;
         }
     }
+
+    /// <summary>
+    ///  Latest game-memory item snapshot (runtime cones etc.), or null before the first read.
+    ///  Null also when the reader is disabled or the game is absent - the map just skips the layer.
+    /// </summary>
+    internal KdopReader.Snapshot? MemoryItemSnapshot => kdopReader?.Current;
 
     /// <summary>
     ///  Measured contents of the sampled circle, as one line: the map window is 560 px tall and the
@@ -939,6 +1238,95 @@ public sealed class AutoParkingPlugin : Plugin
             lastTelemetryUtc = DateTime.UtcNow;
             telemetryStale = false;
         }
+
+        CalibrateWheelbase(data);
+    }
+
+    /// <summary>
+    ///  Turn the wheel positions the game publishes into a wheelbase, so the minimum turning radius
+    ///  stops being a number typed into a settings file.
+    ///
+    ///  Recomputed whenever the layout signature moves rather than latched once: switching trucks in
+    ///  a garage changes the wheel configuration while the process keeps running, and a value measured
+    ///  from the previous truck would otherwise be used forever. The arrays hold a handful of wheels,
+    ///  so this is not a per-tick cost even at telemetry rate.
+    /// </summary>
+    private void CalibrateWheelbase(GameTelemetryData data)
+    {
+        Vector3[]? wheels = data.configVector.truckWheelPositions;
+        int count = data.configUI.truckWheelCount;
+
+        string signature = wheels == null
+            ? "none"
+            : $"{count}|{wheels.Length}|"
+              + string.Join(";", wheels.Take(Math.Min(count == 0 ? 0 : Math.Min(count, wheels.Length), 8))
+                                 .Select(p => $"{p.X:0.##},{p.Y:0.##},{p.Z:0.##}"));
+
+        WheelbaseMeasurement measurement = wheelbaseMeasurement;
+
+        lock (sync)
+        {
+            if (signature != wheelbaseSignature)
+            {
+                wheelbaseSignature = signature;
+                measurement = VehicleGeometry.Measure(wheels, data.configBool.truckWheelSteerable,
+                                                      data.configBool.truckWheelLiftable, count);
+                wheelbaseMeasurement = measurement;
+
+                if (!measurement.Valid)
+                    Logger.Info($"AutoParking: 轴距未能实测（{measurement.Reason}），继续用设置里的 {settings.WheelbaseM:0.00} m");
+            }
+
+            if (!measurement.Valid)
+                return;
+
+            if (settings.AutoCalibrateRadius
+                && Math.Abs(settings.WheelbaseM - measurement.WheelbaseM) >= 0.02)
+            {
+                double previous = settings.WheelbaseM;
+                settings.WheelbaseM = measurement.WheelbaseM;
+                settings.Clamp();
+
+                Logger.Info($"AutoParking: 轴距实测 {measurement.WheelbaseM:0.00} m，覆盖设置里的 {previous:0.00} m"
+                            + $"（{measurement.Axles.Count} 轴，前向轴={measurement.AlongIsZ}，"
+                            + $"轮距 {measurement.FrontTrackM:0.00}/{measurement.RearTrackM:0.00} m，"
+                            + $"轴位 {string.Join(" | ", measurement.Axles)}）");
+            }
+
+            // The width comes from the same wheel positions: the outermost centre plus a tyre
+            // allowance. The hand-typed 2.6 m was wider than this tractor by more than half a metre,
+            // and the obstacle envelope is built straight off it (design doc §51).
+            // The box the planner sweeps, sized from the truck that is actually being driven: the
+            // game's own local AABB when the memory reader has it (and that is the only source for the
+            // length at all), otherwise wheel centres plus the tyre allowance for the width and no
+            // change to the length. Design doc §52 - the typed 6.5 × 2.6 m was 1.9 m shorter and 0.13 m
+            // wider than the 6x2 standing on the course.
+            if (settings.AutoCalibrateBody)
+            {
+                KdopReader.TruckBody body = MemoryItemSnapshot?.Body ?? default;
+                double measuredWidth = body.Available ? body.WidthM
+                                                     : VehicleGeometry.MeasuredWidthM(measurement, settings.TireHalfWidthM);
+                double measuredLength = body.Available ? body.LengthM : 0.0;
+
+                double previousWidth = settings.VehicleWidthM, previousLength = settings.VehicleLengthM;
+                bool widthChanged = measuredWidth >= 1.7 && Math.Abs(previousWidth - measuredWidth) >= 0.02;
+                bool lengthChanged = measuredLength > 4.0 && Math.Abs(previousLength - measuredLength) >= 0.02;
+                if (widthChanged)
+                    settings.VehicleWidthM = measuredWidth;
+                if (lengthChanged)
+                    settings.VehicleLengthM = measuredLength;
+
+                if (widthChanged || lengthChanged)
+                {
+                    settings.Clamp();
+                    Logger.Info($"AutoParking: 车体实测 {(body.Available ? "游戏包围盒" : "轮心+胎宽")} "
+                                + $"{settings.VehicleLengthM:0.00} × {settings.VehicleWidthM:0.00} m"
+                                + (body.Available ? $"（高 {body.HeightM:0.00} m）" : $"（胎宽 {settings.TireHalfWidthM:0.00}/侧）")
+                                + $"，覆盖设置里的 {previousLength:0.00} × {previousWidth:0.00} m"
+                                + $"；障碍包络 {settings.EnvelopeLengthM:0.00} × {settings.EnvelopeWidthM:0.00} m");
+                }
+            }
+        }
     }
 
     private void OnSettingsChanged(AutoParkingSettings newSettings)
@@ -994,6 +1382,26 @@ public sealed class AutoParkingPlugin : Plugin
                     settings.ShowControlPlot = ToBool(value, settings.ShowControlPlot);
                     changed = true;
                     break;
+                case "showMemoryItems":
+                    settings.ShowMemoryItems = ToBool(value, settings.ShowMemoryItems);
+                    changed = true;
+                    break;
+                case "blockRouteWithMemoryItems":
+                    settings.BlockRouteWithMemoryItems = ToBool(value, settings.BlockRouteWithMemoryItems);
+                    changed = true;
+                    break;
+                case "envelopePad":
+                    settings.EnvelopePadM = ToDouble(value, settings.EnvelopePadM);
+                    changed = true;
+                    break;
+                case "smoothForwardLeadIn":
+                    settings.SmoothForwardLeadInM = ToDouble(value, settings.SmoothForwardLeadInM);
+                    changed = true;
+                    break;
+                case "snapToParkingBay":
+                    settings.SnapToParkingBay = ToBool(value, settings.SnapToParkingBay);
+                    changed = true;
+                    break;
                 case "snapToNavCurve":
                     settings.SnapToNavCurve = ToBool(value, settings.SnapToNavCurve);
                     changed = true;
@@ -1012,6 +1420,26 @@ public sealed class AutoParkingPlugin : Plugin
                     break;
                 case "vehicleWidth":
                     settings.VehicleWidthM = ToDouble(value, settings.VehicleWidthM);
+                    changed = true;
+                    break;
+                case "autoCalibrateRadius":
+                    settings.AutoCalibrateRadius = ToBool(value, settings.AutoCalibrateRadius);
+                    changed = true;
+                    break;
+                case "autoCalibrateBody":
+                    settings.AutoCalibrateBody = ToBool(value, settings.AutoCalibrateBody);
+                    changed = true;
+                    break;
+                case "tireHalfWidth":
+                    settings.TireHalfWidthM = ToDouble(value, settings.TireHalfWidthM);
+                    changed = true;
+                    break;
+                case "wheelbase":
+                    settings.WheelbaseM = ToDouble(value, settings.WheelbaseM);
+                    changed = true;
+                    break;
+                case "maxSteerDeg":
+                    settings.MaxSteerDeg = ToDouble(value, settings.MaxSteerDeg);
                     changed = true;
                     break;
                 case "arGroundTrim":
@@ -1518,6 +1946,21 @@ public sealed class AutoParkingPlugin : Plugin
                     { "制动能力", $"{latestTelemetry.truckFloat.airPressure:0.0} bar（应急 {latestTelemetry.configFloat.airPressureEmergency:0.0}）" +
                                 (HasBrakeAir() ? "" : " · 行车制动无效") },
                     { "踏板通路", $"{PedalTransport}（memory=直写内存，失焦仍生效；legacy=虚拟手柄，失焦即失效；挡位/手刹恒走 legacy）" },
+                    { "踏板回退", pedalFallbackEngaged
+                        ? "已触发：memory 刹车未生效，本次运行走 legacy（重启后恢复原设置）"
+                        : (PedalTransport == "memory" ? "待命（满刹车 2s 无减速且气压不降时触发）" : "不需要（已在 legacy）") },
+                    { "轴距", $"{settings.WheelbaseM:0.00} m（实测 " +
+                             (wheelbaseMeasurement.Valid ? $"{wheelbaseMeasurement.WheelbaseM:0.00}" : wheelbaseMeasurement.Reason) +
+                             $"，{wheelbaseMeasurement.Axles.Count} 轴，轮距 {wheelbaseMeasurement.FrontTrackM:0.00}/" +
+                             $"{wheelbaseMeasurement.RearTrackM:0.00}，自动标定 {(settings.AutoCalibrateRadius ? "开" : "关")}）" },
+                    { "车身", $"{settings.VehicleLengthM:0.00} × {settings.VehicleWidthM:0.00} m（" +
+                             (MemoryItemSnapshot?.Body is { Available: true } measured
+                                 ? $"游戏包围盒，高 {measured.HeightM:0.00}"
+                                 : wheelbaseMeasurement.Valid
+                                     ? $"轮心+胎宽 {settings.TireHalfWidthM:0.00}/侧，长无实测源"
+                                     : "未实测") +
+                             $"，自动适应 {(settings.AutoCalibrateBody ? "开" : "关")}）" +
+                             $"→ 障碍包络 {settings.EnvelopeLengthM:0.00} × {settings.EnvelopeWidthM:0.00} m" },
                     { "最小转弯半径", $"{Kinematics.MinTurnRadius(settings):0.00} m" },
                     { "地面基准", $"{GroundContactOffsetNoLock:0.00} m（+微调 {settings.ArGroundTrimM:0.00}）" },
                     { "地图数据", mapStatus },

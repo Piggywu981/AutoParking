@@ -21,6 +21,16 @@ public static class ReedsShepp
 {
     private const double Epsilon = 1e-6;
 
+    // Sweep of the smooth forward family (§53). Coarse on purpose: these are candidates for an
+    // obstacle test, not an optimiser, and every metre of lead-in is something the driver can see.
+    public const double SmoothLeadInStepM = 1.5;
+    public const double SmoothPhiMinRad = 12.0 * Math.PI / 180.0;
+    public const double SmoothPhiMaxRad = 150.0 * Math.PI / 180.0;
+    public const double SmoothPhiStepRad = 5.0 * Math.PI / 180.0;
+    public const int SmoothCandidateMax = 12;
+
+    private static readonly double[] SmoothSplits = { 0.5, 0.35, 0.65 };
+
     private enum SegmentKind
     {
         Line,
@@ -58,6 +68,152 @@ public static class ReedsShepp
 
         results.Sort((a, b) => a.Cost.CompareTo(b.Cost));
         return results;
+    }
+
+    /// <summary>
+    ///  Forward-only "lead-in straight, arc, straight, arc" routes: the shape a driver uses when the
+    ///  spot sits beside the lane instead of behind it.
+    ///
+    ///  Two things <see cref="Solve"/> does not do, both of which the ATS cone course turned out to
+    ///  need (§53): the two arcs may have different radii, and the route may begin with a straight.
+    ///  With no lead-in every member of the family puts its own front-right corner on the cone at the
+    ///  end of the lane's north row, and with one fixed radius the only shapes left are the tight ones
+    ///  - which is how a course that does have a smooth answer came to look unsolvable.
+    ///
+    ///  Closed form: for a turn angle phi the pose differences pin both S = R1 + R2 and the middle
+    ///  straight, and only the split between the two radii stays free,
+    ///
+    ///  <code>along = S sin(phi) + L cos(phi)      lateral = S (1 - cos(phi)) + L sin(phi)</code>
+    ///
+    ///  so the sweep is over (lead-in, phi, split). Cost rewards a large radius, because "smooth" is
+    ///  the whole reason this family exists and a route at the minimum radius is not smoother than one
+    ///  the existing solver already produces.
+    /// </summary>
+    public static List<ParkingPath> SmoothForward(Pose2 from, Pose2 to, double minRadius, double sampleM,
+                                                  double leadInMaxM, double smoothTightnessM, int maxCandidates)
+    {
+        List<SmoothSpec> specs = new();
+
+        Vector2 forward = from.Forward;
+        Vector2 delta = to.Position - from.Position;
+        double along0 = delta.X * forward.X + delta.Y * forward.Y;
+        double lateral = Geometry.SignedLateral(from.Position, forward, to.Position);
+        int side = lateral >= 0.0 ? 1 : -1;
+        double offset = Math.Abs(lateral);
+
+        for (double leadIn = 0.0; leadIn <= leadInMaxM + 1e-9; leadIn += SmoothLeadInStepM)
+        {
+            double along = along0 - leadIn;
+            if (along < minRadius)
+                break;
+
+            for (double phi = SmoothPhiMinRad; phi <= SmoothPhiMaxRad + 1e-9; phi += SmoothPhiStepRad)
+            {
+                double cos = Math.Cos(phi), sin = Math.Sin(phi), den = 1.0 - cos;
+                if (Math.Abs(cos) < 0.05 || den < 1e-6)
+                    continue;
+
+                double sum = (along * sin - offset * cos) / den;
+                if (sum < 2.0 * minRadius)
+                    continue;
+
+                double middle = (along - sum * sin) / cos;
+                if (middle < 0.0)
+                    continue;
+
+                foreach (double fraction in SmoothSplits)
+                {
+                    double first = sum * fraction, second = sum - first;
+                    if (first < minRadius || second < minRadius)
+                        continue;
+
+                    specs.Add(new SmoothSpec(leadIn, first, second, middle, phi, side,
+                                             leadIn + first * phi + middle + second * phi));
+                }
+            }
+        }
+
+        specs.Sort((a, b) => Cost(a).CompareTo(Cost(b)));
+
+        List<ParkingPath> results = new();
+        foreach (SmoothSpec spec in specs)
+        {
+            if (results.Count >= maxCandidates)
+                break;
+
+            ParkingPath? built = BuildSmooth(spec, from, to, minRadius, sampleM, smoothTightnessM);
+            if (built != null)
+                results.Add(built);
+        }
+
+        return results;
+
+        double Cost(SmoothSpec s) => s.Length + smoothTightnessM * minRadius
+                                     / Math.Min(s.FirstRadius, s.SecondRadius);
+    }
+
+    private readonly record struct SmoothSpec(double LeadIn, double FirstRadius, double SecondRadius,
+                                              double Middle, double Phi, int Side, double Length);
+
+    private static ParkingPath? BuildSmooth(SmoothSpec spec, Pose2 from, Pose2 to, double minRadius,
+                                            double sampleM, double smoothTightnessM)
+    {
+        List<Primitive> path = new(4);
+        Vector2 position = from.Position;
+        double heading = from.HeadingRad;
+
+        if (spec.LeadIn > 1e-6)
+        {
+            Vector2 next = position + Geometry.ForwardFromHeading(heading) * (float)spec.LeadIn;
+            path.Add(new Primitive(SegmentKind.Line, 0, position, next, heading, heading, spec.LeadIn, 0.0));
+            position = next;
+        }
+
+        int turn = spec.Side;
+        double swept = turn * spec.Phi;
+        Vector2 arcEnd = Center(new Pose2(position.X, position.Y, heading), turn, spec.FirstRadius)
+                         + Geometry.LeftFromHeading(heading + swept) * (float)(-turn * spec.FirstRadius);
+        path.Add(new Primitive(SegmentKind.Arc, turn, position, arcEnd, heading,
+                               Geometry.NormalizeRadians(heading + swept), spec.FirstRadius * spec.Phi,
+                               spec.FirstRadius));
+        position = arcEnd;
+        heading = Geometry.NormalizeRadians(heading + swept);
+
+        if (spec.Middle > 1e-6)
+        {
+            Vector2 next = position + Geometry.ForwardFromHeading(heading) * (float)spec.Middle;
+            path.Add(new Primitive(SegmentKind.Line, 0, position, next, heading, heading, spec.Middle, 0.0));
+            position = next;
+        }
+
+        turn = -spec.Side;
+        swept = turn * spec.Phi;
+        arcEnd = Center(new Pose2(position.X, position.Y, heading), turn, spec.SecondRadius)
+                 + Geometry.LeftFromHeading(heading + swept) * (float)(-turn * spec.SecondRadius);
+        path.Add(new Primitive(SegmentKind.Arc, turn, position, arcEnd, heading,
+                               Geometry.NormalizeRadians(heading + swept), spec.SecondRadius * spec.Phi,
+                               spec.SecondRadius));
+
+        // The same independent walk the Reeds-Shepp families are checked with: a construction that does
+        // not land on the goal pose is dropped, so a wrong formula means "no route", never "drive into
+        // a cone". Null here = the arcs are allowed to have different radii.
+        if (!EndsAt(path, from, to, null))
+            return null;
+
+        List<PathPoint> points = SamplePath(path, from, spec.FirstRadius, sampleM, DriveDirection.Forward);
+        if (points.Count < 2)
+            return null;
+
+        return new ParkingPath
+        {
+            Points = points,
+            Source = PlanSource.SmoothForward,
+            Cost = spec.Length + smoothTightnessM * minRadius / Math.Min(spec.FirstRadius, spec.SecondRadius),
+            GearSwitches = 0,
+            Description = $"平滑前进线（{(spec.LeadIn > 0.05 ? $"前移 {spec.LeadIn:0.#} m、" : "")}" +
+                          $"半径 {spec.FirstRadius:0.0}/{spec.SecondRadius:0.0} m、" +
+                          $"转 {spec.Phi * 180.0 / Math.PI:0}°）"
+        };
     }
 
     /// <summary>
@@ -343,7 +499,7 @@ public static class ReedsShepp
     ///  pose with a continuous tangent everywhere. This is what keeps a wrong construction from
     ///  becoming a wrong maneuver.
     /// </summary>
-    private static bool EndsAt(List<Primitive> path, Pose2 from, Pose2 to, double radius)
+    private static bool EndsAt(List<Primitive> path, Pose2 from, Pose2 to, double? radius)
     {
         Vector2 position = from.Position;
         double heading = from.HeadingRad;
@@ -358,7 +514,7 @@ public static class ReedsShepp
 
             if (p.Kind == SegmentKind.Arc)
             {
-                if (Math.Abs(p.Radius - radius) > 1e-6)
+                if (radius.HasValue && Math.Abs(p.Radius - radius.Value) > 1e-6)
                     return false;
 
                 double swept = p.Turn * (p.Length / p.Radius);

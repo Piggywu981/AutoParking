@@ -71,6 +71,10 @@
       <HintPath>..\..\ETS2LA-win-release-Portable\current\TruckLib.Models.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="TruckLib.Sii">
+      <HintPath>..\..\ETS2LA-win-release-Portable\current\TruckLib.Sii.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="Hexa.NET.ImGui">
       <HintPath>..\..\ETS2LA-win-release-Portable\current\Hexa.NET.ImGui.dll</HintPath>
       <Private>false</Private>

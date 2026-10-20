@@ -27,6 +27,13 @@ public sealed class MapItemProbe
 
     public readonly record struct NamedCount(string Name, int Count);
 
+    /// <summary>
+    ///  A resolved family, how many of it are in the sample, and how close the nearest one is. The
+    ///  distance is what makes the number actionable: "锥桶×40" 100 m away is nothing, 3 m away is the
+    ///  reason the maneuver is being argued about.
+    /// </summary>
+    public readonly record struct LabelInfo(string Name, int Count, double NearestM);
+
     public sealed class TypeTally
     {
         public string ItemType = "";
@@ -50,9 +57,17 @@ public sealed class MapItemProbe
 
         public int DistinctTokens => tokens.Count;
 
-        private readonly Dictionary<string, int> tokens = new(StringComparer.Ordinal);
+        /// <summary>
+        ///  What the token resolves to (<see cref="MapItemIdentity"/>). Tallied next to the tokens
+        ///  because a code like `dlc_fr_219` says nothing to a person reading the overlay, and the whole
+        ///  point of this layer is to tell a cone apart from a transformer.
+        /// </summary>
+        public int DistinctLabels => labels.Count;
 
-        public void Add(string token, bool collision, double distance, bool nested)
+        private readonly Dictionary<string, int> tokens = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, int> labels = new(StringComparer.Ordinal);
+
+        public void Add(string token, bool collision, double distance, bool nested, string? label = null)
         {
             Count++;
             if (collision)
@@ -64,12 +79,27 @@ public sealed class MapItemProbe
 
             tokens.TryGetValue(token, out int seen);
             tokens[token] = seen + 1;
+
+            if (!string.IsNullOrEmpty(label))
+            {
+                labels.TryGetValue(label, out int labelSeen);
+                labels[label] = labelSeen + 1;
+            }
         }
 
         /// <summary>Most frequent first; equal counts broken by name so two runs of the same spot agree.</summary>
         public IReadOnlyList<NamedCount> TopTokens(int max)
         {
             return tokens.OrderByDescending(pair => pair.Value)
+                        .ThenBy(pair => pair.Key, StringComparer.Ordinal)
+                        .Take(max)
+                        .Select(pair => new NamedCount(pair.Key, pair.Value))
+                        .ToList();
+        }
+
+        public IReadOnlyList<NamedCount> TopLabels(int max)
+        {
+            return labels.OrderByDescending(pair => pair.Value)
                         .ThenBy(pair => pair.Key, StringComparer.Ordinal)
                         .Take(max)
                         .Select(pair => new NamedCount(pair.Key, pair.Value))
@@ -86,6 +116,7 @@ public sealed class MapItemProbe
     public int TotalItems { get; private set; }
 
     private readonly Dictionary<string, TypeTally> byType = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, LabelInfo> labelTotals = new(StringComparer.Ordinal);
     private readonly HashSet<ulong> seen = new();
 
     /// <summary>
@@ -93,7 +124,8 @@ public sealed class MapItemProbe
     ///  red node and a green node, and a prefab owns several - so the UID is the identity here, not
     ///  the call. Returns false for a UID already recorded, which is the common case, not an error.
     /// </summary>
-    public bool Add(ulong uid, string itemType, string? token, bool collision, Vector2 position, bool nested = false)
+    public bool Add(ulong uid, string itemType, string? token, bool collision, Vector2 position,
+                    bool nested = false, string? label = null)
     {
         if (!seen.Add(uid))
             return false;
@@ -105,10 +137,30 @@ public sealed class MapItemProbe
         }
 
         string name = string.IsNullOrEmpty(token) ? NamelessToken : token;
-        tally.Add(name, collision, Geometry.Distance(Center, position), nested);
+        double distance = Geometry.Distance(Center, position);
+        tally.Add(name, collision, distance, nested, label);
+        if (!string.IsNullOrEmpty(label))
+        {
+            labelTotals.TryGetValue(label, out LabelInfo seen);
+            double nearest = seen.Count == 0 ? distance : Math.Min(seen.NearestM, distance);
+            labelTotals[label] = new LabelInfo(label, seen.Count + 1, nearest);
+        }
         TotalItems++;
         return true;
     }
+
+    /// <summary>Families present in the sample, most numerous first. Empty until the identity table resolves anything.</summary>
+    public IReadOnlyList<LabelInfo> Labels(int max = 6)
+    {
+        return labelTotals.Values.OrderByDescending(label => label.Count)
+                         .ThenBy(label => label.Name, StringComparer.Ordinal)
+                         .Take(max)
+                         .ToList();
+    }
+
+    /// <summary>One family by name, or null when the sample holds none of it.</summary>
+    public LabelInfo? Label(string family)
+        => labelTotals.TryGetValue(family, out LabelInfo info) ? info : null;
 
     public TypeTally? TallyOf(string itemType)
     {
@@ -164,6 +216,10 @@ public sealed class MapItemProbe
         string head = $"{tally.ItemType} {tally.Count} · 可碰 {tally.Collidable} · 最近 {Nearest(tally.NearestM)}";
         if (tally.Nested > 0)
             head += $" · 内含 {tally.Nested}";
+        // The codes are what the map stores, the labels are what they mean. Both stay on the line so a
+        // person can spot an identity table that has not finished loading (labels missing, codes present).
+        if (tally.DistinctLabels > 0)
+            head += $" · 身份 {string.Join(" ", tally.TopLabels(3).Select(label => $"{label.Name}×{label.Count}"))}";
         IReadOnlyList<NamedCount> top = tally.TopTokens(MaxTokensPerType);
         string suffix = tally.DistinctTokens > top.Count ? $"（共 {tally.DistinctTokens} 种）" : "";
 

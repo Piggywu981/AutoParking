@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Developer-only live probe: reads the running game's memory from outside the process and
+    answers "does the game itself hold map items at this spot that the archive data lacks?".
+    That is the decisive experiment for the cone field (design doc 38 addendum): the overlay
+    and the offline archive reads agree there are no cone items in /map/usa.mbd there, while
+    cones visibly stand in the world. If the game's own nearby-item list has them, they are
+    runtime objects and the memory route is real; if not, they are pure render geometry.
+
+    Everything here is lifted from the ets2la_plugin source (gitlab.com/ETS2LA/ets2la_plugin,
+    shallow-cloned at D:\tmp\ets2la_plugin_src): patterns.win32.hpp for the signatures,
+    base_ctrl.cpp for the resolution semantics, kdop_item.hpp / array_dyn.hpp for the layouts.
+    Pure ReadProcessMemory - no injection, no host DLLs, no NuGet.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+  </PropertyGroup>
+
+</Project>

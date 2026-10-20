@@ -52,6 +52,18 @@ public static class MapItemSurface
             case Sign sign:
                 kind = "Sign";
                 token = sign.Model.ToString();
+                // Cones are Sign items (927 of 959 in ETS2, 7293 of 7514 in ATS), and the installed
+                // TruckLib does publish Sign.Collision - not reading it drew every cone as a hollow
+                // point and kept the whole family out of the ground-truth blockers.
+                collision = sign.Collision;
+                return true;
+            // The class that repeats a model along a path: most of the shipped map's barriers, fences,
+            // construction props and even depot buildings live here, and the identity is on the
+            // subcurve, not on the item. Reporting nothing for Curve is what hid 108k barrier items.
+            case Curve curve:
+                kind = "Curve";
+                token = curve.Subcurves.FirstOrDefault(s => s != null)?.Model.ToString() ?? "";
+                collision = curve.Collision;
                 return true;
             case Compound compound:
                 kind = "Compound";
@@ -64,6 +76,41 @@ public static class MapItemSurface
                 return false;
         }
     }
+
+    /// <summary>
+    ///  The item's own ground footprint, read out of the map's k-DOP.
+    ///
+    ///  `MapItem.Kdop` is an internal property, but it returns a `KdopItem` whose public base
+    ///  `KdopBounds` exposes `Minimums[5]`/`Maximums[5]` - the same 25-DOP the game holds in memory.
+    ///  Measured offline: a traffic cone (`sign.dlc_fr_219`) reads min [-394.3, 53.1, 1279.6, …] /
+    ///  max [-393.7, 54.0, 1280.2, …], i.e. 0.6 m × 0.6 m on the ground and 0.9 m tall. So real extents
+    ///  do not need a PMD parse per token after all - the sector file already carries them (doc 26
+    ///  open-question ①/29 assumed otherwise).
+    ///
+    ///  For an item that spans a chain (Curve) the box is the box of the whole chain, so its short axis
+    ///  is the chain's width and its long axis is its length; that is only meaningful per axis pair.
+    /// </summary>
+    public static bool TryGroundBox(MapItem item, out Vector2 min, out Vector2 max)
+    {
+        min = Vector2.Zero;
+        max = Vector2.Zero;
+
+        if (KdopProperty == null)
+            return false;
+
+        if (KdopProperty.GetValue(item) is not KdopBounds bounds || bounds.Minimums == null || bounds.Maximums == null
+            || bounds.Minimums.Length < 3 || bounds.Maximums.Length < 3)
+            return false;
+
+        min = new Vector2(bounds.Minimums[0], bounds.Minimums[2]);
+        max = new Vector2(bounds.Maximums[0], bounds.Maximums[2]);
+        return max.X > min.X && max.Y > min.Y;
+    }
+
+    private static readonly System.Reflection.PropertyInfo? KdopProperty =
+        typeof(MapItem).GetProperty("Kdop", System.Reflection.BindingFlags.NonPublic
+                                            | System.Reflection.BindingFlags.Instance
+                                            | System.Reflection.BindingFlags.Public);
 
     /// <summary>
     ///  Where the item sits on the ground. The item's own nodes beat the node the walk arrived

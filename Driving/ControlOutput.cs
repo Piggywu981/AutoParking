@@ -24,7 +24,11 @@ public sealed class ControlOutput
     /// <summary>Set from the settings page every tick; see <c>AutoParkingSettings.ControlWeight</c>.</summary>
     public float Weight = 20.0f;
 
-    private readonly ControlChannelDefinition driveChannel = new() { Id = ChannelPrefix + "drive", Timeout = 0.3f };
+    // The game-side reader drops its own claim on the pedal after 0.2 s without a fresh write
+    // (`core.cpp:184-187`), and when it drops it does not clear the pedal value it last injected
+    // (`core.cpp:231-239`). A channel that times out therefore does not return the truck to the
+    // driver, it returns it to a stale pedal, so surviving a tick stall is the safer failure.
+    private readonly ControlChannelDefinition driveChannel = new() { Id = ChannelPrefix + "drive", Timeout = 1.0f };
     private readonly ControlChannelDefinition gearChannel = new() { Id = ChannelPrefix + "gear", Timeout = 0.5f };
     private readonly ControlChannelDefinition holdChannel = new() { Id = ChannelPrefix + "hold", Timeout = 0.5f };
 
@@ -45,6 +49,16 @@ public sealed class ControlOutput
     /// <summary>The signed acceleration actually published: positive throttle, negative brake.</summary>
     public float LastAcceleration { get; private set; }
 
+    /// <summary>
+    ///  The published acceleration floor used in place of an exact zero. On the memory transport the
+    ///  host claims the game-side override only while the averaged value is non-zero
+    ///  (<c>Output.cs:304</c> writes <c>override_acceleration = weightedValue != 0</c>), and giving it
+    ///  up does not clear the pedal the game was last handed (<c>core.cpp:231-239</c> only logs). An
+    ///  exact zero from us is therefore not "coast" - it is "stop refreshing, keep whatever pedal was
+    ///  last latched". A creep brake value keeps the override held and the wheel state known.
+    /// </summary>
+    private const float OverrideFloorAcceleration = -0.01f;
+
     public void Apply(ControlDemand demand)
     {
         LastSteer = demand.Steer;
@@ -63,6 +77,10 @@ public sealed class ControlOutput
     private void PublishDrive(ControlDemand demand)
     {
         float acceleration = Math.Clamp(demand.Throttle - demand.Brake, -1f, 1f);
+
+        if (acceleration == 0.0f)
+            acceleration = OverrideFloorAcceleration;
+
         LastAcceleration = acceleration;
 
         ControlVariables variables = new() { steering = Math.Clamp(demand.Steer, -1f, 1f) };

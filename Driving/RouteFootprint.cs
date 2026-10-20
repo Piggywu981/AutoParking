@@ -23,8 +23,10 @@ public static class RouteFootprint
     ///  insists on, so the area and the conflicts describe one vehicle, not two.</summary>
     public static (double LengthM, double WidthM) EnvelopeSize(AutoParkingSettings settings)
     {
-        return (settings.VehicleLengthM + 0.6 + 2.0 * settings.ObstacleMarginM,
-                settings.VehicleWidthM + 0.5 + 2.0 * settings.ObstacleMarginM);
+        // The same box the conflict check sweeps. Before §51 this carried the pre-§46 constants
+        // (+0.6 / +0.5, no EnvelopePadM), so the footprint meter and the planner silently disagreed
+        // as soon as EnvelopePadM moved off its default.
+        return (settings.EnvelopeLengthM, settings.EnvelopeWidthM);
     }
 
     public static void Measure(ParkingPath route, AutoParkingSettings settings, GroundTrust trust)

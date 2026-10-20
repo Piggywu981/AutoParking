@@ -38,6 +38,13 @@ public static class Geometry
 
     /// <summary>
     ///  Telemetry rotation components are fractions of a full turn, not radians.
+    ///
+    ///  The X component IS this file's heading, with no offset: rotation.X = 0.249999 is a truck whose
+    ///  nose points at (-1, 0). Do not "correct" it by half a turn - SCS models face local -Z, so the
+    ///  widely quoted truck_forward = (2(wy+xz), 1-2(x²+y²)) = R·(0,0,+1) is the TAIL, and any mapping
+    ///  derived from it looks 180° off. §47 recorded exactly that mistake; the driver's own view of the
+    ///  scene settled it (sealed cone row behind the cab), and Tools\MemoryProbe --telemetry prints the
+    ///  rotation triple against the game's quaternion for re-checking. Harness asserts the sign.
     /// </summary>
     public static double HeadingFromRotationComponent(double rotationComponent)
     {

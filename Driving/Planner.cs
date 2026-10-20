@@ -39,6 +39,14 @@ public static class Planner
     private const double StartGraceM = 2.0;
     private const double EndGraceM = 1.0;
 
+    /// <summary>
+    ///  Metres of route length the smooth forward family is worth per unit of tightness: a candidate
+    ///  at the planning radius pays the full amount, one twice as gentle pays half. Without this the
+    ///  family's shortest member wins, and the shortest member is the tightest one - which defeats the
+    ///  reason it was added (§53).
+    /// </summary>
+    private const double SmoothTightnessM = 6.0;
+
     /// <param name="trust">When supplied, every candidate gets its swept footprint and unconfirmed-ground
     ///  area measured for the readout. It does not take part in the choice — M7a instruments, M7c decides.</param>
     public static PlanResult Plan(Pose2 start, Pose2 goal, AutoParkingSettings settings, ObstacleSnapshot obstacles,
@@ -146,6 +154,23 @@ public static class Planner
             ParkingPath? withTail = AppendStraightTail(forward, goal, settings.PathSampleM);
             if (withTail != null && withTail.Length <= maxLength)
                 candidates.Add(withTail);
+        }
+
+        // The smooth forward family: same gear as the Reeds-Shepp drive-in but free to creep forward
+        // first and to use two different arc radii. On the ATS course this is the only forward-only
+        // shape that clears the cones at all, and it is what the driver asked for instead of a
+        // multi-point maneuver (§53).
+        if (settings.SmoothForwardLeadInM > 0.0)
+        {
+            foreach (ParkingPath smooth in ReedsShepp.SmoothForward(start, Standoff(goal, tail, DriveDirection.Forward),
+                                                                    radius, settings.PathSampleM,
+                                                                    settings.SmoothForwardLeadInM, SmoothTightnessM,
+                                                                    ReedsShepp.SmoothCandidateMax))
+            {
+                ParkingPath? withTail = AppendStraightTail(smooth, goal, settings.PathSampleM);
+                if (withTail != null && withTail.Length <= maxLength)
+                    candidates.Add(withTail);
+            }
         }
 
         List<ParkingPath> reversed = ReedsShepp.Solve(Standoff(goal, tail, DriveDirection.Reverse), start,
@@ -330,9 +355,30 @@ public static class Planner
 
         double startGrace = startGraceM ?? StartGraceM;
         double endGrace = endGraceM ?? EndGraceM;
-        double length = settings.VehicleLengthM + 0.6 + 2.0 * settings.ObstacleMarginM;
-        double width = settings.VehicleWidthM + 0.5 + 2.0 * settings.ObstacleMarginM;
+
+        // One formula for the swept box, shared with RouteFootprint through the settings (design doc
+        // §51). Defaults 0.25 + 0.5 on a 6.5 x 2.6 m tractor give the historical 8.1 x 4.1 m. The base
+        // pad is a setting because practice-course bays are tighter than that: a 2.46 m truck facing a
+        // 3.1 m cone gap needs total padding <= 0.3 m per side to be admissible at all (§46).
+        double length = settings.EnvelopeLengthM;
+        double width = settings.EnvelopeWidthM;
         double total = path.Length;
+
+        // Conservative cull box: a polygon whose AABB cannot reach the path's AABB (padded by the
+        // envelope's half diagonal) cannot overlap any swept footprint, whatever the heading. The
+        // memory layer (§43) pushes hundreds of small boxes in here, most of them far from the
+        // corridor; testing every sample against every one is the difference between milliseconds
+        // and another tick stall (§39/§40). A strict superset test - same conflicts, less work.
+        Vector2 min = new(float.MaxValue, float.MaxValue), max = new(float.MinValue, float.MinValue);
+        foreach (PathPoint p in path.Points)
+        {
+            min = Vector2.Min(min, p.Position);
+            max = Vector2.Max(max, p.Position);
+        }
+
+        float pad = (float)(0.5 * Math.Sqrt(length * length + width * width));
+        min -= new Vector2(pad, pad);
+        max += new Vector2(pad, pad);
 
         int conflicts = 0;
         for (double along = startGrace; along <= total - endGrace; along += CorridorSampleM)
@@ -345,6 +391,9 @@ public static class Planner
 
             foreach (Vector2[] obstacle in obstacles.Polygons)
             {
+                if (!PolygonTouchesBox(obstacle, min, max))
+                    continue;
+
                 if (Geometry.PolygonsOverlap(footprint, obstacle))
                 {
                     conflicts++;
@@ -354,5 +403,20 @@ public static class Planner
         }
 
         return conflicts;
+    }
+
+    /// <summary>True when the polygon's own AABB overlaps the cull box. AABB overlap is a strict
+    ///  superset of polygon-box overlap: a polygon crossing the box can have no vertex inside it
+    ///  (a long wall run straddling the corridor), but its bounds cannot escape the test.</summary>
+    private static bool PolygonTouchesBox(Vector2[] polygon, Vector2 min, Vector2 max)
+    {
+        Vector2 pMin = new(float.MaxValue, float.MaxValue), pMax = new(float.MinValue, float.MinValue);
+        foreach (Vector2 v in polygon)
+        {
+            pMin = Vector2.Min(pMin, v);
+            pMax = Vector2.Max(pMax, v);
+        }
+
+        return pMax.X >= min.X && pMin.X <= max.X && pMax.Y >= min.Y && pMin.Y <= max.Y;
     }
 }

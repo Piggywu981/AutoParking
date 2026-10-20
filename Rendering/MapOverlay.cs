@@ -27,6 +27,12 @@ internal sealed class MapOverlay
     /// </summary>
     private const double HeadingDeadZonePx = 12.0;
 
+    /// <summary>How far from a bay's rectangle a pick still counts as meaning that bay.</summary>
+    private const double BaySnapReachM = 6.0;
+
+    private static readonly uint ColorBay = Color(0.95f, 0.95f, 0.95f, 0.95f);
+    private static readonly uint ColorBayFill = Color(0.95f, 0.95f, 0.95f, 0.10f);
+
     // Packed the same way Dear ImGui's IM_COL32 does (r | g<<8 | b<<16 | a<<24) so these
     // constants are safe to compute before the ImGui context exists.
     private static uint Color(float r, float g, float b, float a = 1f)
@@ -61,6 +67,15 @@ internal sealed class MapOverlay
     {
         return kind switch
         {
+            // Resolved identities first - these are what a person can point at on the screen.
+            "锥桶" => ColorCone,
+            "护栏" or "防撞桶" or "防撞柱" => ColorBarrier,
+            "围栏" or "墙" => ColorWall,
+            "箱子" or "托盘" or "集装箱" or "料堆" or "桩料" or "施工件" or "脚手架" => ColorCrate,
+            "建筑" => ColorBuilding,
+            "植被" => ColorVegetation,
+            "路面标线" or "电线" or "灯杆" => ColorStaticOther,
+            // Unresolved: fall back to the map class so the layer still reads as *something*.
             "Buildings" => ColorBuilding,
             "Model" => ColorModel,
             "Sign" => ColorSign,
@@ -68,6 +83,20 @@ internal sealed class MapOverlay
             _ => ColorStaticOther
         };
     }
+
+    private static readonly uint ColorCone = Color(0.98f, 0.45f, 0.15f);
+    private static readonly uint ColorConeEdge = Color(0.10f, 0.06f, 0.02f);
+    // Runtime-spawned cones read out of the game's memory (§41). Deliberately redder and slightly
+    // larger than the archive cones above: a cone is a cone, but where it came from is exactly the
+    // thing this layer exists to debug.
+    private static readonly uint ColorMemCone = Color(1f, 0.30f, 0.10f);
+    private static readonly uint ColorMemConeEdge = Color(0.12f, 0.04f, 0.01f);
+    private static readonly uint ColorMemBoard = Color(0.55f, 0.10f, 0.10f);
+    private static readonly uint ColorMemMover = Color(0.29f, 0.56f, 0.85f);
+    private static readonly uint ColorBarrier = Color(0.95f, 0.90f, 0.25f);
+    private static readonly uint ColorWall = Color(0.85f, 0.35f, 0.85f);
+    private static readonly uint ColorCrate = Color(0.75f, 0.55f, 0.25f);
+    private static readonly uint ColorVegetation = Color(0.35f, 0.75f, 0.35f);
     private static readonly uint ColorTruck = Color(0.30f, 0.95f, 0.45f);
     private static readonly uint ColorTarget = Color(0.95f, 0.85f, 0.30f);
     private static readonly uint ColorTargetLocked = Color(0.35f, 0.90f, 0.95f);
@@ -251,6 +280,8 @@ internal sealed class MapOverlay
             ImGui.SameLine();
             ImGui.TextColored(new Vector4(0.80f, 0.68f, 0.45f, 1f), "沙色=prefab 轮廓（凸包近似）");
             ImGui.SameLine();
+            ImGui.TextColored(new Vector4(1f, 0.30f, 0.10f, 1f), "橙红=内存锥桶（运行时生成）");
+            ImGui.SameLine();
             ImGui.TextColored(new Vector4(0.55f, 0.55f, 0.55f, 1f), "· 实心=地图标记可碰");
         }
 
@@ -267,6 +298,92 @@ internal sealed class MapOverlay
         drawList.AddRect(canvasMin, canvasMax, ColorCanvasEdge, 0f, thickness: 1f);
 
         DrawGrid(drawList, canvasMin, canvasMax, canvasCenter, truckPlane, scale);
+
+        // Bays the cones outline, read by ParkingBays. Drawn under the items so the cone rows that
+        // form the walls stay visible; the arrow is the heading the bay asks for (nose in through the
+        // opening), which is also what a snapped pick gets.
+        if (geometry != null && settings.ShowMemoryItems)
+        {
+            foreach (ParkingBay bay in geometry.Bays)
+            {
+                Vector2 cornerMin = ToCanvas(bay.Center - bay.HalfSize, canvasCenter, truckPlane, scale);
+                Vector2 cornerMax = ToCanvas(bay.Center + bay.HalfSize, canvasCenter, truckPlane, scale);
+                drawList.AddRectFilled(cornerMin, cornerMax, ColorBayFill);
+                drawList.AddRect(cornerMin, cornerMax, ColorBay, 4f, ImDrawFlags.None, 2f);
+
+                Vector2 nose = Geometry.ForwardFromHeading(bay.HeadingRad);
+                Vector2 from = ToCanvas(bay.Center - nose * (float)(bay.InteriorLengthM * 0.35),
+                                        canvasCenter, truckPlane, scale);
+                Vector2 to = ToCanvas(bay.Center + nose * (float)(bay.InteriorLengthM * 0.35),
+                                      canvasCenter, truckPlane, scale);
+                drawList.AddLine(from, to, ColorBay, 3f);
+                Vector2 wing = new(-nose.Y, nose.X);
+                drawList.AddLine(to, to - (nose + wing * 0.5f) * 12f, ColorBay, 3f);
+                drawList.AddLine(to, to - (nose - wing * 0.5f) * 12f, ColorBay, 3f);
+            }
+        }
+
+        // The game's runtime-spawned items (roadwork cones above all) exist only in game memory -
+        // the host's MapData cannot contain them (design doc §41). This layer reads from the
+        // reader's snapshot, so it works even before the map geometry is ready. "Other" kinds are
+        // skipped on purpose: the full list also carries archive items the static layer below
+        // already draws, and double-drawing them would hide which dots the archive is missing.
+        KdopReader.Snapshot? memSnapshot = settings.ShowMemoryItems ? plugin.MemoryItemSnapshot : null;
+        float memNearestM = float.MaxValue;
+        if (memSnapshot != null)
+        {
+            foreach (KdopReader.MemItem item in memSnapshot.Items)
+            {
+                if (item.Kind == KdopReader.MemKind.Other)
+                    continue;
+
+                if (item.Kind == KdopReader.MemKind.Cone)
+                {
+                    float distance = (float)Geometry.Distance(item.PlanePos, truckPlane);
+                    if (distance < memNearestM)
+                        memNearestM = distance;
+                }
+
+                Vector2 at = ToCanvas(item.PlanePos, canvasCenter, truckPlane, scale);
+                if (at.X < canvasMin.X - 8f || at.X > canvasMax.X + 8f || at.Y < canvasMin.Y - 8f || at.Y > canvasMax.Y + 8f)
+                    continue;
+
+                switch (item.Kind)
+                {
+                    case KdopReader.MemKind.Cone:
+                        drawList.AddCircleFilled(at, 4.2f, ColorMemCone);
+                        drawList.AddCircle(at, 4.2f, ColorMemConeEdge, 12, 1.4f);
+                        break;
+                    case KdopReader.MemKind.Board:
+                        drawList.AddRectFilled(at - new Vector2(3f, 3f), at + new Vector2(3f, 3f), ColorMemBoard);
+                        break;
+                    case KdopReader.MemKind.Mover:
+                        drawList.AddCircleFilled(at, 3.2f, ColorMemMover);
+                        drawList.AddCircle(at, 3.2f, ColorMemConeEdge, 12, 1f);
+                        break;
+                    case KdopReader.MemKind.Building:
+                    {
+                        // The real footprint, not a fixed marker: a wall run must read as a wall.
+                        // Same hue as the static layer's buildings - a building is a building -
+                        // with a dark edge so memory-sourced ones stay tellable apart.
+                        Vector2 half = new(MathF.Max(item.Dx, 0.6f) * scale * 0.5f,
+                                           MathF.Max(item.Dz, 0.6f) * scale * 0.5f);
+                        drawList.AddRectFilled(at - half, at + half, ColorBuilding);
+                        drawList.AddRect(at - half, at + half, ColorMemConeEdge, 0f, 0, 1f);
+                        break;
+                    }
+                }
+            }
+
+            string memStatus = memSnapshot.Status;
+            if (memNearestM < float.MaxValue)
+                memStatus += $" · 最近内存锥桶 {memNearestM:0} m";
+            if (settings.BlockRouteWithMemoryItems)
+                memStatus += " · 已拦路";
+            float memLineY = (canvasMax.Y - canvasMin.Y) - (geometry != null ? 46f : 16f);
+            drawList.AddText(canvasMin + new Vector2(10f, memLineY), ColorMemCone,
+                $"内存 {memStatus}");
+        }
 
         if (geometry == null)
         {
@@ -310,12 +427,28 @@ internal sealed class MapOverlay
 
         foreach (MapGeometry.StaticShape shape in geometry.StaticShapes)
         {
-            uint color = ShapeColor(shape.Kind);
+            // Label first, class second: "那一坨灰点是什么" is only answerable once the token has been
+            // resolved, and a cone is drawn as a cone rather than as an anonymous Sign point.
+            uint color = ShapeColor(shape.Label.Length > 0 ? shape.Label : shape.Kind);
 
             if (shape.Points.Length == 1)
             {
                 Vector2 at = ToCanvas(shape.Points[0], canvasCenter, truckPlane, scale);
-                if (shape.Collision)
+                if (shape.Label == "锥桶")
+                {
+                    // Cones are the object this layer exists to catch, so they get a marker that survives
+                    // zooming out: an orange disc with a dark rim, always readable at map scale, plus an
+                    // outer ring when the map says it collides (the flag that lets it block a route).
+                    drawList.AddCircleFilled(at, 3.4f, ColorCone);
+                    drawList.AddCircle(at, 3.4f, ColorConeEdge, 12, 1.4f);
+                    if (shape.Collision)
+                        drawList.AddCircle(at, 7f, ColorCone, 16, 1f);
+                    continue;
+                }
+
+                if (shape.Blocks)
+                    drawList.AddRectFilled(at - new Vector2(2.5f, 2.5f), at + new Vector2(2.5f, 2.5f), color);
+                else if (shape.Collision)
                     drawList.AddCircleFilled(at, 2.2f, color);
                 else
                     drawList.AddCircle(at, 2.2f, color, 0, 1f);
@@ -348,9 +481,7 @@ internal sealed class MapOverlay
 
         PlanResult? plan = plugin.PlanSnapshot;
         if (plan?.Path != null)
-        {
-            DrawRoute(drawList, plan.Path, canvasCenter, truckPlane, scale);
-        }
+            DrawRoute(drawList, plan.Path, canvasCenter, truckPlane, scale, plan.ConflictCount > 0);
 
         // The sample is a circle around the truck and the canvas is a rectangle, so "not drawn" is
         // very often just "not visible". Show the boundary and both radii instead of leaving that to
@@ -360,6 +491,13 @@ internal sealed class MapOverlay
                                   + MathF.Pow((canvasMax.Y - canvasMin.Y) * 0.5f, 2f)) / scale;
         drawList.AddText(canvasMin + new Vector2(10f, (canvasMax.Y - canvasMin.Y) - 16f), ColorText,
             $"采样 {geometry.RadiusM:0} m · 可见 ±{visibleM:0} m · 静态 {geometry.StaticShapes.Count} 项 · 场站轮廓 {geometry.PrefabOutlines.Count}");
+        // The nearest-cone number is the one that answers "is the map lying to me": if the game shows a
+        // cone line and this reads 锥桶 0, the objects are not map items at all.
+        string identities = string.Join(" ", geometry.Probe.Labels(4)
+            .Select(label => $"{label.Name}×{label.Count}({label.NearestM:0} m)"));
+        drawList.AddText(canvasMin + new Vector2(10f, (canvasMax.Y - canvasMin.Y) - 32f), ColorText,
+            identities.Length > 0 ? $"身份 {identities} · 静态障碍 {geometry.Obstacles.Count}"
+                                 : "身份 未解析（定义表还在填，或附近没有认得出的物体）");
 
         DrawScaleBar(drawList, canvasMin, scale);
         HandleMouse(interactive, canvasMin, canvasMax, canvasCenter, truckPlane, scale, settings, geometry);
@@ -367,16 +505,21 @@ internal sealed class MapOverlay
 
     /// <summary>
     ///  The planned route: forward legs in cyan, reverse legs in orange, gear changes as white
-    ///  dots. This is the user's chance to veto a route before it is ever driven.
+    ///  dots. This is the user's chance to veto a route before it is ever driven. A conflicted
+    ///  fallback (no clean candidate exists, the start will be refused) is drawn in obstacle red
+    ///  instead - the first person to be confused by a cone-crossing route drawn in "go" colors
+    ///  was the owner, and the status line alone did not carry the message.
     /// </summary>
-    private static void DrawRoute(ImDrawListPtr drawList, ParkingPath path, Vector2 canvasCenter, Vector2 truckPlane, float scale)
+    private static void DrawRoute(ImDrawListPtr drawList, ParkingPath path, Vector2 canvasCenter, Vector2 truckPlane, float scale,
+                                  bool conflicted)
     {
         IReadOnlyList<PathPoint> points = path.Points;
         for (int i = 1; i < points.Count; i++)
         {
             Vector2 from = ToCanvas(points[i - 1].Position, canvasCenter, truckPlane, scale);
             Vector2 to = ToCanvas(points[i].Position, canvasCenter, truckPlane, scale);
-            uint color = points[i].Travel == DriveDirection.Forward ? ColorRouteForward : ColorRouteReverse;
+            uint color = conflicted ? ColorObstacle
+                : points[i].Travel == DriveDirection.Forward ? ColorRouteForward : ColorRouteReverse;
             drawList.AddLine(from, to, color, 2.5f);
         }
 
@@ -460,8 +603,16 @@ internal sealed class MapOverlay
             double reference = plugin.CurrentPose.HeadingRad;
             Pose2 pose = new(world.X, world.Y, reference);
 
-            bool snappedToCurve = false;
-            if (settings.SnapToNavCurve && geometry.TrySnapToCurve(world, 3.0, reference, out Pose2 snapped))
+            // The bay wins over a nav curve: a spot merely near the game's bay still fails the job, and
+            // the bay is the more specific claim about what the player meant.
+            bool snappedToBay = false, snappedToCurve = false;
+            if (settings.SnapToParkingBay && geometry.Bays.Count > 0
+                && ParkingBays.TrySnap(geometry.Bays, world, BaySnapReachM, out Pose2 bayPose))
+            {
+                pose = bayPose;
+                snappedToBay = true;
+            }
+            else if (settings.SnapToNavCurve && geometry.TrySnapToCurve(world, 3.0, reference, out Pose2 snapped))
             {
                 pose = snapped;
                 snappedToCurve = true;
@@ -474,7 +625,7 @@ internal sealed class MapOverlay
             dragScale = scale;
             dragCanvasMin = canvasMin;
 
-            Logger.Info($"AutoParking: 选位开始 世界=({pose.X:0.00}, {pose.Z:0.00}) 吸附导航线={snappedToCurve} " +
+            Logger.Info($"AutoParking: 选位开始 世界=({pose.X:0.00}, {pose.Z:0.00}) 吸附车位={snappedToBay} 吸附导航线={snappedToCurve} " +
                         $"朝向={pose.YawDegrees:0.0}° 画布左上=({canvasMin.X:0}, {canvasMin.Y:0}) 比例={scale:0.00}px/m");
             return;
         }

@@ -15,7 +15,10 @@ public enum PlanSource
     StraightReverse,
     ReedsSheppForward,
     ReedsSheppReverse,
-    TwoLegStaging
+    TwoLegStaging,
+
+    /// <summary>Forward-only, no gear switch: lead-in straight, two arcs of possibly different radius.</summary>
+    SmoothForward
 }
 
 public readonly record struct PathPoint(Vector2 Position, double HeadingRad, double Curvature,

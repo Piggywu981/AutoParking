@@ -42,12 +42,60 @@ public sealed class AutoParkingSettings
     public double EntryDistanceM { get; set; } = 12.0;
     public double OvershootM { get; set; } = 0.5;
 
-    // Vehicle geometry
+    // Vehicle geometry. What the game publishes here is uneven, and it is worth recording which of
+    // these four is a fact we read and which is a number we type:
+    //
+    //   - Wheelbase      measured, see AutoCalibrateRadius below.
+    //   - MaxSteerDeg    NOT in telemetry and not in the truck defs. The only value SCS ships is a
+    //                    comment in def/vehicle/physics.sii ("maximum wheel turn (30degrees)"), which
+    //                    is a global physics note rather than this truck's parameter. So this stays
+    //                    hand-set, and it is the one input to the turning radius we cannot obtain.
+    //   - VehicleLength
+    //   - VehicleWidth   not in telemetry either. The chassis/cab/hood each carry their own model
+    //                    bounding box (TruckLib.Models.Model.Open(path, fileSystem).BoundingBox -
+    //                    measured 3.14 x 1.34 x 8.99 m for a Cascadia 6x2_short chassis), so real
+    //                    extents exist but only per accessory part, and which parts are fitted
+    //                    changes with the configuration. Unioning them is a separate piece of work;
+    //                    until then these two are display-only, as the settings page says.
     public double WheelbaseM { get; set; } = 4.0;
     public double MaxSteerDeg { get; set; } = 33.0;
     public double VehicleLengthM { get; set; } = 6.5;
     public double VehicleWidthM { get; set; } = 2.6;
+
+    /// <summary>
+    ///  Overwrite <see cref="WheelbaseM"/> with the wheelbase measured from the wheel positions the
+    ///  game publishes as vehicle configuration, so it follows the truck instead of a number typed
+    ///  while driving some other one. Off means the hand-typed value wins outright.
+    /// </summary>
     public bool AutoCalibrateRadius { get; set; } = true;
+
+    /// <summary>
+    ///  Size the swept box from the truck that is actually being driven: the game's own local AABB of
+    ///  the player's vehicle, read from memory the way its traffic code reads every vehicle (design doc
+    ///  §52). It is the only source for the vehicle's LENGTH - measured on the ATS course's 6x2 as
+    ///  8.43 × 2.47 × 3.84 m against typed defaults of 6.5 × 2.6, i.e. the box was nearly two metres
+    ///  shorter than the truck. When that read is unavailable the width falls back to the wheel centres
+    ///  plus <see cref="TireHalfWidthM"/>; the length keeps the typed value.
+    /// </summary>
+    public bool AutoCalibrateBody { get; set; } = true;
+
+    /// <summary>
+    ///  Half a tyre, added to each side of the outer wheel centre - used only when the body box above
+    ///  could not be read. The telemetry publishes wheel positions and no tyre dimension at all
+    ///  (checked against the whole GameTelemetryData), so this is the one part of the width that stays
+    ///  typed. Cross-checked once: wheel centres ±1.03 + 0.20/side gave 2.46 m against the game's own
+    ///  2.47 m.
+    /// </summary>
+    public double TireHalfWidthM { get; set; } = 0.2;
+
+    /// <summary>
+    ///  The box the obstacle conflict check sweeps across the route, and the one the map and AR draw.
+    ///  One place on purpose: <c>RouteFootprint</c> kept the pre-§46 formula and disagreed with the
+    ///  planner as soon as <see cref="EnvelopePadM"/> moved off its default (design doc §51).
+    /// </summary>
+    public double EnvelopeWidthM => VehicleWidthM + 2.0 * (EnvelopePadM + ObstacleMarginM);
+
+    public double EnvelopeLengthM => VehicleLengthM + 0.1 + 2.0 * (EnvelopePadM + ObstacleMarginM);
 
     // Speeds
     public double ForwardSpeedKph { get; set; } = 6.0;
@@ -93,8 +141,37 @@ public sealed class AutoParkingSettings
     public double TerminalStraightM { get; set; } = 1.5;
     public double PathSampleM { get; set; } = 0.25;
 
+    /// <summary>
+    ///  How far forward the smooth forward family may creep before it starts its turn. The maneuver
+    ///  begins wherever the truck is, and on a cone course the cone that refuses a curve is usually
+    ///  ten metres ahead of the nose - so the first metre count of the route is a straight, not an arc.
+    ///  Zero turns the family off and leaves the older candidates as the only choices (§53).
+    /// </summary>
+    public double SmoothForwardLeadInM { get; set; } = 12.0;
+
     // Obstacles
-    public double ObstacleMarginM { get; set; } = 0.5;
+
+    /// <summary>
+    ///  The variable half of the per-side envelope padding, on top of <see cref="EnvelopePadM"/>.
+    ///  Only the sum reaches anything: the corridor check sweeps
+    ///  VehicleWidthM + 2*(EnvelopePadM + ObstacleMarginM) meters wide (§51). Its floor used to be
+    ///  0.2 m, which together with the pad floor made 0.2 m the tightest envelope expressible - and
+    ///  the ATS cone course's measured 3.44 m bay mouth admits a 2.47 m truck with 0.49 m per side,
+    ///  so a 0.25 m/side total left no route at all, smooth or otherwise (§53). Floor now 0.05.
+    /// </summary>
+    public double ObstacleMarginM { get; set; } = 0.05;
+
+    /// <summary>
+    ///  Per-side base padding of the obstacle envelope, on top of <see cref="ObstacleMarginM"/>.
+    ///  Together they decide how wide a gap must be before a route may use it: the corridor check
+    ///  sweeps a box of VehicleWidthM + 2*(pad + margin) meters. The old 0.25 + 0.5 reproduced the
+    ///  historical 4.0 m width, which is a highway number: measured on the practice course, the bay
+    ///  mouth is 3.44 m clear and the truck 2.47 m wide, so 0.10 m per side still leaves twelve clean
+    ///  routes, 0.15 leaves three and 0.20 leaves none - including the two-shift route §52 believed
+    ///  was passing there (§53, numbers in scratch/pad_table.py). What you shave off here comes
+    ///  straight out of the tracking-error budget - raise it back for public roads.
+    /// </summary>
+    public double EnvelopePadM { get; set; } = 0.05;
 
     /// <summary>
     ///  Only conflicts this far ahead of the vehicle stop it. Anything further is not a reason to
@@ -129,11 +206,39 @@ public sealed class AutoParkingSettings
     /// </summary>
     public bool ShowControlPlot { get; set; } = false;
 
+    /// <summary>
+    ///  Draw the map items the game spawned at runtime (roadwork cones above all) on the flat map.
+    ///  These never pass through sector parsing, so the host's MapData cannot see them - they come
+    ///  from the game's own kdop item lists, read from the game process by KdopReader (§41). The
+    ///  reader is read-only, runs on its own background task, and degrades to a status line if the
+    ///  game is absent or a pattern misses after an update. Drawn only - nothing here blocks a
+    ///  route yet, same 只画不拦 contract as the static layer.
+    /// </summary>
+    public bool ShowMemoryItems { get; set; } = true;
+
+    /// <summary>
+    ///  Feed the memory items (cones, boards, movers, buildings) into the planner's obstacle set,
+    ///  so routes avoid them like any other blocker. Owner decision 2026-10-16: a physical object
+    ///  standing near the lot must not be hit whatever exactly it is, so classification generosity
+    ///  is acceptable here - a misread small sign blocking the route fails safe (the maneuver is
+    ///  rejected or re-routed), while a missed cone fails into a collision. The known failure mode
+    ///  is unchanged by this: if the cones leave no corridor, replans run out (MaxReplans) and the
+    ///  maneuver falls back to the frozen route - only the hotkey ends that; keep a hand on it.
+    /// </summary>
+    public bool BlockRouteWithMemoryItems { get; set; } = true;
+
     public double ArGroundTrimM { get; set; } = 0.0;
     public double MapScalePxPerM { get; set; } = 1.25;
     public double MapZoom { get; set; } = 1.0;
     public double MapViewRadiusM { get; set; } = 120.0;
     public bool SnapToNavCurve { get; set; } = true;
+
+    /// <summary>
+    ///  A pick that lands in or near a cone-outlined parking bay is moved to that bay's centre and given
+    ///  the bay's own heading (nose in through the opening), because a spot merely close to the game's
+    ///  bay still fails the job. Bays come from <see cref="ParkingBays"/>; see design doc §50.
+    /// </summary>
+    public bool SnapToParkingBay { get; set; } = true;
 
     /// <summary>
     ///  How far a navigation curve or lane centerline vouches for the ground beside it. Half of a typical
@@ -180,6 +285,7 @@ public sealed class AutoParkingSettings
         MaxSteerDeg = Math.Clamp(MaxSteerDeg, 20.0, 45.0);
         VehicleLengthM = Math.Clamp(VehicleLengthM, 4.0, 12.0);
         VehicleWidthM = Math.Clamp(VehicleWidthM, 1.8, 3.2);
+        TireHalfWidthM = Math.Clamp(TireHalfWidthM, 0.05, 0.45);
 
         ForwardSpeedKph = Math.Clamp(ForwardSpeedKph, 2.0, 15.0);
         ReverseSpeedKph = Math.Clamp(ReverseSpeedKph, 1.0, 8.0);
@@ -203,9 +309,11 @@ public sealed class AutoParkingSettings
         GearSwitchPenaltyM = Math.Clamp(GearSwitchPenaltyM, 0.0, 20.0);
         PlanRadiusMargin = Math.Clamp(PlanRadiusMargin, 1.0, 2.5);
         TerminalStraightM = Math.Clamp(TerminalStraightM, 0.0, 5.0);
+        SmoothForwardLeadInM = Math.Clamp(SmoothForwardLeadInM, 0.0, 25.0);
         PathSampleM = Math.Clamp(PathSampleM, 0.1, 1.0);
 
-        ObstacleMarginM = Math.Clamp(ObstacleMarginM, 0.2, 1.5);
+        ObstacleMarginM = Math.Clamp(ObstacleMarginM, 0.05, 1.5);
+        EnvelopePadM = Math.Clamp(EnvelopePadM, 0.0, 1.0);
         ObstacleLookaheadM = Math.Clamp(ObstacleLookaheadM, 1.5, 15.0);
         MaxReplans = Math.Clamp(MaxReplans, 0, 8);
 

@@ -128,6 +128,36 @@ internal static class MapProbeChecks
         bool nestedShown = nested.Lines(6).Any(line => line.Contains("内含 3"));
         Report(ref failures, nestedShown, "明细行显示内含数", $"出现「内含 3」：{nestedShown}");
 
+        // 7) Identity labels: a map item only carries a short code (`dlc_fr_219`), and the same code is a
+        // barrier column, a transformer and a building scheme depending on the class prefix. The label is
+        // the only thing on the inventory that tells a cone from a lamp post, so it has to be tallied apart
+        // from the codes and survive onto the line - and an item the identity table cannot name must stay
+        // unnamed rather than borrowing a neighbour's label.
+        MapItemProbe labelled = new() { Center = new Vector2(0, 0), RadiusM = 120 };
+        labelled.Add(1, "Sign", "dlc_fr_219", true, new Vector2(6, 0), label: "锥桶");
+        labelled.Add(2, "Sign", "dlc_fr_219", true, new Vector2(7, 0), label: "锥桶");
+        labelled.Add(3, "Curve", "0700s", true, new Vector2(8, 0), label: "护栏");
+        labelled.Add(4, "Model", "1061", false, new Vector2(9, 0));
+
+        MapItemProbe.TypeTally signs = labelled.TallyOf("Sign")!;
+        bool labelTallied = signs.Count == 2 && signs.DistinctLabels == 1
+                            && signs.TopLabels(3).Single().Name == "锥桶"
+                            && signs.TopLabels(3).Single().Count == 2;
+        Report(ref failures, labelTallied, "身份按类单独计数",
+            $"Sign {signs.Count} 个 · 身份 {string.Join(",", signs.TopLabels(3).Select(l => $"{l.Name}×{l.Count}"))} " +
+            $"（判据 锥桶×2）");
+
+        bool probeLabels = labelled.Labels(6).Select(l => l.Name).SequenceEqual(new[] { "锥桶", "护栏" })
+                            && labelled.Label("锥桶")!.Value.NearestM == 6 && labelled.Label("护栏")!.Value.NearestM == 8;
+        Report(ref failures, probeLabels, "全窗口身份汇总只数有名字的、并带最近距离",
+            $"「{string.Join(" ", labelled.Labels(6).Select(l => $"{l.Name}×{l.Count}({l.NearestM:0} m)"))}」" +
+            $"（判据 锥桶×2 最近 6 m、护栏×1 最近 8 m，无名那条不出现）");
+        Report(ref failures, labelled.Label("箱子") == null, "样本里没有的家族不出现",
+            $"箱子：{(labelled.Label("箱子") == null ? "无" : "出现了")}");
+
+        bool labelShown = labelled.Lines(6).Any(line => line.Contains("Sign 2") && line.Contains("身份 锥桶×2"));
+        Report(ref failures, labelShown, "明细行显示身份", labelled.Lines(6).First(line => line.StartsWith("Sign")));
+
         return failures;
     }
 

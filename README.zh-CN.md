@@ -73,6 +73,10 @@
     连多边形都形不成。设计文档 §31 记了它在真实场区跑出来的样子：全是路口构件，不是车前那堆箱子。
     按钮行末尾是**「锁定窗口」勾选框**：勾上时窗口位置和大小被冻住（`ImGuiWindowFlags.NoMove | NoResize`），
     这是让选位手势确定的前提，原因见第 8 节。默认不勾，因为窗口本来就需要偶尔挪开。
+    **橙红点是内存锥桶**（施工区那类游戏运行时生成的物件，地图文件里没有，§41）：插件以只读方式
+    从游戏进程读它自己的条目列表（独立后台线程 0.5 s 一拍，不占 tick），画锥桶/施工牌/动态物件/
+    建筑（品红实心块，真实占地大小），画布角落有计数和最近距离。开启「内存条目拦路」后这些
+    （建筑也是）同时进规划障碍集——路线绕开、绕不开就拒绝启动或重规划（§43）。
   - **AR 叠加层**（游戏画面上，默认开）：车位框、车身投影、前进方向箭头、目标位姿，外加
     **路线预览**——动手之前就把"将要占用的走廊 + 将要走的中心线 + 换挡点"画在车前地面上（见 6.7）。
   - **控制分项曲线**（ImGui 窗口，**默认关**）：最近约 10 秒的控制分项曲线——横向误差、航向误差、
@@ -121,7 +125,8 @@
 | | `RefuseWithTrailer` | true | 带挂车时拒绝启动 |
 | | `ControlWeight` | 20 | 宿主把写同一字段的所有通道按权重平均，所以权重低不是让位，而是被覆盖。实测对手≈14 时我们的刹车请求被换算成正油门，并把气压耗光。与 ACC/超车插件同时使用时调到高于对方 |
 | 车身 | `WheelbaseM` / `MaxSteerDeg` | 4.0 / 33 | 决定最小转弯半径，是最要紧的两个几何参数 |
-| | `VehicleLengthM` / `VehicleWidthM` | 6.5 / 2.6 | 障碍冲突检测用的矩形 footprint |
+| | `VehicleLengthM` / `VehicleWidthM` | 6.5 / 2.6 | 障碍冲突判定所扫的矩形。开着自动适应时这两个数会被游戏自己的车体包围盒覆盖（现场 6x2 实测 8.43 × 2.47 m，§52）——手填值只是读不到时的底 |
+| | `AutoCalibrateBody` / `TireHalfWidthM` | true / 0.2 | 用游戏自己给玩家车辆的局部包围盒同时覆盖手填的长和宽（与游戏给所有 AI 车定中心用的是同一个盒子，§52；现场实测 8.43 × 2.47 × 3.84 m，而手填是 6.5 × 2.6）。读不到时宽度退回 2×(最外轮心 + 本项)、长度保持手填。只测牵引车头，挂车是另一个对象 |
 | 速度 | `ForwardSpeedKph` / `ReverseSpeedKph` | 6 / 3 | 爬行速度上限 |
 | | `MaxAccel` / `MaxBrakeDecel` / `ComfortDecel` | 1.0 / 1.2 / 0.5 | 踏板量与参考速度剖面 |
 | | `LaunchAccelMps2` | 0.6 | 静止起步补偿（滚动阻力+传动间隙） |
@@ -134,13 +139,17 @@
 | | `TerminalStraightM` | 1.5 | 入库前最后一段直线。圆弧的航向只有在弧的终点才正好对上，早停 0.35 m 就会带着角度出库 |
 | | `PathSampleM` | 0.25 | 路径采样步长 |
 | 容差 | `ToleranceLateralM` / `ToleranceHeadingDeg` | 0.20 / 4.0 | 判定"到位" |
-| | `ObstacleMarginM` | 0.5 | 车身矩形外扩 |
+| | `ObstacleMarginM` | 0.5 | 障碍包络每侧的动态余量 |
+| | `EnvelopePadM` | 0.25 | 障碍包络每侧的基础外扩。包络宽 = `VehicleWidthM` + 2×(本项 + `ObstacleMarginM`)，默认 2.6 m 车宽下合计 **4.1 m**（§46 按 2.5 m 车宽写成 4.0 m，§51 更正）。练习场窄缝推荐 0.05 + 余量 0.2 → 3.1 m；车宽改为轮心实测后是 2.96 m |
 | | `ObstacleLookaheadM` | 4.0 | 只有这个距离以内的冲突才停车。注意扫掠矩形本身约 8 m 长，所以障碍在 7.5 m 外就会登记 |
 | 重规划 | `ReplanWhileStopped` | true | **只在车停着时**重新求解路径——换挡边界、被挡停等 2 秒后，或距终点不再缩短而开始变大时（二段修正挪车）。行进中不重算：新路径与旧路径只在当前点相切、弧长不重合，投影分不清两个参考 |
 | | `MaxReplans` | 3 | 换路径次数上限，用完退回定死。到顶**不会中止**——只有热键能结束动作 |
 | 结束 | `HandbrakeOnFinish` / `RestoreAssistsOnFinish` | true | 到位拉手刹、交还辅助驾驶 |
 | 可视化 | `MapScalePxPerM` / `MapZoom` / `MapViewRadiusM` / `SnapToNavCurve` | 1.25 / 1.0 / 120 / true | |
 | | `LockMapWindow` | false | 选位时冻结地图窗口的位置和大小（见第 8 节） |
+| | `ShowMemoryItems` | true | 画游戏运行时生成的锥桶（从游戏进程只读，§41/§42） |
+| | `BlockRouteWithMemoryItems` | true | 内存条目（锥桶/牌/Mover/建筑）进障碍集，路线绕开或拒绝启动（§43）。失败模式未变：堵死时重规划用完退回定死路线，只有热键能结束 |
+| | `SnapToParkingBay` | true | 从锥桶布局里认出游戏要求的车位（两排相对 + 一端封口 + 一端开口），画出来，落在库内的点自动吸到库中心、车头朝里（从开口指向封口）；并且**车位内部**的条目不再算障碍——车位自己的标记物是两个 8×8 m 的 Mover，不豁免就会把游戏要求的那个库位永远判成被占（§50）。围成库墙的那两排锥桶仍然拦路：内部判定内缩 0.6 m |
 | | `ConfirmedCorridorHalfWidthM` | 5.0 | 导航曲线/车道线向两侧确认多少地面（见 6.6） |
 | | `ArGroundTrimM` | 0.0 | AR 地面微调（车轮接触点估算之外的手工偏移） |
 
@@ -202,7 +211,8 @@ token 名，不是靠猜。token 种类数本身就是要量的一个数：上�
 
 注意：哪些类型能进 `MapData` 由宿主的**数据保真度**（`DataSettings.json`）决定，而且过滤发生在地图
 *解析*时——建筑、牌子在 Medium 就保留；路灯等散落模型要 **High**；公司/城市 POI 区域要 **Extreme**。
-改这个值得重新解析（重启），不是运行中能调的旋钮。
+改这个值得重新解析（重启），不是运行中能调的旋钮。锥桶是 `Sign` 条目，Medium 就已经在里面了；真正要
+**Extreme** 的是 `Curve` 层（护栏/围栏/道具链，见 6.6）——`IgnoredItemTypes` 在它之下会把 `Curve = 0x2C` 丢掉。
 
 ### 6.5 离线扇区读数（`Tools\MapSectorDump`）
 问的是 6.4 同一个问题——"那儿到底有什么"——但直接从游戏的 `.scs` 里读，不用开游戏。它把 `.mbd` 和目标
@@ -217,7 +227,44 @@ dotnet run --project Tools/MapSectorDump -c Release -- <游戏目录或某个 .s
 写任何障碍分类规则之前先跑它：区分"不在地图数据里"、"在数据里但拿不到（prefab 自带几何）"、
 "拿得到但只是画在画面外"这三种情况，这是唯一的便宜办法。设计文档 §30 记了它第一次跑出来的结果。
 
-### 6.6 候选路线代价（日志里的 `路径代价` 块）
+### 6.6 物体到底是什么（`MapItemIdentity`、`Tools\ObjectProbe`）
+
+地图条目不存名字，只存短码——`dlc_fr_219`、`1573`、`2x002`。而**短码不唯一**：`dlc_fr_219` 作为
+`bld_model.dlc_fr_219` 是路障柱，作为 `bld_scheme.dlc_fr_219` 是建筑方案，作为 `model.dlc_fr_219` 是变压器。
+可读身份在单位指向的模型文件里（`/model2/sign/traffic_cone_01_fr.pmd`），而它在 `/def/world/*.sii`。
+所以身份解析走的是「**类限定的单位全名 → 模型路径 → 家族标签**」（锥桶/护栏/围栏/墙/施工件/箱子/植被/路面标线…）。
+整张表离线实测 ~10 s，因此每次地图重建只填 6 个文件，没填上的条目一律算「未分类」——
+**没名字的物体只画、不拦**，这是刻意的：要被当成障碍信任，先得叫得出名字。
+
+真实尺寸是白拿的，跟 §26/§29 的假设相反：`MapItem.Kdop` 是 `internal`，但它的类型继承**公开**的
+`KdopBounds`，`Minimums[5]/Maximums[5]` 就是游戏自己在用的 25-DOP。实测一个锥桶：地面 **0.6 × 0.6 m、高 0.9 m**。
+做包围盒不需要按 token 解析 PMD。
+
+`Tools\ObjectProbe` 就是产出这些测量的离线仪器：
+
+```
+dotnet run --project Tools/ObjectProbe -c Release -- def    [游戏目录] [关键词…]      # /def/world/*.sii 单位
+dotnet run --project Tools/ObjectProbe -c Release -- files  [游戏目录] [路径] [过滤]  # 列归档目录
+dotnet run --project Tools/ObjectProbe -c Release -- units  [游戏目录] <sii> [过滤]   # 一个 SII 里的单位
+dotnet run --project Tools/ObjectProbe -c Release -- curve  [游戏目录] <扇区> [token] # 一个扇区的 Curve 条目
+dotnet run --project Tools/ObjectProbe -c Release -- kdop   [游戏目录] <扇区> [过滤]  # 逐条目 k-DOP 尺寸
+dotnet run --project Tools/ObjectProbe -c Release -- mapscan [游戏目录] [关键词…]     # 全图：按类型 × 模型清点
+dotnet run --project Tools/ObjectProbe -c Release -- token   <字符串|数值…>           # 短码打包/解包
+dotnet run --project Tools/ObjectProbe -c Release -- near    [游戏目录] <x> <z> [半径]  # 某坐标 N 米内到底有什么
+```
+
+锥桶在平面地图上不再和普通点位混画：橙色实心圆 + 深色描边，地图标了可碰撞时再加一圈外环；画布左下角读
+`身份 锥桶×N(最近 x m) · 静态障碍 M`，身份表还没填完时明确写 `身份 未解析`（留空分不清"这里没有"和"还没读到"）。
+那个"最近 x m"就是用来跟游戏对质的数：眼前明明一排锥桶而读数写 `锥桶 0`，说明它们压根不是地图条目
+（§38 就是在 ATS 的一片测试场地上量到这件事的），调保真度也没用。
+
+清点结果按图不同，务必对着**当前运行游戏自己的 `.mbd`** 去数：ETS2 的 `europe` 有 959 个锥桶条目，
+ATS 的 `usa` 有 7 514 个；而且你脚下的扇区可能来自 DLC 归档（`dlc_ks.scs`），所以 `near` 会搜所有归档而不只是 base。
+
+`mapscan` 会把整张地图暂存到 `%TEMP%`，约 6–8 分钟。设计文档 §38 记了它给出的数（锥桶 959 个，其中 927 个是
+`Sign`；护栏 108 132 个，大头在 `Curve`）和它推翻的两条前提。
+
+### 6.7 候选路线代价（日志里的 `路径代价` 块）
 
 每次规划都会把**所有**候选路线打出来，不只是选中的那条：长度、换挡次数、这条路线**要求占用的地面**
 （就是障碍判定已经在用的那个包络，沿路径扫过再按 1 m 栅格计数，所以来回压过的地面只算一次），
@@ -229,7 +276,7 @@ dotnet run --project Tools/MapSectorDump -c Release -- <游戏目录或某个 .s
 （67.1 m / 339 m² / 未确认 194 m²），而选中的紧凑倒库是 49.1 m / 261 m² / 154 m²。
 **离线数字已实测；游戏里的读数还没测。**
 
-### 6.7 游戏画面里的路线预览（AR）
+### 6.8 游戏画面里的路线预览（AR）
 
 一旦有了路径，AR 就在**动手之前**把它画在地面上：车辆将要占用的走廊、走廊中心线，以及换挡处的
 **洋红实心圆**（地图窗口里同一个决定用同一个色）。前进段青色、倒车段橙色——和平面地图用同一组色相，所以地上的段和地图上的段一眼就是同一条。
@@ -261,12 +308,17 @@ Rendering\
   MapGeometry.cs       map/ppd 数据 → 可绘制几何（含 prefab 描述符解析）
   MapItemProbe.cs      同一次节点遍历里都有哪些地图条目，按类型分桶（只读测量，6.4）
   MapItemSurface.cs    单个条目的类型名 / token / 碰撞标志 / 地面形状——离线读取工具共用这一份
+  MapItemIdentity.cs   类限定短码 → 模型文件 → 家族标签；"这是锥桶"就靠它（6.6）
   MapOverlay.cs        平面地图窗口 + 选位/缩放/按钮
   ArOverlay.cs         游戏内 AR 绘制
 SettingsPage.razor     @page "/plugins/adjustments/local.autoparking"
+Memory\
+  KdopReader.cs        后台读游戏进程自己的条目列表：运行时生成的锥桶（§41/§42）画进平面地图
 Tools\PlannerHarness\  离线仿真工程（6.3）：独立 csproj，靠 DefaultItemExcludes 从 DLL 里排除
 Tools\MapSurfaceDump\  反射安装版 TruckLib 程序集：插件到底能从地图数据里读到什么
 Tools\MapSectorDump\   不开游戏，直接从 .scs 里读一个扇区（6.5）
+Tools\ObjectProbe\     不开游戏：定义查表、逐条目 k-DOP 尺寸、全图按类型×模型清点（6.6）
+Tools\MemoryProbe\     从进程外读运行中游戏的 kdop 条目列表（设计文档 §41，锥桶运行时生成那条）
 docs\                  设计文档 + 逐条实现记录（含被实测推翻的假设）
 ```
 

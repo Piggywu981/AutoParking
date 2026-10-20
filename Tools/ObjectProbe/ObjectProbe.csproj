@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Developer-only offline probe: it answers "is this object in the game's files at all, and in which
+    layer" without the game running, by reading the archives straight through TruckLib.
+
+    Three questions it settles (design doc 28/30/32 kept bouncing between them):
+      def   - does /def/world/*.sii define the object as a unit (so it is placeable at all)?
+      ppd   - does a prefab's descriptor carry a placed-model list, and does the prefab's .pmd keep
+              individually named/transformed parts (i.e. can props be reached inside a prefab)?
+      token - is a map item's token field a packed name that decodes, or an opaque number?
+
+    Lives under Tools\: the plugin .csproj carves Tools\ out of its default globs, and
+    ThirdPartyPlugins\build_all.ps1 only collects csproj files one level down.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AssemblyName>ObjectProbe</AssemblyName>
+    <HostDir>..\..\..\..\ETS2LA-win-release-Portable\current\</HostDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="TruckLib">
+      <HintPath>$(HostDir)TruckLib.dll</HintPath>
+    </Reference>
+    <Reference Include="TruckLib.Core">
+      <HintPath>$(HostDir)TruckLib.Core.dll</HintPath>
+    </Reference>
+    <Reference Include="TruckLib.HashFs">
+      <HintPath>$(HostDir)TruckLib.HashFs.dll</HintPath>
+    </Reference>
+    <Reference Include="TruckLib.Models">
+      <HintPath>$(HostDir)TruckLib.Models.dll</HintPath>
+    </Reference>
+    <Reference Include="TruckLib.Sii">
+      <HintPath>$(HostDir)TruckLib.Sii.dll</HintPath>
+    </Reference>
+    <Reference Include="RBush">
+      <HintPath>$(HostDir)RBush.dll</HintPath>
+    </Reference>
+    <Reference Include="GisDeflate">
+      <HintPath>$(HostDir)GisDeflate.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>

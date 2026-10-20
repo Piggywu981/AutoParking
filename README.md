@@ -96,6 +96,13 @@ when that row or probe is rendered.
     The button row ends with a **lock-window checkbox**: while ticked, the panel's position and size
     are frozen (`ImGuiWindowFlags.NoMove | NoResize`), which is what makes a pick deterministic — see
     §8. Off by default, because the panel does need to be moved out of the way sometimes.
+    **Orange-red discs are memory cones** - the roadwork-style objects the game spawns at runtime,
+    which never pass through sector parsing and so can never appear in the host's map data (§41).
+    The plugin reads the game's own item lists from the game process, read-only, on a dedicated
+    background thread (0.5 s cadence, never the tick thread), and draws cones / construction boards
+    / movers / buildings (solid magenta at their real footprint) with counts and the nearest
+    distance in the canvas corner. With "内存条目拦路" on, these - buildings included - also enter
+    the planner's obstacle set: routes avoid them, or the start is rejected / re-routed (§43).
   - **AR overlay** (on the game screen, on by default): spot box, vehicle footprint projection,
     forward-direction arrow, target pose, and the **route preview** - the corridor the vehicle will
     occupy and the line it will follow, drawn on the ground before it is driven (§6.7).
@@ -154,7 +161,8 @@ path unsolvable or blocked by an obstacle / path too long.
 | | `RefuseWithTrailer` | true | Refuse to start with a trailer |
 | | `ControlWeight` | 20 | The host averages every channel writing the same field, so a low weight is not deference — it is being overwritten. A measured competitor at ≈14 turned our brake demand into positive throttle and drained the air reservoirs. Raise this above any ACC/overtake plugin running alongside |
 | Body | `WheelbaseM` / `MaxSteerDeg` | 4.0 / 33 | Determines minimum turning radius — the two most important geometry parameters |
-| | `VehicleLengthM` / `VehicleWidthM` | 6.5 / 2.6 | Rectangular footprint used for obstacle conflict detection |
+| | `VehicleLengthM` / `VehicleWidthM` | 6.5 / 2.6 | The box the obstacle conflict check sweeps. With `AutoCalibrateBody` on (default) both are overwritten from the game's own vehicle AABB - 8.43 × 2.47 m measured on the 6x2 in the course, versus these typed defaults (§52) |
+| | `AutoCalibrateBody` / `TireHalfWidthM` | true / 0.2 | Overwrite **both** `VehicleLengthM` and `VehicleWidthM` with the game's own local AABB of the player's vehicle - the same box its traffic code centres every AI vehicle on (§52; measured 8.43 × 2.47 × 3.84 m against typed 6.5 × 2.6). If that read is unavailable the width falls back to 2×(outer wheel centre + this allowance) and the length keeps the typed value. Tractor only: a trailer is a separate object |
 | Speed | `ForwardSpeedKph` / `ReverseSpeedKph` | 6 / 3 | Creep speed caps |
 | | `MaxAccel` / `MaxBrakeDecel` / `ComfortDecel` | 1.0 / 1.2 / 0.5 | Pedal amounts and reference speed profile |
 | | `LaunchAccelMps2` | 0.6 | Standing-start compensation (rolling resistance + drivetrain slack) |
@@ -167,13 +175,17 @@ path unsolvable or blocked by an obstacle / path too long.
 | | `TerminalStraightM` | 1.5 | Length of the straight leg driven into the spot. An arc only reaches the correct heading at its very end, so stopping 0.35 m short leaves the bay turned by exactly that much |
 | | `PathSampleM` | 0.25 | Path sampling step |
 | Tolerance | `ToleranceLateralM` / `ToleranceHeadingDeg` | 0.20 / 4.0 | What counts as "in place" |
-| | `ObstacleMarginM` | 0.5 | Vehicle footprint outward expansion |
+| | `ObstacleMarginM` | 0.5 | Per-side dynamic margin of the obstacle envelope |
+| | `EnvelopePadM` | 0.25 | Per-side base padding of the obstacle envelope. Width = `VehicleWidthM` + 2×(this + `ObstacleMarginM`) = **4.1 m** by default on the 2.6 m default width (§46 wrote 4.0 m from a 2.5 m body - §51). Tight practice-course bays: 0.05 + margin 0.2 → 3.1 m, or 2.96 m once the width is measured from the wheels |
 | | `ObstacleLookaheadM` | 4.0 | Only conflicts this far ahead stop the truck. Note the swept footprint is ~8 m long, so a blocker registers about 7.5 m out regardless of this number |
 | Re-planning | `ReplanWhileStopped` | true | Re-solve the route **only while the vehicle is stopped** — at a gear change, after 2 s held by a blocker, or when the distance to the spot starts growing instead of shrinking (a second-segment correction). Never mid-drive: a new route shares the pose but not the arc length, and the progress estimator cannot tell the two references apart |
 | | `MaxReplans` | 3 | Cap on swaps; after it the route is frozen again. Hitting the cap does **not** abort — only the hotkey ends the maneuver |
 | Finish | `HandbrakeOnFinish` / `RestoreAssistsOnFinish` | true | Apply handbrake and restore driver assists on completion |
 | Visualization | `MapScalePxPerM` / `MapZoom` / `MapViewRadiusM` / `SnapToNavCurve` | 1.25 / 1.0 / 120 / true | |
 | | `LockMapWindow` | false | Freeze the map panel's rect while picking (§8) |
+| | `ShowMemoryItems` | true | Draw runtime-spawned cones, read read-only from the game process (§41/§42) |
+| | `BlockRouteWithMemoryItems` | true | Feed memory items (cones/boards/movers/buildings) into the planner's obstacle set - routes avoid them or the start is rejected (§43). Failure mode unchanged: a fully blocked lot falls back to the frozen route after MaxReplans; only the hotkey ends that |
+| | `SnapToParkingBay` | true | Read the game's parking bay out of the cone layout (two facing rows, capped at one end, open at the other), draw it, snap a pick inside it to the bay centre with the nose pointing in through the opening - and stop treating anything **inside** the bay as an obstacle, because the bay's own markings are two 8×8 m movers that otherwise refuse the very spot the job asks for (§50). The wall cones stay obstacles: the test is inset by 0.6 m |
 | | `ConfirmedCorridorHalfWidthM` | 5.0 | How far a nav curve or lane vouches for the ground beside it (§6.6) |
 | | `ArGroundTrimM` | 0.0 | AR ground trim (manual offset beyond the wheel-contact-point estimate) |
 
@@ -253,7 +265,9 @@ switched model loading off entirely because resolving one model description per 
 Note: which item types reach `MapData` at all is decided by the host's **Data Fidelity** setting
 (`DataSettings.json`), and the filtering happens while the map is *parsed* — buildings and signs
 survive Medium, street lamps and other loose models need **High**, company/city POI areas need
-**Extreme**. Changing it means re-parsing (restart), not a live knob.
+**Extreme**. Changing it means re-parsing (restart), not a live knob. Cones are `Sign` items, so they are
+already in at Medium; it is the `Curve` layer (barrier/fence/prop chains, §6.6) that needs **Extreme** —
+`IgnoredItemTypes` drops `Curve = 0x2C` below it.
 
 ### 6.5 Offline sector read (`Tools\MapSectorDump`)
 Asks §6.4's question — *what is actually there* — from the game's own `.scs` files instead of a live
@@ -271,7 +285,50 @@ different situations apart — the object is not in the map data, it is in the d
 (prefab interior geometry), or it is present and merely off-screen. Design doc §30 records what it
 answered the first time it was run.
 
-### 6.6 Candidate route cost (the `路径代价` log block)
+### 6.6 What an object actually is (`MapItemIdentity`, `Tools\ObjectProbe`)
+
+A map item does not store a name. It stores a short code — `dlc_fr_219`, `1573`, `2x002` — and the code is
+**not unique**: `dlc_fr_219` is a barrier column as `bld_model.dlc_fr_219`, a building scheme as
+`bld_scheme.dlc_fr_219`, and a transformer as `model.dlc_fr_219`. The readable identity is the model file the
+unit points at (`/model2/sign/traffic_cone_01_fr.pmd`), which lives in `/def/world/*.sii`. So identity is
+resolved as *class-qualified unit name → model path → family label* (锥桶/护栏/围栏/墙/施工件/箱子/植被/路面标线…),
+built incrementally — the whole table costs ~10 s offline, so it fills 6 files per map rebuild and items stay
+*unclassified* until it knows them. **Unnamed objects are drawn but never block.** That is deliberate: an
+obstacle has to be named to be trusted.
+
+Real extents come free, contrary to what §26/§29 assumed: `MapItem.Kdop` is internal, but its type derives
+from the public `KdopBounds` whose `Minimums[5]/Maximums[5]` are the very 25-DOP the game collides with.
+Measured on a cone: 0.6 m × 0.6 m on the ground, 0.9 m tall. No PMD parse per token is needed for footprints.
+
+`Tools\ObjectProbe` is the offline instrument that produced all of the above:
+
+```
+dotnet run --project Tools/ObjectProbe -c Release -- def    [game dir] [keyword…]   # /def/world/*.sii units
+dotnet run --project Tools/ObjectProbe -c Release -- files  [game dir] [path] [filt] # list an archive directory
+dotnet run --project Tools/ObjectProbe -c Release -- units  [game dir] <sii> [filt]  # units in one SII file
+dotnet run --project Tools/ObjectProbe -c Release -- curve  [game dir] <sector> [tok]# one sector's Curve items
+dotnet run --project Tools/ObjectProbe -c Release -- kdop   [game dir] <sector> [filt]# per-item k-DOP extents
+dotnet run --project Tools/ObjectProbe -c Release -- mapscan [game dir] [keyword…]   # whole map, by class × model
+dotnet run --project Tools/ObjectProbe -c Release -- token   <字符串|数值…>            # pack/unpack short codes
+dotnet run --project Tools/ObjectProbe -c Release -- near    [game dir] <x> <z> [radius] # what is within N m of a spot
+```
+
+Cones get their own marker on the flat map - orange disc with a dark rim, plus an outer ring when the map
+marks them collidable - and the canvas corner reads `身份 锥桶×N(最近 x m) · 静态障碍 M`, or `身份 未解析`
+while the table is still filling (blank would not tell "nothing here" apart from "not read yet"). That
+nearest-meters number is the one to argue with the game about: a cone line standing in front of the truck
+next to `锥桶 0` means those objects are not map items at all - design doc §38 measured exactly that on an
+ATS test course - and no fidelity setting changes it.
+
+Census numbers differ per map, so always read the running game's own `.mbd`: ETS2's `europe` carries 959
+cone items, ATS's `usa` carries 7 514. And the sector under the truck can live in a DLC archive
+(`dlc_ks.scs`), which is why `near` searches every archive rather than only the base ones.
+
+`mapscan` stages the whole map to `%TEMP%` and takes ~6–8 minutes. Design doc §38 records the counts it gave
+(959 cone items — 927 of them `Sign`; 108 132 barrier items, mostly `Curve`) and the two premises it disproved.
+
+
+### 6.7 Candidate route cost (the `路径代价` log block)
 
 Every plan logs **all** the routes the planner considered, not just the winner: length, gear switches,
 the ground area the route *demands* (the vehicle envelope the collision test already uses, swept along the
@@ -286,7 +343,7 @@ table: in the harness scenario the loop-the-aisle family loses on both axes (67.
 unconfirmed) against the chosen compact back-in (49.1 m / 261 m² / 154 m²). **Offline numbers are measured;
 the in-game readout is not yet.**
 
-### 6.7 The route preview in the game view (AR)
+### 6.8 The route preview in the game view (AR)
 
 Once a route exists, the AR overlay draws it on the ground **before it is driven**: the corridor the
 vehicle will occupy, its centerline, and a filled magenta disc where it changes gear (the map window uses
@@ -323,12 +380,17 @@ Rendering\
   MapGeometry.cs       map/ppd data → drawable geometry (incl. prefab descriptor parsing)
   MapItemProbe.cs      What the same node walk contains, bucketed by map item type (read-only, §6.4)
   MapItemSurface.cs    One item's type name / token / collision flag / ground shape - shared with the offline reader
+  MapItemIdentity.cs   Class-qualified unit code → model file → family label; what says a cone is a cone (§6.6)
   MapOverlay.cs        Flat map window + spot picking/zoom/buttons
   ArOverlay.cs         In-game AR drawing
 SettingsPage.razor     @page "/plugins/adjustments/local.autoparking"
+Memory\
+  KdopReader.cs        Background reader for the game's own item lists - runtime-spawned cones (§41/§42) onto the flat map
 Tools\PlannerHarness\  Offline harness (§6.3): own project, excluded from the DLL by DefaultItemExcludes
 Tools\MapSurfaceDump\  Reflects the installed TruckLib assemblies - what a plugin can actually read
 Tools\MapSectorDump\   Reads one map sector straight out of the .scs files, no game (§6.5)
+Tools\ObjectProbe\     Def lookup, per-item k-DOP extents and whole-map inventory, no game (§6.6)
+Tools\MemoryProbe\     Reads the running game's kdop item lists from outside the process (§41 of the design doc)
 docs\                  Design doc + per-item implementation log (incl. assumptions disproven by testing)
 ```
 

@@ -3,3 +3,5 @@ obj/
 *.user
 .vs/
 .trae/
+# SDD scratch (ledger, briefs, review packages)
+.superpowers/

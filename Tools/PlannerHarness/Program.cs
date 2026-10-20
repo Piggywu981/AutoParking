@@ -117,6 +117,36 @@ bool pickDragOk = jitterIgnored && deliberate && dragErrorDeg < 1e-6;
 Console.WriteLine($"  {(pickDragOk ? "✓" : "✗")} 选位拖动死区：1 px 抖动被忽略={jitterIgnored} · 40 px 生效={deliberate} · 与正东夹角 {dragErrorDeg:0.000}°");
 
 Console.WriteLine();
+Console.WriteLine("遥测朝向映射（rotation.X 指的是车头还是车尾，§47/§48）：");
+// rotation.X is the yaw this file's convention steers by, with no offset. The trap: the usual
+// "truck_forward = (2(wy+xz), 1-2(x²+y²))" is R·(0,0,+1), and SCS models face local -Z, so that
+// vector is the TAIL - §47 took it for the nose and added a half turn, which pointed the plugin at
+// the tail. The reference row is the frame Tools\MemoryProbe --telemetry prints: rotation.X =
+// 0.249999 with the sealed cone row behind the cab, i.e. the nose at (-1, 0).
+int headingFailures = 0;
+foreach ((double component, float noseX, float noseZ, string what) in new (double, float, float, string)[]
+{
+    (0.249999, -1f, 0f, "实测帧：车头朝 -X"),
+    (0.0, 0f, -1f, "yaw 0：车头朝 -Z"),
+    (0.5, 0f, 1f, "yaw 半圈：车头朝 +Z"),
+    (0.75, 1f, 0f, "yaw 270°：车头朝 +X")
+})
+{
+    Vector2 nose = Geometry.ForwardFromHeading(Geometry.HeadingFromRotationComponent(component));
+    bool noseOk = Math.Abs(nose.X - noseX) < 1e-4 && Math.Abs(nose.Y - noseZ) < 1e-4;
+    Console.WriteLine($"  {(noseOk ? "✓" : "✗")} {what}：rotation.X={component} → forward=({nose.X:0.000}, {nose.Y:0.000})");
+    if (!noseOk)
+        headingFailures++;
+}
+
+// Pins the direction of the trap: adding the half turn §47 added lands on the tail.
+Vector2 halfTurn = Geometry.ForwardFromHeading(Geometry.HeadingFromRotationComponent(0.249999) + Math.PI);
+bool isTail = halfTurn.X > 0.999f && Math.Abs(halfTurn.Y) < 1e-3f;
+Console.WriteLine($"  {(isTail ? "✓" : "✗")} 加半圈就是车尾：forward=({halfTurn.X:0.000}, {halfTurn.Y:0.000})（判据 ≈(+1,0)）");
+if (!isTail)
+    headingFailures++;
+
+Console.WriteLine();
 Console.WriteLine("点在多边形（扫掠栅格要用它判定环内/环外）：");
 int pointFailures = GeometryPointChecks.Run();
 
@@ -131,6 +161,18 @@ int trustFailures = GroundTrustChecks.Run();
 Console.WriteLine();
 Console.WriteLine("地图内容探针（纯逻辑：去重、排序、截断、行数预算）：");
 int probeFailures = MapProbeChecks.Run();
+
+Console.WriteLine();
+Console.WriteLine("车轮布局实测轴距（从游戏自己发布的轮位配置算）：");
+int wheelbaseFailures = VehicleGeometryChecks.Run();
+
+Console.WriteLine();
+Console.WriteLine("车位识别（从锥桶布局里认出游戏要求的车位，§50）：");
+int bayFailures = ParkingBayChecks.Run();
+
+Console.WriteLine();
+Console.WriteLine("全前进平滑候选（前移直线 + 弧-直-弧，§53）：");
+int smoothFailures = SmoothForwardChecks.Run();
 
 Console.WriteLine();
 Console.WriteLine("prefab 轮廓（只能由控制点取凸包，所以是近似）：");
@@ -152,7 +194,8 @@ Console.WriteLine($"  {(hullPairSafe ? "✓" : "✗")} 两点输入不崩、面�
 
 return report.Failures.Count == 0 && simPassed == 5 && keptGoing && stagedLeg.Reached
     && replanWorks && autoNeutralOk && unwinds && watchdogWorks && pickDragOk && probeFailures == 0
-    && pointFailures == 0 && trustFailures == 0 && footprintFailures == 0
+    && pointFailures == 0 && trustFailures == 0 && footprintFailures == 0 && wheelbaseFailures == 0
+    && headingFailures == 0 && bayFailures == 0 && smoothFailures == 0
     && hullDropsInterior && hullDegenerates && hullPairSafe ? 0 : 1;
 
 // The recession watchdog needs states that make the distance grow. Nothing in the closed loop does

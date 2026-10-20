@@ -22,9 +22,14 @@
     <Compile Include="GroundTrustChecks.cs" />
     <Compile Include="RouteFootprintChecks.cs" />
     <Compile Include="MapProbeChecks.cs" />
+    <Compile Include="VehicleGeometryChecks.cs" />
+    <Compile Include="ParkingBayChecks.cs" />
+    <Compile Include="SmoothForwardChecks.cs" />
     <Compile Include="$(PluginRoot)Geometry.cs" />
     <Compile Include="$(PluginRoot)Settings.cs" />
+    <Compile Include="$(PluginRoot)Driving\ParkingBay.cs" />
     <Compile Include="$(PluginRoot)Driving\GroundTrust.cs" />
+    <Compile Include="$(PluginRoot)Driving\VehicleGeometry.cs" />
     <Compile Include="$(PluginRoot)Driving\RouteFootprint.cs" />
     <Compile Include="$(PluginRoot)Rendering\MapItemProbe.cs" />
     <Compile Include="$(PluginRoot)Driving\ObstacleSnapshot.cs" />

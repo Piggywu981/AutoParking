@@ -49,6 +49,18 @@
                 Description="最近 10 秒的横向误差、航向误差、转向（原始 vs 限速整形后）、目标/实际速度、纵向 P/I/D 与最终指令。调参时开：数值表只能给当前读数，曲线才看得出是收敛还是在抖。平时关掉，注册窗口本身也有开销。"
                 Value="@Plugin.Settings.ShowControlPlot"
                 ValueChanged="@((bool value) => Plugin.HandleAction("showControlPlot", value))" />
+        <Switch Title="游戏内存条目（运行时生成的锥桶）"
+                Description="施工区的锥桶是游戏运行时生成的，不在地图文件里，宿主的地图数据永远看不到。开启后插件以只读方式从游戏进程读它自己的条目列表（0.5 秒一拍、独立后台线程，不占 tick），把锥桶/施工牌/动态物件画进平面地图——橙红点是内存来的，橙色点是地图数据来的。游戏大版本更新后特征码可能需要重找，届时地图角落的状态行会写明原因。"
+                Value="@Plugin.Settings.ShowMemoryItems"
+                ValueChanged="@((bool value) => Plugin.HandleAction("showMemoryItems", value))" />
+        <Switch Title="内存条目拦路"
+                Description="把内存条目（锥桶/施工牌/动态物件/建筑）喂给路径规划的障碍集：路线会绕开它们，实在绕不开就拒绝启动或重规划。2026-10-16 车主决定：场子边上的实物不管是什么都不该撞，所以分类从宽——认错一个小牌的代价是「拒绝启动」（安全侧失败），漏掉一个锥桶的代价是撞上去。注意失败模式没有变：锥桶把路全堵死时，重规划次数用完会退回定死路线继续开，只有热键能结束——手放在 Abort 上。"
+                Value="@Plugin.Settings.BlockRouteWithMemoryItems"
+                ValueChanged="@((bool value) => Plugin.HandleAction("blockRouteWithMemoryItems", value))" />
+        <Switch Title="吸附到游戏车位"
+                Description="从内存里的锥桶布局里认出「两排相对 + 一端封口 + 一端开口」的停车位，点选落在该位内或附近时自动把车位挪到库中心、朝向取「从开口指向封口」（车头朝里、从开口倒/开进去）。同时：落在车位内部的内存条目不再算障碍——车位自己的标记物（实测是两个 8×8 m 的 Mover）会把游戏要求的那个库位判成「被占」，从而永远拒绝启动。车位框的边界锥桶仍然拦路（内缩 0.6 m 判定）。"
+                Value="@Plugin.Settings.SnapToParkingBay"
+                ValueChanged="@((bool value) => Plugin.HandleAction("snapToParkingBay", value))" />
         <Switch Title="吸附到导航曲线"
                 Description="点选时把车位吸附到附近建筑导航曲线的方向上，避免车头朝向乱指。"
                 Value="@Plugin.Settings.SnapToNavCurve"
@@ -69,10 +81,33 @@
                 Value="@(Convert.ToSingle(Plugin.Settings.VehicleLengthM))"
                 ValueChanged="@((float value) => Plugin.HandleAction("vehicleLength", value))" />
         <Slider Title="车身宽度 (m)"
-                Description="同上，只影响显示（本版本不泊挂车）。"
+                Description="障碍冲突判定与占地仪表所用的车身宽度（包络宽 = 本值 + 2×(外扩+余量)），不是只显示用。开着下面的自动实测时，这里会被「最外轮心×2 + 胎宽」覆盖。"
                 Min="@(1.8f)" Max="@(3.2f)" Step="@(0.05f)"
                 Value="@(Convert.ToSingle(Plugin.Settings.VehicleWidthM))"
                 ValueChanged="@((float value) => Plugin.HandleAction("vehicleWidth", value))" />
+        <Switch Title="车身尺寸自动适应实车"
+                Description="用游戏自己给玩家车辆算的局部包围盒（读内存：base_ctrl → game_actor+0x18 → 车辆对象+0x18 的 aabox，与游戏给所有 AI 车定中心用的同一套算法）覆盖手填的长×宽。这是长度唯一的实测来源：现场那台 6x2 实测 8.43 × 2.47 m，而手填默认是 6.5 × 2.6——包络比车短了近 2 米，属于往危险方向偏。读不到包围盒时（特征码失效、非驾驶状态）宽度退回「最外轮心 + 胎宽」，长度保持手填。关掉则完全以手填值为准。"
+                Value="@Plugin.Settings.AutoCalibrateBody"
+                ValueChanged="@((bool value) => Plugin.HandleAction("autoCalibrateBody", value))" />
+        <Slider Title="胎宽余量 (m/侧)"
+                Description="只在读不到车体包围盒时用：轮心之外每侧再加多少算到轮胎外缘。遥测发布轮心位置但不发布轮胎宽度，所以这一项只能是估值；0.20 m/侧时算出 2.46 m，与游戏包围盒的 2.47 m 差 1 cm。调小会让包络比真实车身更窄（危险方向），调大只是更保守。"
+                Min="@(0.05f)" Max="@(0.45f)" Step="@(0.01f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.TireHalfWidthM))"
+                ValueChanged="@((float value) => Plugin.HandleAction("tireHalfWidth", value))" />
+        <Switch Title="自动标定轴距"
+                Description="从游戏自己发布的车轮位置算出轴距，覆盖下面的手填值。轮子的位置是车辆配置数据，不用先跑一段车就能读到；换了底盘或驾驶室会重新测。关掉则完全以下面的手填值为准。"
+                Value="@Plugin.Settings.AutoCalibrateRadius"
+                ValueChanged="@((bool value) => Plugin.HandleAction("autoCalibrateRadius", value))" />
+        <Slider Title="轴距 (m)"
+                Description="最小转弯半径的分子，也是规划曲率的上限。自动标定开着时这里会被实测值覆盖，实测结果和轴分组看状态表「轴距」一行。"
+                Min="@(2.5f)" Max="@(7.5f)" Step="@(0.05f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.WheelbaseM))"
+                ValueChanged="@((float value) => Plugin.HandleAction("wheelbase", value))" />
+        <Slider Title="最大前轮转角 (°)"
+                Description="转弯半径 = 轴距 / tan(此角)。游戏数据里没有每车的这个值：官方物理定义里只有一句注释说「maximum wheel turn (30degrees)」，是全局值不是本车的，所以这里保持可手调，默认 33°。"
+                Min="@(20f)" Max="@(45f)" Step="@(0.5f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.MaxSteerDeg))"
+                ValueChanged="@((float value) => Plugin.HandleAction("maxSteerDeg", value))" />
         <Slider Title="AR 地面微调 (m)"
                 Description="AR 的地面高度按车轮接地点推算（见状态表“地面基准”）。若绿色十字仍浮空或陷进地里，用它微调。"
                 Min="@(-1f)" Max="@(1f)" Step="@(0.05f)"
@@ -129,6 +164,11 @@
                 Min="@(0.0f)" Max="@(4.0f)" Step="@(0.1f)"
                 Value="@(Convert.ToSingle(Plugin.Settings.TerminalStraightM))"
                 ValueChanged="@((float value) => Plugin.HandleAction("terminalStraight", value))" />
+        <Slider Title="平滑线允许前移 (m)"
+                Description="全前进平滑候选先沿当前方向直行多少米再开始转。驾校场里那根拦住曲线的锥在车头右前方约 10 m，一起步就转必然被它吃掉前右角，所以这一族的第一段是直线。0 = 关掉这一族，只剩原来的 Reeds-Shepp / 两段中转（设计文档 §53）。"
+                Min="@(0.0f)" Max="@(20.0f)" Step="@(1.0f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.SmoothForwardLeadInM))"
+                ValueChanged="@((float value) => Plugin.HandleAction("smoothForwardLeadIn", value))" />
         <Slider Title="转向比例增益" Min="@(0.2f)" Max="@(3.0f)" Step="@(0.05f)"
                 Value="@(Convert.ToSingle(Plugin.Settings.SteerGain))"
                 ValueChanged="@((float value) => Plugin.HandleAction("steerGain", value))" />
@@ -175,6 +215,16 @@
                 Min="@(1.5f)" Max="@(15f)" Step="@(0.5f)"
                 Value="@(Convert.ToSingle(Plugin.Settings.ObstacleLookaheadM))"
                 ValueChanged="@((float value) => Plugin.HandleAction("obstacleLookahead", value))" />
+        <Slider Title="障碍判定余量 (m)"
+                Description="车包络每侧的动态那份余量。与「包络基础外扩」相加才是真正生效的数：包络宽 = 车宽 + 2×(基础外扩 + 余量)。实测驾校车位口净宽 3.44 m、本车宽 2.47 m → 每侧只有 0.49 m，所以两者合计 0.10 时还有 12 条无冲突路线、0.15 只剩 3 条、0.20 起一条都不剩（设计文档 §53：0.25 m/侧 时连已采纳的那条换挡线都被判 21 处冲突）。省下来的才是留给跟踪误差的预算——低速够用，公开道路请调回去。"
+                Min="@(0.05f)" Max="@(1.5f)" Step="@(0.05f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.ObstacleMarginM))"
+                ValueChanged="@((float value) => Plugin.HandleAction("obstacleMargin", value))" />
+        <Slider Title="包络基础外扩 (m)"
+                Description="同上，每侧固定的那一份，默认 0.05（与「障碍判定余量」合计 0.10 m/侧，正好让驾校车位进得去）。历史默认是 0.25 + 0.5 = 4.0 m 包络，那是公开道路的数；在这个锥桶场用它会把所有候选都拒掉。改这里等于改跟踪误差预算，两个滑杆是相加关系，别只看一个。"
+                Min="@(0f)" Max="@(1f)" Step="@(0.05f)"
+                Value="@(Convert.ToSingle(Plugin.Settings.EnvelopePadM))"
+                ValueChanged="@((float value) => Plugin.HandleAction("envelopePad", value))" />
         <Switch Title="停住时允许重算路径"
                 Description="关掉就退回原来的行为：engage 时那条路径一路走到底。"
                 Value="@Plugin.Settings.ReplanWhileStopped"
