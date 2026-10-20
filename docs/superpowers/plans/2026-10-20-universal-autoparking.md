@@ -968,3 +968,22 @@ git commit -m "docs: ship the sidecar probe, document marker following and the d
 3. **起步门确认**：故意熄火/带速起步各一次，应被拒且原因写在横幅上。
 4. **abort 键常备**：实车第一次只在空旷直线段测试跟随，确认热键能立刻交还。
 5. **记录**：每次实车后把 `Goal value change`（`--strctx "Goal value change"`）与插件日志的 legs 序列对一遍，写进设计文档条目。
+
+---
+
+## Superseded during execution
+
+执行中产生的裁决覆盖了下面这些行。计划正文**不回改**（它是当时的施工文本），这里逐条给出"原文 / 实际 /
+依据"；两者冲突时以本节与 SDD ledger 的 Ruling 为准。
+
+| 原文 | 原文写的 | 实际交付 | 依据 |
+|---|---|---|---|
+| `:95` | `MinGapOverTruckM=1.0` | **0.4**（spec §4.5：纵向净长 ≥ 车长 + 0.4，否则拒绝） | R2；Step 4 的代码与 spec 一致，常量行是陈的 |
+| `:595` | `MinAirBar = 4.0` | **0** | R41：该字段单位未定，按"bar"设 4.0 在实测读数 114–123 上永不触发 |
+| `:600` | 夹取 `MinAirBar [0, 10]` | **[0, 200]** | R41：宽到两种刻度都放得下，不预设单位 |
+| `:637` | 滑杆 `Min="0" Max="10"`、标题"起步气压门槛" | `Min 0 / Max 200`、标题写明**（单位未定）** | R37/R41：默认 0 是"关闭可调门槛"，不是"关闭气压检查"；`HasBrakeAir()` 另算 |
+| `:745` | sidecar 路径由 `AppContext.BaseDirectory` + `SidecarPath` 组成 | **候选链**：显式 `SidecarPath` → `<宿主 exe 目录>\Plugins\MemoryProbe.exe` → 插件自身目录，逐条记日志 | R7：宿主影子复制只带走 DLL，`AppContext.BaseDirectory` 是临时目录 |
+| `:754` | 气压门 = `if (realControl && !HasBrakeAir())` 一处 | **两道独立拒绝**：可调门槛 `air < MinAirBar`（仅当 `MinAirBar > 0`）+ `HasBrakeAir()`（游戏自己的应急阈值）；两条消息互不冒充 | R37/R41：`HasBrakeAir()` 比的是应急气压，不是本键；`MinAirBar=0` 时前者惰性、后者照常，这个不对称是对的 |
+| `:758` | 置信度门只写 `Confidence < MinConfidence` | **按出处判**：`saved-spot` 前缀豁免，其余档照旧 | R36：人自己选的位姿没有识别不确定性，0.6 默认下"退回存点"必须可用 |
+| `:916`、`:952` | `✓ ≥151` | **floor 是 154**（`✗` 仍是三条固定项） | R3：判据按**增量**核（131→137→143→144→147→152→154），绝对值只是当时的快照 |
+

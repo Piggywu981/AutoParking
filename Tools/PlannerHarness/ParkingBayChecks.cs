@@ -110,7 +110,7 @@ internal static class ParkingBayChecks
         bool near = bays.Exists(b => Math.Abs(b.Center.X - 14) < 0.5 && Math.Abs(b.Center.Y - 101.85) < 0.5);
         bool distant = bays.Exists(b => Math.Abs(b.Center.X - 64) < 0.5 && Math.Abs(b.Center.Y - 101.85) < 0.5);
 
-        Report(ref failures, near && distant, "42 m 空档断排，近处库位仍可检出",
+        Report(ref failures, bays.Count == 2 && near && distant, "42 m 空档断排，近处库位仍可检出",
                $"{bays.Count} 个（判据 2）· 近排 (14, 101.85) {(near ? "检出" : "漏判")} · " +
                $"远排 (64, 101.85) {(distant ? "检出" : "漏判")}");
 

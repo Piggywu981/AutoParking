@@ -64,6 +64,17 @@ transmission) / braking / steering** to back the tractor into the spot.
    surface, which is where our pedal commands were being lost; the plugin's status table and log line
    report which path is actually in use (`transport=memory|legacy`). The host documents this toggle as
    not working on every system, and it may need a game restart to take effect.
+5. **Build the identity sidecar once**, before the plugin, so the plugin's build can copy it:
+   ```
+   dotnet build Tools/MemoryProbe -c Release
+   ```
+   The plugin's build then copies `MemoryProbe.exe` from
+   `Tools\MemoryProbe\bin\Release\net10.0\win-x64\` beside `AutoParking.dll`, and both files are
+   deployed together. It is optional in the literal sense: without it the plugin still starts and still
+   follows the marker using geometry alone, but it loses the **identity strings** — nothing can confirm
+   that the vehicle it treats as "parked" is really `academy.parked.truck`, or that a trigger is the
+   parking trigger. A missing exe is announced by a build warning and by one startup log line; the
+   identity channel reports itself as degraded rather than failing the maneuver.
 
 Dependencies: the plugin references `ETS2LA.*.dll`, `TruckLib*.dll`, and `Hexa.NET.ImGui.dll`
 under `current\` directly, so it **must live in the same install tree as the ETS2LA host**.
@@ -153,6 +164,70 @@ Startup is refused (reason shown in the status table and log) when: no spot sele
 telemetry timeout / SDK inactive or game paused / trailer attached / map data not ready /
 path unsolvable or blocked by an obstacle / path too long.
 
+### 4.1 Marker following — park where the game asks, one leg at a time
+
+ETS2 driving-school and depot jobs do not have a single drop-off point: the task moves its own marker
+from stage to stage, so a manual pick can at best express one of them. With **跟随游戏标记（通用泊车）**
+on (the default) you do not pick at all — you press `Toggle` and the plugin resolves the place the game
+wants the truck parked, in this order:
+
+1. the **`0xC17` Mover pair** — two marker movers sitting on the aim point (confidence 0.9);
+2. the **gap between the framing parked vehicles**, for the stage where the marker has not appeared in
+   the bay yet (0.6);
+3. the **spot you saved** with a map pick (0.4 — exempt from the confidence gate, because a person
+   chose that pose).
+
+It then plans **one leg at a time**, drives it, and advances when the game moves the marker: settling
+at a leg's target for `SettleTimeS` re-resolves the next marker (a second leg, e.g. the reverse into
+the bay), and a marker that moves more than `MarkerMoveToleranceM` (0.5 m) re-plans the current leg in
+place. Re-planning continues a maneuver; it is not a pause and not an abort.
+
+**Shadow mode is on by default and sends nothing.** It runs the whole chain — resolve, plan, draw the
+target and the route on the map — and publishes no throttle, brake, steering, gear or handbrake
+command. Commands flow only when **both** Dry-run and Shadow mode are off; turning Shadow mode off
+while Dry-run is still on moves nothing.
+
+Start gates (refusals, checked once when you press the key — never a mid-maneuver interruption):
+no target from any tier of the resolver, trailer attached (`RefuseWithTrailer`), a route the planner
+will not accept, unknown shifter configuration, and a target below the confidence gate. When commands
+would really be sent they also include: engine off, still rolling, and brake air below the game's own
+emergency threshold (plus the tunable floor, which ships disabled — see "Known limitations"). Whether
+a refusal applies in dry-run/shadow too is deliberate: a gate that only protects real control does not
+fire while you are watching a plan with the engine off.
+
+Only the hotkeys end a maneuver — `Toggle` pauses, `Abort` gives up and hands the truck back. No
+observation, including a vanished marker or a dead sidecar, aborts on its own; marker loss or drift
+degrades to re-planning and reporting. **Tractor unit only** — a trailer is refused by default.
+
+Turn 跟随游戏标记 off to go back to the pure manual workflow: a map pick is then the only way to
+start, and the marker tiers are not consulted. With it on, a completed marker maneuver clears the
+drawn target while the saved spot persists, so a map pick acts as the resolver's 0.4 fallback rather
+than as the aim.
+
+### 4.2 Known limitations of marker following
+
+These are measured or reasoned, not hedged. Read them before trusting the feature with a real truck.
+
+- **Bay detection is world-axis-only.** `ParkingBays` recognises rows of cones that run along the
+  world axes; a bay rotated off them is silently not found (deliberate: never guess). The marker
+  protocol is the primary path for that reason — bay detection only snaps picks and exempts a bay's
+  own markings.
+- **The parked-vehicle blocker is on, and it changes what is plannable.** The framing trucks exist
+  only as `0x2F Hookup` items, so they used to be invisible to the planner. With the measured academy
+  scene, the same route scores **0 conflicts without the framing trucks and 27 with them**, at the
+  **default 6.5 m body**. The honest outcome is that an insert leg can now be *refused* rather than
+  driven through a truck — and that number belongs to the default body: a live run with
+  `AutoCalibrateBody` on swaps in the measured 8.43 m body, which changes the envelope and can change
+  whether a route resolves.
+- **`MinAirBar` ships as 0 / disabled, and its unit is unresolved in this repo.** The two call sites
+  that print `truckFloat.airPressure` call it bar; a constant read off the same field is named psi; and
+  this repo's own logs read 114–123 in it. Only the shipped `HasBrakeAir()` check (against the game's
+  own `airPressureEmergency`) is unit-safe. Do not set this floor from a unit assumption.
+- **Identity needs the sidecar**, and even with it, identity is absent for about **0.9 s after every
+  ~0.5 m of truck travel** — the cache is keyed by a rounded window and each cold window costs one
+  full probe walk (measured 0.884 s for a 90 m window). So identity is informative mainly at
+  standstill, which is when the resolver runs; while driving it is at best one window behind.
+
 ## 5. Settings Overview
 
 | Group | Key settings | Default | Notes |
@@ -195,6 +270,22 @@ Reserved fields that are not wired up yet (changing them has no effect; do not u
 infer behavior): `AutoCalibrateRadius` (auto calibration of the turning radius — the algorithm
 is written up in the design doc §6.1 but not implemented), `OvershootM`, `HazardOnFinish`,
 `EngineOffOnFinish`.
+
+### 5.1 JSON-only settings (marker following)
+
+Two keys have no control on the settings page. They live in `%APPDATA%\ETS2LA\AutoParking.json` and
+are edited by hand:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `SidecarPath` | `""` | Explicit path to `MemoryProbe.exe`. Empty means "resolve it": `<host exe dir>\Plugins\MemoryProbe.exe` first, then the plugin's own directory |
+| `GameProcessName` | `eurotrucks2` | Which process the sidecar reads. Its own default is `amtrucks`, so ETS2 must name it |
+
+There is no UI for them because the host's settings page has no text-input component (it ships
+sliders, switches and one dropdown), so a path field cannot be rendered at all. `SidecarPath` is not
+resolved against the DLL's directory — the host shadow-copies the DLL alone into a temp folder, so at
+runtime that directory contains no exe. Every candidate is logged at startup with whether it exists,
+plus which one was chosen.
 
 ## 6. Self-Test Tools
 

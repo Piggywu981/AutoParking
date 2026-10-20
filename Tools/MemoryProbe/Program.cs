@@ -486,7 +486,8 @@ void DoViz(ulong basePtr, double radius)
 // sweep, same quiet skip set, same uid dedupe, same distance filter and radius, same 3000-item cap. Only
 // the printing differs, and in that mode stdout holds records and nothing else - a consumer must not have
 // to filter narration out of the identity channel. Record shape (one per line, CRLF-terminated like every
-// other Console line on Windows, so the trailing field has to be trimmed of \r before parsing):
+// other Console line on Windows; the numeric parses tolerate the trailing \r, but an STR line's LAST field
+// is an identity run, not a number, so a reader must trim \r before it uses that text):
 //   ITEM\t<type:int>\t<uid:0xHEX>\t<flags:0xHEX>\t<x>\t<y>\t<z>\t<dx>\t<dy>\t<dz>
 //   STR\t<uid:0xHEX>\t<ascii-run>
 // x/y/z is the k-DOP centre, dx/dy/dz its extents, floats InvariantCulture "0.###". STR lines come from

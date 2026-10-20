@@ -261,13 +261,15 @@ public sealed class AutoParkingSettings
     public double SavedSpotZ { get; set; }
     public double SavedSpotHeadingRad { get; set; }
 
-    // Marker-following auto-park. The defaults come from spec §6 of
-    // docs/superpowers/specs/2026-10-19-universal-autoparking-design.md - that table lists 9 keys and
-    // no ranges at all (the 0.05/0.30 pair in the spec is InsertPad's pad clamp, a different number),
-    // so the clamp bounds below plus AutoParkByMarker and GameProcessName come from the plan
-    // (docs/superpowers/plans/2026-10-20-universal-autoparking.md, Task 6). Nothing reads these yet:
-    // the consumers arrive with the target-resolution wiring later in the same plan, so until then
-    // this is inert configuration and the current maneuver behaves exactly as before.
+    // Marker-following auto-park. Key names and intended defaults follow spec §6 of
+    // docs/superpowers/specs/2026-10-19-universal-autoparking-design.md - that table lists 9 keys and no
+    // ranges at all (the 0.05/0.30 pair in the spec is InsertPad's pad clamp, a different number), so the
+    // Math.Clamp bounds in Clamp() plus AutoParkByMarker and GameProcessName come from the plan
+    // (docs/superpowers/plans/2026-10-20-universal-autoparking.md, Task 6), not from the spec. One default
+    // departs from the spec on purpose and is documented where it lives: MinAirBar ships 0 instead of the
+    // spec's 4.0, because the unit of the air field is unresolved. The consumers are wired: the resolver,
+    // controller and output gate read these keys, so each one now changes behavior rather than being inert
+    // configuration.
 
     /// <summary>
     ///  Run the whole chain - resolve the game's marker, plan, draw the target pose and the route on

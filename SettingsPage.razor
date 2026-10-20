@@ -13,7 +13,7 @@
     else
     {
         <Switch Title="Dry-run"
-                Description="Plan and display everything, but never send throttle, brake, steering or gear commands. Keep this on until the first real test in your own game. It is one half of a pair: the effective gate is DryRun || ShadowMode, so the truck only receives commands when this switch and 影子模式 (further down, in the 通用泊车 section) are both off. That conjunction is pending Task 8: this build still reads only this switch, and ShadowMode is not wired yet."
+                Description="Plan and display everything, but never send throttle, brake, steering or gear commands. Keep this on until the first real test in your own game. It is one half of a pair: the effective gate is DryRun || ShadowMode, so the truck only receives commands when this switch and 影子模式 (further down, in the 通用泊车 section) are both off. Both halves are read on every output path, so closing either one alone keeps the truck still."
                 Value="@Plugin.Settings.DryRun"
                 ValueChanged="@((bool value) => Plugin.HandleAction("dryRun", value))" />
         <Slider Title="控制权重"
@@ -41,11 +41,11 @@
            Dropdown，没有文本输入组件，所以这两项故意没有控件、HandleAction 里也故意没有 case（不是
            漏掉，加了也永远走不到）。README 里写明 JSON 路径。 *@
         <Switch Title="跟随游戏标记（通用泊车）"
-                Description="按热键后自动解析游戏要求的停车位置（0xC17 Mover 对 → 停放车间隙 → 已存点）并执行。关掉则回到必须在地图上手动选点的旧行为。"
+                Description="按热键后自动解析游戏要求的停车位置（0xC17 Mover 对 → 停放车间隙 → 已存点）并执行。关掉则回到必须在地图上手动选点的旧行为。开着时，一次标记泊车完成后地图上画的目标会被清掉，而保存的车位仍然留着——所以此时的手动点选是解析链「手动存点」那一档的兜底，而不是这次要执行的目标；想要纯手动流程就把这个开关关掉。"
                 Value="@Plugin.Settings.AutoParkByMarker"
                 ValueChanged="@((bool value) => Plugin.HandleAction("autoParkByMarker", value))" />
         <Switch Title="影子模式"
-                Description="全链路解析 + 规划，并把目标与路线画在地图上，但不发任何控制命令：油门、刹车、转向、挡位、手刹一个都不发。生效门是 DryRun || ShadowMode，也就是本页顶部的 Dry-run 与这里两个开关必须都关掉，卡车才会收到命令——只关掉影子模式而 Dry-run 还开着，车不会动。尚未接线（Task 8）：本版还没读这个开关，output.DryRun 目前只取 Dry-run，只关掉 Dry-run 而这里仍开着时命令照样会发；上面那个合取生效门要等 Task 8 接上才成立。实车前先用它核对规划线。影子模式本身不会暂停也不会中止——只有热键能结束动作。"
+                Description="全链路解析 + 规划，并把目标与路线画在地图上，但不发任何控制命令：油门、刹车、转向、挡位、手刹一个都不发。生效门是 DryRun || ShadowMode，也就是本页顶部的 Dry-run 与这里两个开关必须都关掉，卡车才会收到命令——只关掉影子模式而 Dry-run 还开着，车不会动。实车前先用它核对规划线。影子模式本身不会暂停也不会中止——只有热键能结束动作。"
                 Value="@Plugin.Settings.ShadowMode"
                 ValueChanged="@((bool value) => Plugin.HandleAction("shadowMode", value))" />
         <Switch Title="倒库腿动态包络"
@@ -63,7 +63,7 @@
                 Value="@(Convert.ToSingle(Plugin.Settings.SafetyMarginM))"
                 ValueChanged="@((float value) => Plugin.HandleAction("safetyMarginM", value))" />
         <Slider Title="停稳判定 (s)"
-                Description="到达目标后需要连续保持静止多少秒才算停稳，之后才重新解析下一个标记（多腿衔接）或宣告完成。它只决定「什么时候算到位」，不会自己暂停或中止动作——结束动作仍然只有热键。"
+                Description="到达目标后需要连续保持静止多少秒才算停稳，之后才重新解析下一个标记（多腿衔接）或宣告完成。它只决定「什么时候算到位」，不会自己暂停或中止动作——结束动作仍然只有热键。在这段保持期间中止键是有效的（当场放弃并交还），而开始/暂停键仍然回答「已有一个泊车任务在跑」——这个不对称是刻意的：踩着刹车等待时手必须能收回去，但两条入口同时有效会让同一次按键产生歧义。"
                 Min="@(1f)" Max="@(10f)" Step="@(0.5f)"
                 Value="@(Convert.ToSingle(Plugin.Settings.SettleTimeS))"
                 ValueChanged="@((float value) => Plugin.HandleAction("settleTimeS", value))" />

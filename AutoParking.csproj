@@ -89,4 +89,18 @@
     </Reference>
   </ItemGroup>
 
+  <!-- The identity sidecar ships beside the DLL. Tools\MemoryProbe is a separate project (excluded
+       from the glob above), so its exe only exists after it has been built once; the copy is
+       conditional so a bare clone still builds. An empty settings.SidecarPath resolves
+       <host exe dir>\Plugins\MemoryProbe.exe, which is exactly this destination (README §1). -->
+  <Target Name="CopySidecarProbe" AfterTargets="Build"
+          Condition="Exists('Tools\MemoryProbe\bin\Release\net10.0\win-x64\MemoryProbe.exe')">
+    <Copy SourceFiles="Tools\MemoryProbe\bin\Release\net10.0\win-x64\MemoryProbe.exe"
+          DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
+  </Target>
+  <Target Name="WarnMissingSidecarProbe" AfterTargets="Build"
+          Condition="!Exists('Tools\MemoryProbe\bin\Release\net10.0\win-x64\MemoryProbe.exe')">
+    <Warning Text="MemoryProbe.exe not built - identity channel will run degraded (geometry-only). Build Tools\MemoryProbe first for full marker identity." />
+  </Target>
+
 </Project>

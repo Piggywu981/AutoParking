@@ -148,3 +148,23 @@ SettingsPage 加对应控件（镜像现有滑杆/开关风格）。
 - 从任务单元脚本解析阶段语义（MarkerFollower 不需要）
 - 任何"观察到 X 就自动停"的逻辑（M4）
 - 内化进程内读内存（v2 再议，接口已按可替换设计：IdentityChannel 是接口）
+
+## 12. 实现后的修订（Amendments after implementation）
+
+执行过程中出现了几条比本规格更晚的裁决。上面的正文**不回改**（它是当时的设计意图），这里逐条给出
+"原文 / 实际交付 / 依据"。两者冲突时以本节为准。
+
+| 原文 | 原文写的 | 实际交付 | 依据 |
+|---|---|---|---|
+| `:61` | 置信度低于 `MinConfidence` 一律拒绝起步 | 拒绝条件是 `confidence < MinConfidence` **且**出处不是 `saved-spot` 档（`provenance.StartsWith("saved-spot")` 豁免） | R36：位姿是人自己选的，没有识别不确定性可拦；默认 0.6 下"跟随标记退回到你存的点"必须可用 |
+| `:84` | "`ShadowMode=false` 需在 SettingsPage 显式关" | 生效门是**合取** `DryRun \|\| ShadowMode`：两个开关都关掉才发命令 | `DryRun` 默认 true；只关影子模式车不会动。三处输出点共用 `DryRunActive`（Task 8） |
+| `:68`、`:103` | sidecar 路径默认"插件 DLL 同目录" | **候选链**：显式 `SidecarPath` → `<宿主 exe 目录>\Plugins\MemoryProbe.exe` → 插件自身目录（`AppContext.BaseDirectory`），每一条都连同"存不存在"写日志 | R7：宿主只把 DLL 影子复制进 `%TEMP%\ETS2LA\PluginShadow\<name>_<guid>\`，运行时 DLL 目录里没有 exe |
+| `:109` | `MinAirBar` 默认 4.0 | 默认 **0（关闭）**，夹取 `[0, 200]` | 该字段单位在本仓库没有定论（两个调用点按 bar 打印、一个常量命名为 psi、日志读数 114–123）。单位安全的是 `HasBrakeAir()`，与 `MinAirBar` 是两道互相独立的起步拒绝 |
+
+两处已在实现时就地改过（不在本表内）：`:82` 的气压门原写作 `>`，与"0 = 关闭"自相矛盾，Task 6 改成
+严格 `<` 的拒绝式（R37）；`§4.5` 的 `MinGapOverTruckM` 在计划里写成 1.0，实现取 0.4（R2，见计划文的
+"Superseded during execution"）。
+
+实现位置：`AutoParkingPlugin.ValidateStart`（两道路径、置信度门的出处前缀）、
+`AutoParkingPlugin.InitIdentityChannel`（候选链）、`Settings.MinAirBar`（默认与注释）。
+
