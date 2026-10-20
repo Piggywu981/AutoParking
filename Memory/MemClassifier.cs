@@ -33,7 +33,8 @@ internal enum MemKind
     /// <summary>A Hookup item flagged as parked rather than moving traffic (§54): a vehicle already
     ///  standing in the lot. Its k-DOP is the real footprint of that vehicle, which is what bounds
     ///  the gap the truck has to fit into. Drawn as a gray footprint and, unlike Trigger, it does
-    ///  block routes while <c>BlockRouteWithMemoryItems</c> is on (R16).</summary>
+    ///  block routes - but only while both <c>ShowMemoryItems</c> and <c>BlockRouteWithMemoryItems</c>
+    ///  are on, the same gate every other memory obstacle sits behind (R16).</summary>
     ParkedVehicle,
     /// <summary>Any other small item class; drawn nowhere, blocks nothing.</summary>
     Other
@@ -81,6 +82,26 @@ internal static class MemClassifier
         }
         return MemKind.Other;
     }
+
+    /// <summary>
+    ///  The one definition of "a memory item of this kind becomes a planner obstacle": cone, board,
+    ///  mover, building, parked vehicle. It lives here, next to the kind rules, so
+    ///  <c>AutoParkingPlugin.AddMemoryObstacles</c> and <c>Tools\PlannerHarness\ParkedObstacleChecks</c>
+    ///  share it - the harness cannot link the plugin (host assemblies), and a second copy of this
+    ///  whitelist in the check would stay green after the plugin's copy dropped a kind.
+    ///
+    ///  <see cref="MemKind.Trigger"/> is deliberately excluded: a trigger is an invisible detection
+    ///  volume (measured 10.16 × 4.05 × 6.68 m), not something standing on the ground, so blocking it
+    ///  would fence off the very goal the truck is parking in. Parked vehicles are in only since the
+    ///  framing-truck measurement (three 7.50 × 3.23 m 0x2F Hookups bounding the academy gap): with the
+    ///  kind left out the planner planned straight through that row - 0 conflicts on a route that sweeps
+    ///  the trucks, 27 once they are in the set (§43/§54, R16).
+    ///
+    ///  A whitelist, not a blacklist, so a kind the classifier learns later is not a blocker by
+    ///  construction; it has to be added here on purpose.
+    /// </summary>
+    internal static bool BlocksMemoryRoutes(MemKind kind)
+        => kind is MemKind.Cone or MemKind.Board or MemKind.Mover or MemKind.Building or MemKind.ParkedVehicle;
 
     /// <summary>
     ///  The one predicate for "this 0x2F Hookup is a parked vehicle rather than moving traffic":

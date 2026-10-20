@@ -15,6 +15,11 @@ using AutoParking;
 ///  Two plans differ in nothing but the three boxes. The first reproduces the hole (a route accepted
 ///  against today's obstacle set); the second proves the same route is no longer accepted once the
 ///  boxes are present. Both numbers are printed so a failure says which side moved.
+///
+///  Scope note: this case exercises <see cref="Planner"/> and the whitelist it shares with the plugin,
+///  <c>MemClassifier.BlocksMemoryRoutes</c> - so dropping parked vehicles from that predicate fails
+///  here. It does not cover whether the runtime reader actually feeds these items into a snapshot,
+///  which needs the game and belongs to the in-game check (Task 9).
 /// </summary>
 internal static class ParkedObstacleChecks
 {
@@ -53,18 +58,45 @@ internal static class ParkedObstacleChecks
         // (i) Today's set contains no representation of the framing vehicles, so this is the hole:
         // the route that exists can sweep the space the trucks occupy. The measured claim is that
         // it is accepted with zero conflicts, not merely "some route exists".
-        bool hole = without.Ok && without.ConflictCount == 0;
+        //
+        // The predicate term is what pins the plugin change: AddMemoryObstacles decides "blocker"
+        // with MemClassifier.BlocksMemoryRoutes, and this file cannot link the plugin, so asserting
+        // the shared predicate is the only offline guard against the whitelist dropping this kind.
+        // Without it the boxes above are fed to the planner by hand and this case stays green
+        // through exactly the regression it exists to prevent.
+        bool parkedBlocks = MemClassifier.BlocksMemoryRoutes(MemKind.ParkedVehicle);
+        bool hole = without.Ok && without.ConflictCount == 0 && parkedBlocks;
         Report(ref failures, hole, "无停放车：实测场景规划出 0 冲突路线（漏洞）",
                $"conflicts={without.ConflictCount} · Ok={without.Ok} · Reason={without.Reason} · " +
-               $"Route={without.Path?.Description ?? "无"}");
+               $"Route={without.Path?.Description ?? "无"} · ParkedVehicle 阻挡={parkedBlocks}");
 
         // (ii) The closure. A planner that refuses the route outright (`Ok == false`) and one that
         // still returns it with conflicts are both correct here, because the plugin only drives an
         // Ok plan; the assertion is that the route is no longer accepted.
-        bool blocked = !with.Ok || with.ConflictCount > 0;
+        //
+        // The route itself is re-measured, not inferred. Without this term the comparison would rest
+        // on Planner returning candidates[0] for both runs, and `without.ConflictCount == 0` is
+        // tautological when the snapshot is empty - CountCorridorConflicts returns early on an empty
+        // obstacle set, so the printed 0 would say nothing about the route. Sweeping the *without*-run's
+        // path through the *with*-boxes snapshot turns that 0 into a measured 0-conflict route and the
+        // 27 into a conflict count on that same route.
+        int sameRouteConflicts = without.Path is { } route
+            ? Planner.CountCorridorConflicts(route, cfg, withTrucks)
+            : -1;
+
+        // The predicate terms: Trigger must stay out (a detection volume is not an obstacle) and Other
+        // must stay out, while a kind that blocked before still blocks - so the helper cannot pass by
+        // being "everything blocks" or "nothing does".
+        bool moverBlocks = MemClassifier.BlocksMemoryRoutes(MemKind.Mover);
+        bool triggerBlocks = MemClassifier.BlocksMemoryRoutes(MemKind.Trigger);
+        bool otherBlocks = MemClassifier.BlocksMemoryRoutes(MemKind.Other);
+
+        bool blocked = (!with.Ok || with.ConflictCount > 0) && sameRouteConflicts > 0
+                       && moverBlocks && !triggerBlocks && !otherBlocks;
         Report(ref failures, blocked, "三台停放车入障碍集后，同一场景不再被接受",
-               $"conflicts={with.ConflictCount} · Ok={with.Ok} · Reason={with.Reason} · " +
-               $"Route={with.Path?.Description ?? "无"}");
+               $"conflicts={with.ConflictCount} · sameRoute={sameRouteConflicts} · Ok={with.Ok} · " +
+               $"Reason={with.Reason} · Route={with.Path?.Description ?? "无"} · " +
+               $"Mover 阻挡={moverBlocks} / Trigger 阻挡={triggerBlocks} / Other 阻挡={otherBlocks}");
 
         return failures;
     }

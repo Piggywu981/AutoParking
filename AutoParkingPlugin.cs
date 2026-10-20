@@ -429,12 +429,14 @@ public sealed class AutoParkingPlugin : Plugin
     ///  carries the set from its last rebuild (≤0.5 s old), while HandleObstacles sees fresh data
     ///  every tick - the same freshness split the traffic obstacles already live with.
     ///
-    ///  The kind test below is a whitelist, so a kind the classifier learns afterwards is not a
-    ///  blocker by construction. Trigger stays out on purpose: it is a 10 × 4 × 6.7 m invisible
-    ///  detection volume, not a thing standing on the ground. ParkedVehicle is in - the academy's
-    ///  framing trucks exist only as 0x2F Hookup items (measured: three 7.50 × 3.23 m footprints in
-    ///  the row that bounds the target gap), so a whitelist without it leaves the insert leg's swing
-    ///  unrepresented and free to sweep through one (§43/§54, R16).
+    ///  The kind test is <see cref="MemClassifier.BlocksMemoryRoutes"/>, a whitelist shared with the
+    ///  offline harness, so a kind the classifier learns afterwards is not a blocker by construction,
+    ///  and the check that pins this list cannot drift from the list the plugin uses. Trigger stays out
+    ///  on purpose: it is a 10 × 4 × 6.7 m invisible detection volume, not a thing standing on the
+    ///  ground. ParkedVehicle is in - the academy's framing trucks exist only as 0x2F Hookup items
+    ///  (measured: three 7.50 × 3.23 m footprints in the row that bounds the target gap), so a whitelist
+    ///  without it leaves the insert leg's swing unrepresented and free to sweep through one
+    ///  (§43/§54, R16).
     /// </summary>
     private int AddMemoryObstacles(MapGeometry geometry, Vector2 truckPlane, double radiusM)
     {
@@ -448,8 +450,7 @@ public sealed class AutoParkingPlugin : Plugin
         int added = 0;
         foreach (KdopReader.MemItem item in memory.Items)
         {
-            if (item.Kind is not (MemKind.Cone or MemKind.Board
-                or MemKind.Mover or MemKind.Building or MemKind.ParkedVehicle))
+            if (!MemClassifier.BlocksMemoryRoutes(item.Kind))
                 continue;
 
             if (Math.Abs(item.PlanePos.X - truckPlane.X) > radiusM

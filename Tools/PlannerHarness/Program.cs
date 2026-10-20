@@ -191,7 +191,7 @@ Console.WriteLine("标记跟随控制器（腿数 / 标记位移 / 落地窗口�
 int controllerFailures = AutoParkControllerChecks.Run();
 
 Console.WriteLine();
-Console.WriteLine("停放车作为障碍（驾校 framing 车只有 0x2F Hookup 一种表示，R16）：");
+Console.WriteLine("停放车作为障碍（驾校 framing 车只有 0x2F Hookup 一种表示，R16；本用例只覆盖 Planner 与共享谓词 MemClassifier.BlocksMemoryRoutes，运行时读取是否真的喂进来只能游戏内验，Task 9）：");
 int parkedObstacleFailures = ParkedObstacleChecks.Run();
 
 Console.WriteLine();
