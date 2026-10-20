@@ -106,12 +106,17 @@ public static class TargetResolver
 
     // Widest-gap-first so Resolve's "take gaps[0]" is deterministic.
     //
-    // Rows are framed along the world X axis only, and that is deliberate: the sort is on X and a pair
-    // only counts when it shares Y inside RowBandM, so a row of parked vehicles running north-south is
-    // never found. Driving/ParkingBay.cs documents the same refusal for off-axis cone bays - a bay
-    // rotated away from the axes is silently not detected rather than guessed at. Keep it: a caller
-    // that gets nothing back degrades to the saved spot, while one that gets a guessed axis parks the
-    // truck across a row. Do not "fix" this into a best-fit rotation.
+    // GAP PAIRING here is world-X only, and that is deliberate: the sort is on X and two neighbours
+    // only count as a gap when the same-Y band test below lets them through, so a row of parked
+    // vehicles running north-south yields no gap. Driving/ParkingBay.cs:31-32 documents the same
+    // refusal for off-axis cone bays - a bay rotated away from the axes is silently not detected
+    // rather than guessed at. Keep it: a caller that gets nothing back degrades to the saved spot,
+    // while one that gets a guessed gap parks the truck across a row. Do not "fix" this into a
+    // best-fit rotation.
+    //
+    // HEADING INFERENCE is the narrower thing and is NOT covered by the refusal above: RowHeading
+    // snaps to whichever of the two world axes the parked spread is longer along (X or Z), never to
+    // an arbitrary angle. An axis-only answer still cannot invent a rotated goal; see RowHeading.
     private static List<(Vector2 a, Vector2 b, double clear, double depth)> FramingGaps(
         List<Item> parked, double vehicleLengthM)
     {
@@ -133,8 +138,14 @@ public static class TargetResolver
 
     private static double RowHeading(List<Item> parked, Vector2 at, Pose2 truck)
     {
-        // kdop boxes carry no yaw; the row axis is the heading family. Pick the sign whose
-        // forward is closer to the truck's own nose so the goal never flips 180° on the user.
+        // kdop boxes carry no yaw; the row axis is the heading family. This is a world-axis SNAP, not a
+        // rotation fit: the spread picks X or Z, never an arbitrary angle, which is the same refusal
+        // Driving/ParkingBay.cs:31-32 records for off-axis bays. The Z branch is reachable and intended
+        // even though FramingGaps pairs along world X only - a north-south row gives no gap, but its
+        // axis is still a fact read off the parked vehicles, whereas falling back to the truck's own
+        // heading would invent the goal from the vehicle instead of from the row.
+        // Pick the sign whose forward is closer to the truck's own nose so the goal never flips 180° on
+        // the user.
         Vector2 fwd = Geometry.ForwardFromHeading(truck.HeadingRad);
         double sx = 0, sy = 0;
         int near = 0;

@@ -24,6 +24,19 @@ internal static class TargetResolverChecks
     };
     private static readonly Pose2 Truck = new(2194.40, 1804.12, 1.295); // 74.2°=1.295 rad
 
+    // Synthetic north-south row: four framing vehicles sharing one X and spread along Z, with a 0xC17
+    // pair beside them. FramingGaps pairs along world X only, so this scene yields NO gap - yet
+    // RowHeading still has to resolve, and the only honest answer is the other world axis.
+    private static readonly TargetResolver.Item[] RowNorthSouth =
+    {
+        new(0x09, 0x512DA87F500000A1, new Vector2(1000.00f, 1000.00f), 8.75f, 8.75f, 0xC17),
+        new(0x09, 0x3C11E12C598000A2, new Vector2(1000.30f, 1000.30f), 7.94f, 7.94f, 0xC17),
+        new(0x2F, 0x50E541F01C9C00A1, new Vector2(1008.00f,  985.00f), 7.50f, 3.23f, 0x200),
+        new(0x2F, 0x51B24FF0D91C00A2, new Vector2(1008.00f,  995.00f), 7.50f, 3.23f, 0x100),
+        new(0x2F, 0x50E5468F7C9C00A3, new Vector2(1008.00f, 1005.00f), 7.50f, 3.23f, 0x10C),
+        new(0x2F, 0x50E5468F7C9C00A4, new Vector2(1008.00f, 1015.00f), 7.50f, 3.23f, 0x100),
+    };
+
     public static int Run()
     {
         int failures = 0;
@@ -47,15 +60,34 @@ internal static class TargetResolverChecks
                      + $"{pair.Value.Provenance}");
 
         // kdop boxes carry no yaw, so the row axis is the only heading available - but an axis has two
-        // signs and the wrong one points the truck backwards. Nose west must read 90°, nose east 270°.
+        // signs and the wrong one points the truck backwards. Nose west must read +90°, nose east -90°:
+        // the sign itself is asserted, not just the magnitude, because a constant axis (or a bare
+        // |heading| test) keeps every magnitude check green while shipping a 180°-wrong goal.
+        // The two halves below then repeat the rule for a row the gap finder cannot see at all.
         TargetResolver.Target? west = TargetResolver.Resolve(Scene, Truck, null, 6.5);
         TargetResolver.Target? east = TargetResolver.Resolve(Scene,
             new Pose2(2194.40, 1804.12, 1.295 + Math.PI), null, 6.5);
+        // Heading ±π sits on the atan2 branch cut, so the north-south half is asserted on the forward
+        // vector the repo maps headings by (forward = (-sin h, -cos h)): a Z-axis row must land with
+        // forward.X 0, i.e. heading 0 or ±π and never ±π/2, with forward.Y following the nose.
+        TargetResolver.Target? plusZ = TargetResolver.Resolve(RowNorthSouth,
+            new Pose2(1020.00, 1000.00, 2.0), null, 6.5);            // forward.Y = -cos 2 > 0
+        TargetResolver.Target? minusZ = TargetResolver.Resolve(RowNorthSouth,
+            new Pose2(1020.00, 1000.00, 2.0 - Math.PI), null, 6.5);   // same row, nose reversed
+        Vector2 plusZFwd = Geometry.ForwardFromHeading(plusZ?.Pose.HeadingRad ?? double.NaN);
+        Vector2 minusZFwd = Geometry.ForwardFromHeading(minusZ?.Pose.HeadingRad ?? double.NaN);
         Report(ref failures, west.HasValue && Math.Abs(west.Value.Pose.HeadingRad - Math.PI / 2) < 0.01
-               && east.HasValue && Math.Abs(Math.Abs(east.Value.Pose.HeadingRad) - Math.PI / 2) < 0.01,
+               && east.HasValue && Math.Abs(east.Value.Pose.HeadingRad + Math.PI / 2) < 0.01
+               && plusZ.HasValue && minusZ.HasValue
+               && Math.Abs(plusZ.Value.Confidence - 0.9) < 0.001     // pair path, no gap to borrow
+               && Math.Abs(plusZFwd.X) < 0.01 && plusZFwd.Y > 0
+               && Math.Abs(minusZFwd.X) < 0.01 && minusZFwd.Y < 0,
                "对目标航向取排轴线中与车头相近的符号",
                $"朝西 {(west?.Pose.HeadingRad ?? double.NaN) * 180.0 / Math.PI:0.0}° · "
-               + $"朝东 {(east?.Pose.HeadingRad ?? double.NaN) * 180.0 / Math.PI:0.0}°（判据 +90 / -90）");
+               + $"朝东 {(east?.Pose.HeadingRad ?? double.NaN) * 180.0 / Math.PI:0.0}°（判据 +90 / -90）· "
+               + $"南北排 {(plusZ?.Pose.HeadingRad ?? double.NaN) * 180.0 / Math.PI:0.0}° / "
+               + $"{(minusZ?.Pose.HeadingRad ?? double.NaN) * 180.0 / Math.PI:0.0}°"
+               + "（判据 forward.X 0 · forward.Y 随车头）");
 
         // Without the pair the framing row alone still says where the truck goes: the widest gap the
         // 8.78 m clear length leaves between two parked vehicles, with its 3.23 m depth as the room.
