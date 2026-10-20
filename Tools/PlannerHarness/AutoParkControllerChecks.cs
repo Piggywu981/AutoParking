@@ -21,9 +21,39 @@ internal static class AutoParkControllerChecks
         var t1 = new TargetResolver.Target(new Pose2(2166.175, 1801.835, Math.PI / 2),
                                            "mover-pair:0xA", 0.9, 0xA, null, null);
         c.OnAcquired(t1);
+
+        // The 0xC17 pair's target pose is the pair's midpoint while its uid names ONE member
+        // (TargetResolver.cs:82), and the drift poll matches that member by uid. SeedLastMarkerPosition
+        // is what lets the caller hand the poll the member's own sample space; without it the member's
+        // first sample sits half the pair spacing from the midpoint and fires. Both directions are
+        // pinned here - the unseeded comparison DOES report a move at the member (the defect the seed
+        // exists to prevent), and the seeded one does not - plus the seed must stay an anchor: no leg
+        // counted, uid and the arrival stamp untouched, and refused before any leg exists (or the
+        // pre-acquisition MarkerMoved guard would be defeated by resurrecting LastMarkerPos).
+        var unseededPair = new AutoParkController();
+        unseededPair.OnAcquired(t1);
+        Vector2 member = new(t1.Pose.Position.X, t1.Pose.Position.Y + 1.25f); // half of a 2.5 m pair
+        bool unseededFires = unseededPair.MarkerMoved(member, 0.5);
+
+        var seededPair = new AutoParkController();
+        seededPair.OnAcquired(t1);
+        var arrived = new DateTime(2026, 10, 20, 12, 0, 5, DateTimeKind.Utc);
+        seededPair.OnArrived(arrived);
+        seededPair.SeedLastMarkerPosition(member);
+        bool seedIsAnchorOnly = seededPair.Legs == 1
+                             && seededPair.MarkerUid == 0xA
+                             && seededPair.LastMarkerPos == member
+                             && seededPair.ArrivedUtc == arrived
+                             && !seededPair.MarkerMoved(member, 0.5);
+
+        var preAcqSeed = new AutoParkController();
+        preAcqSeed.SeedLastMarkerPosition(member);
+        bool preAcqSeedIgnored = preAcqSeed.LastMarkerPos == Vector2.Zero;
+
         bool okA = c.Legs == 1 && c.MarkerUid == 0xA
                 && c.Active is { } a1 && a1.Provenance == "mover-pair:0xA"
-                && c.LastMarkerPos == t1.Pose.Position;
+                && c.LastMarkerPos == t1.Pose.Position
+                && unseededFires && seedIsAnchorOnly && preAcqSeedIgnored;
         Report(ref failures, okA,
                "Controller: OnAcquired 记腿数与标记 uid",
                $"legs {c.Legs} · uid 0x{c.MarkerUid:X} · last ({c.LastMarkerPos.X:0.000}, {c.LastMarkerPos.Y:0.000}) "

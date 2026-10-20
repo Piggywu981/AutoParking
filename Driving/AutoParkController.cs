@@ -51,6 +51,23 @@ internal sealed class AutoParkController
     }
 
     /// <summary>
+    ///  Re-anchors <see cref="LastMarkerPos"/> at <paramref name="pos"/> without counting a leg and
+    ///  without touching <see cref="ArrivedUtc"/>: a re-anchor for the caller's sample space, not a
+    ///  new acquisition. A 0xC17 pair resolves to the pair's midpoint while the target's uid names one
+    ///  member of it, and MarkerMoved matches that member by uid - comparing the member against the
+    ///  midpoint reads half the pair spacing as a move on the first poll and re-aims the leg at one
+    ///  cone. Ignored with no active leg, like OnArrived: there is no leg whose sample space to
+    ///  re-anchor, and resurrecting LastMarkerPos before one would un-gate the caller's poll.
+    /// </summary>
+    public void SeedLastMarkerPosition(Vector2 pos)
+    {
+        if (Active is null)
+            return;
+
+        LastMarkerPos = pos;
+    }
+
+    /// <summary>
     ///  True when the marker has moved further than <paramref name="toleranceM"/> from the position the
     ///  current leg last accepted, and on that answer LastMarkerPos advances to <paramref name="markerPos"/>,
     ///  so the next call measures from the accepted position instead of re-triggering on the same
