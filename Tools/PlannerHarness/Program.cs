@@ -175,6 +175,10 @@ Console.WriteLine("全前进平滑候选（前移直线 + 弧-直-弧，§53）�
 int smoothFailures = SmoothForwardChecks.Run();
 
 Console.WriteLine();
+Console.WriteLine("目标解析（跟着游戏的 0xC17 标记与 framing 缺口走，§54）：");
+int targetFailures = TargetResolverChecks.Run();
+
+Console.WriteLine();
 Console.WriteLine("prefab 轮廓（只能由控制点取凸包，所以是近似）：");
 Vector2[] hullSquare = Geometry.ConvexHull(new[]
 {
@@ -195,7 +199,7 @@ Console.WriteLine($"  {(hullPairSafe ? "✓" : "✗")} 两点输入不崩、面�
 return report.Failures.Count == 0 && simPassed == 5 && keptGoing && stagedLeg.Reached
     && replanWorks && autoNeutralOk && unwinds && watchdogWorks && pickDragOk && probeFailures == 0
     && pointFailures == 0 && trustFailures == 0 && footprintFailures == 0 && wheelbaseFailures == 0
-    && headingFailures == 0 && bayFailures == 0 && smoothFailures == 0
+    && headingFailures == 0 && bayFailures == 0 && smoothFailures == 0 && targetFailures == 0
     && hullDropsInterior && hullDegenerates && hullPairSafe ? 0 : 1;
 
 // The recession watchdog needs states that make the distance grow. Nothing in the closed loop does
