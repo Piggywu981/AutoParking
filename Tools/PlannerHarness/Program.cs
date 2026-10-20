@@ -183,6 +183,10 @@ Console.WriteLine("内存条目分类器（k-DOP 的 type/flags/尺寸 → 锥�
 int classifierFailures = MemClassifierChecks.Run();
 
 Console.WriteLine();
+Console.WriteLine("sidecar 身份通道（MemoryProbe --deep-tsv 的 TSV 记录解析；进程/缓存那一半只能在游戏里验，§4.3）：");
+int identityFailures = IdentityChannelChecks.Run();
+
+Console.WriteLine();
 Console.WriteLine("prefab 轮廓（只能由控制点取凸包，所以是近似）：");
 Vector2[] hullSquare = Geometry.ConvexHull(new[]
 {
@@ -204,7 +208,7 @@ return report.Failures.Count == 0 && simPassed == 5 && keptGoing && stagedLeg.Re
     && replanWorks && autoNeutralOk && unwinds && watchdogWorks && pickDragOk && probeFailures == 0
     && pointFailures == 0 && trustFailures == 0 && footprintFailures == 0 && wheelbaseFailures == 0
     && headingFailures == 0 && bayFailures == 0 && smoothFailures == 0 && targetFailures == 0
-    && classifierFailures == 0 && hullDropsInterior && hullDegenerates && hullPairSafe ? 0 : 1;
+    && classifierFailures == 0 && identityFailures == 0 && hullDropsInterior && hullDegenerates && hullPairSafe ? 0 : 1;
 
 // The recession watchdog needs states that make the distance grow. Nothing in the closed loop does
 // that any more - the window fix removed the pinning that used to - so it is fed synthetic ones:
