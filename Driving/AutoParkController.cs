@@ -54,11 +54,19 @@ internal sealed class AutoParkController
     ///  True when the marker has moved further than <paramref name="toleranceM"/> from the position the
     ///  current leg last accepted, and on that answer LastMarkerPos advances to <paramref name="markerPos"/>,
     ///  so the next call measures from the accepted position instead of re-triggering on the same
-    ///  displacement every poll. False leaves LastMarkerPos untouched. Callers poll this only while a
-    ///  leg is active: before OnAcquired (and after Reset) LastMarkerPos is Vector2.Zero.
+    ///  displacement every poll. False leaves LastMarkerPos untouched.
+    ///
+    ///  With no active leg it returns false and does not advance anything: before the first OnAcquired
+    ///  (and after Reset) LastMarkerPos is Vector2.Zero, and measuring from that origin would report
+    ///  "moved" for any real sample, firing a caller's ~1 Hz poll on the first tick. This class owns the
+    ///  state that defines "a leg is active", so the refusal lives here; a caller's own poll gating is
+    ///  belt-and-braces rather than the only defence.
     /// </summary>
     public bool MarkerMoved(Vector2 markerPos, double toleranceM)
     {
+        if (Active is null)
+            return false;
+
         if (Vector2.Distance(LastMarkerPos, markerPos) <= toleranceM)
             return false;
 
@@ -66,9 +74,17 @@ internal sealed class AutoParkController
         return true;
     }
 
-    /// <summary>Stamps the arrival of the current leg. Settled reads this; nothing else does.</summary>
+    /// <summary>
+    ///  Stamps the arrival of the current leg. Settled reads this; nothing else does. With no active leg
+    ///  the call is ignored - there is nothing to settle, and stamping one would let Settled report true
+    ///  for a maneuver that has no leg, the same impossible state the "not arrived yet" default keeps out.
+    ///  As with MarkerMoved, the guard belongs here because this class owns "a leg is active".
+    /// </summary>
     public void OnArrived(DateTime utcNow)
     {
+        if (Active is null)
+            return;
+
         ArrivedUtc = utcNow;
     }
 
