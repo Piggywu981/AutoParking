@@ -14,6 +14,12 @@
 //
 // Usage:
 //   dotnet run --project Tools/MemoryProbe -c Release -- [pid|name] [--near X Z [R]] [--array HEXOFF]... [--strings token]...
+//     [--deep X Z [R]]      one human-readable block per kdop item near (X, Z)
+//     [--deep-tsv X Z [R]]  same walk, stdout carries ONLY machine-readable records:
+//         ITEM\t<type:int>\t<uid:0xHEX>\t<flags:0xHEX>\t<x>\t<y>\t<z>\t<dx>\t<dy>\t<dz>
+//         STR\t<uid:0xHEX>\t<ascii-run>
+//       One record per line, CRLF-terminated like any Console output on Windows, every byte ASCII,
+//       floats InvariantCulture "0.###". Narration is suppressed there so nothing has to be filtered.
 
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -31,6 +37,7 @@ bool wheelsOnly = false;
 int bodyOffset = -1;
 double trafficSeconds = 0;
 double deepX = double.NaN, deepZ = double.NaN, deepR = 25;
+bool deepTsv = false;
 
 for (int i = 0; i < args.Length; i++)
 {
@@ -46,8 +53,9 @@ for (int i = 0; i < args.Length; i++)
     else if (a == "--array" && i + 1 < args.Length) extraArrays.Add(Convert.ToInt64(args[++i], 16));
     else if (a == "--viz") { vizRadius = 100; if (i + 1 < args.Length && double.TryParse(args[i + 1], System.Globalization.CultureInfo.InvariantCulture, out var r)) { vizRadius = r; i++; } }
     else if (a == "--telemetry") { telemetryOnly = true; }
-    else if (a == "--deep" && i + 2 < args.Length)
+    else if ((a == "--deep" || a == "--deep-tsv") && i + 2 < args.Length)
     {
+        deepTsv = a == "--deep-tsv";
         deepX = double.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture);
         deepZ = double.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture);
         if (i + 1 < args.Length && double.TryParse(args[i + 1], System.Globalization.CultureInfo.InvariantCulture, out var rr)) { deepR = rr; i++; }
@@ -87,7 +95,7 @@ proc.Refresh();
 var mod = proc.MainModule ?? throw new Exception("no main module");
 long imageBase = mod.BaseAddress.ToInt64();
 int imageSize = (int)mod.ModuleMemorySize;
-Console.WriteLine($"process: {proc.ProcessName} pid={proc.Id}  module: {mod.ModuleName} base=0x{imageBase:X} size=0x{imageSize:X}");
+if (!deepTsv) Console.WriteLine($"process: {proc.ProcessName} pid={proc.Id}  module: {mod.ModuleName} base=0x{imageBase:X} size=0x{imageSize:X}");
 
 var h = Native.OpenProcess(0x0410 /* QUERY_INFORMATION | VM_READ */, false, proc.Id);
 if (h == IntPtr.Zero) throw new Exception($"OpenProcess failed win32={Marshal.GetLastWin32Error()} (elevate the shell if this persists)");
@@ -109,7 +117,7 @@ if (strctxTokens.Count > 0)
 // so every hit is decoded and validated; instance ptr and game-actor offsets come from decoding,
 // not hardcoded positions.
 byte[] image = ReadBytes(h, imageBase, imageSize);
-Console.WriteLine($"module image read: {image.Length / (1024 * 1024)} MB");
+if (!deepTsv) Console.WriteLine($"module image read: {image.Length / (1024 * 1024)} MB");
 
 var baseCtrlCandidates = new List<(long insn, long instPtr, ulong instance, int gameActorOffset)>();
 foreach (long insn in FindAllPattern(image, imageBase, "48 8b ? ? ? ? ? 48 8b ? 48 8b ? 48 8b 80"))
@@ -123,9 +131,12 @@ foreach (long insn in FindAllPattern(image, imageBase, "48 8b ? ? ? ? ? 48 8b ? 
     if (ga < 0) continue;
     baseCtrlCandidates.Add((insn, instPtr, instance, ga));
 }
-Console.WriteLine($"base_ctrl pattern: {baseCtrlCandidates.Count} hit(s)");
-foreach (var c in baseCtrlCandidates)
-    Console.WriteLine($"  insn=0x{c.insn:X} (+0x{c.insn - imageBase:X})  instance_ptr=0x{c.instPtr:X} -> 0x{c.instance:X}  game_actor_offset=0x{c.gameActorOffset:X}");
+if (!deepTsv)
+{
+    Console.WriteLine($"base_ctrl pattern: {baseCtrlCandidates.Count} hit(s)");
+    foreach (var c in baseCtrlCandidates)
+        Console.WriteLine($"  insn=0x{c.insn:X} (+0x{c.insn - imageBase:X})  instance_ptr=0x{c.instPtr:X} -> 0x{c.instance:X}  game_actor_offset=0x{c.gameActorOffset:X}");
+}
 
 long sKdop = FindPattern(image, imageBase, "4c 8d 81 ?? ?? ?? ?? 0f 29 ?? ?? 48 8d 91");
 if (sKdop == 0) throw new Exception("nearby_kdop_items pattern not found");
@@ -133,12 +144,12 @@ int nearbyKdopOffset = I32(image, sKdop + 3 - imageBase);
 
 long sNonAi = FindPattern(image, imageBase, "f0 0f c1 42 ?? 48 8d b9 ?? ?? ?? ?? 48 8b 07");
 int nonAiOffset = sNonAi != 0 ? I32(image, sNonAi + 8 - imageBase) : 0;
-Console.WriteLine($"nearby_kdop_items_offset=0x{nearbyKdopOffset:X}  nearby_non_ai_vehicles_offset=0x{nonAiOffset:X} (insn 0x{sKdop:X} +0x{sKdop - imageBase:X})");
+if (!deepTsv) Console.WriteLine($"nearby_kdop_items_offset=0x{nearbyKdopOffset:X}  nearby_non_ai_vehicles_offset=0x{nonAiOffset:X} (insn 0x{sKdop:X} +0x{sKdop - imageBase:X})");
 
 var candidate = baseCtrlCandidates.FirstOrDefault(c => c.instance != 0);
 if (candidate.instance == 0) throw new Exception("no base_ctrl candidate with a non-null instance - game not in a driving state?");
 ulong baseCtrl = candidate.instance;
-Console.WriteLine($"base_ctrl_u* = 0x{baseCtrl:X}");
+if (!deepTsv) Console.WriteLine($"base_ctrl_u* = 0x{baseCtrl:X}");
 
 // ---- kdop item arrays. item_type numbering matches TruckLib ItemType (design doc §38).
 // The pattern-resolved offset is only a CANDIDATE in 1.61 - sweep every base_ctrl member that
@@ -157,7 +168,7 @@ if (vizRadius > 0)
 }
 if (!double.IsNaN(deepX))
 {
-    DoDeep(candidate.instance, deepX, deepZ, deepR);
+    DoDeep(candidate.instance, deepX, deepZ, deepR, deepTsv);
     return;
 }
 ScanBaseCtrlForKdopArrays(candidate.instance);
@@ -468,7 +479,18 @@ void DoViz(ulong basePtr, double radius)
 // ASCII run reachable from the item's own first 0x100 bytes (tokens, model paths, trigger names).
 // That is how the required parking spot stops being something we infer from cones and becomes something
 // we read.
-void DoDeep(ulong basePtr, double x, double z, double r)
+//
+// --deep-tsv is the SAME walk with a machine-readable print format, not a second scan path: same array
+// sweep, same quiet skip set, same uid dedupe, same distance filter and radius, same 3000-item cap. Only
+// the printing differs, and in that mode stdout holds records and nothing else - a consumer must not have
+// to filter narration out of the identity channel. Record shape (one per line, CRLF-terminated like every
+// other Console line on Windows, so the trailing field has to be trimmed of \r before parsing):
+//   ITEM\t<type:int>\t<uid:0xHEX>\t<flags:0xHEX>\t<x>\t<y>\t<z>\t<dx>\t<dy>\t<dz>
+//   STR\t<uid:0xHEX>\t<ascii-run>
+// x/y/z is the k-DOP centre, dx/dy/dz its extents, floats InvariantCulture "0.###". STR lines come from
+// exactly the call --deep already prints - ReadAsciiRuns(h, elem, 0x100, 5) - so the two modes cannot
+// disagree about a uid; a uid may repeat, one line per run, and each run is 0x20-0x7E by construction.
+void DoDeep(ulong basePtr, double x, double z, double r, bool tsv)
 {
     var inv = System.Globalization.CultureInfo.InvariantCulture;
     List<(long off, ulong value, ulong size)> arrays = new();
@@ -482,7 +504,7 @@ void DoDeep(ulong basePtr, double x, double z, double r)
         if (value == 0 || size == 0 || size > 200_000 || cap < size) continue;
         arrays.Add((off, value, size));
     }
-    Console.WriteLine($"base_ctrl 里像 array_dyn_t 的成员 {arrays.Count} 个");
+    if (!tsv) Console.WriteLine($"base_ctrl 里像 array_dyn_t 的成员 {arrays.Count} 个");
 
     var seen = new HashSet<ulong>();
     int shown = 0, skipped = 0;
@@ -510,33 +532,56 @@ void DoDeep(ulong basePtr, double x, double z, double r)
 
             int type = it[0x0A];
             if (quiet.Contains(type)) { skipped++; continue; }
-            ulong vptr = BitConverter.ToUInt64(it, 0);
             ulong uid = BitConverter.ToUInt64(it, 0x40);
             uint flags = BitConverter.ToUInt32(it, 0x34);
-            bool vptrInModule = vptr >= (ulong)imageBase && vptr < (ulong)(imageBase + imageSize);
-            Console.WriteLine($"\nITEM 0x{elem:X}  类型 0x{type:X2} {TypeName(type)}  uid=0x{uid:X12}  flags=0x{flags:X}");
-            Console.WriteLine($"     @({cx:F2}, {((miny + maxy) / 2):F2}, {cz:F2})  尺寸 {(maxx - minx):F2}x{(maxy - miny):F2}x{(maxz - minz):F2}  离目标 {dist:F2} m");
-            Console.WriteLine($"     vptr=0x{vptr:X}{(vptrInModule ? "（游戏模块内）" : "（模块外）")}  类名={ClassName(vptr) ?? "?"}");
-
-            var found = new List<string>();
-            for (int w = 0; w + 8 <= 0x100; w += 8)
+            if (tsv)
             {
-                ulong p = BitConverter.ToUInt64(it, w);
-                if (p < 0x10000 || p > 0x7FFFFFFFFFFF) continue;
-                foreach (string s in ReadAsciiRuns(h, (long)p, 96, 4))
-                {
-                    if (s.Length >= 4 && !found.Contains(s)) found.Add($"@+0x{w:X2} {s}");
-                }
-                if (found.Count >= 8) break;
+                Console.WriteLine($"ITEM\t{type}\t0x{uid:X12}\t0x{flags:X}\t" +
+                                  $"{Num(cx, inv)}\t{Num((miny + maxy) / 2, inv)}\t{Num(cz, inv)}\t" +
+                                  $"{Num(maxx - minx, inv)}\t{Num(maxy - miny, inv)}\t{Num(maxz - minz, inv)}");
+                foreach (string s in ReadAsciiRuns(h, (long)elem, 0x100, 5))
+                    Console.WriteLine($"STR\t0x{uid:X12}\t{s}");
             }
-            foreach (string s in ReadAsciiRuns(h, (long)elem, 0x100, 5))
-                if (!found.Any(f => f.EndsWith(s))) found.Add($"内联 {s}");
-            foreach (string s in found.Take(12)) Console.WriteLine($"     串  {s}");
+            else
+            {
+                ulong vptr = BitConverter.ToUInt64(it, 0);
+                bool vptrInModule = vptr >= (ulong)imageBase && vptr < (ulong)(imageBase + imageSize);
+                Console.WriteLine($"\nITEM 0x{elem:X}  类型 0x{type:X2} {TypeName(type)}  uid=0x{uid:X12}  flags=0x{flags:X}");
+                Console.WriteLine($"     @({cx:F2}, {((miny + maxy) / 2):F2}, {cz:F2})  尺寸 {(maxx - minx):F2}x{(maxy - miny):F2}x{(maxz - minz):F2}  离目标 {dist:F2} m");
+                Console.WriteLine($"     vptr=0x{vptr:X}{(vptrInModule ? "（游戏模块内）" : "（模块外）")}  类名={ClassName(vptr) ?? "?"}");
+
+                var found = new List<string>();
+                for (int w = 0; w + 8 <= 0x100; w += 8)
+                {
+                    ulong p = BitConverter.ToUInt64(it, w);
+                    if (p < 0x10000 || p > 0x7FFFFFFFFFFF) continue;
+                    foreach (string s in ReadAsciiRuns(h, (long)p, 96, 4))
+                    {
+                        if (s.Length >= 4 && !found.Contains(s)) found.Add($"@+0x{w:X2} {s}");
+                    }
+                    if (found.Count >= 8) break;
+                }
+                foreach (string s in ReadAsciiRuns(h, (long)elem, 0x100, 5))
+                    if (!found.Any(f => f.EndsWith(s))) found.Add($"内联 {s}");
+                foreach (string s in found.Take(12)) Console.WriteLine($"     串  {s}");
+            }
             shown++;
         }
     }
-    Console.WriteLine($"\n共展开 {shown} 个条目（另有 {skipped} 个 Terrain/Sound/VisArea/MapArea 静默跳过）");
+    if (!tsv) Console.WriteLine($"\n共展开 {shown} 个条目（另有 {skipped} 个 Terrain/Sound/VisArea/MapArea 静默跳过）");
 }
+
+// One formatter for every float field of the TSV record: InvariantCulture "0.###", which for a finite
+// value is digits, '.' and '-' only. Non-finite values get the literal token NaN instead of the format's
+// own rendering, and that is deliberate rather than measured-necessary: kdopSane above only vouches for
+// x and z, so a non-item element can still reach the printer with a garbage y, and this keeps the record
+// alphabet independent of the runtime's NumberFormat infinity symbol. Measured on this SDK's runtime
+// (dotnet fsi, same net10.0 framework, no InvariantGlobalization flag): (+inf).ToString("0.###", inv) is
+// "Infinity" and NaN is "NaN", both ASCII and both accepted back by double.Parse, so no live sample ever
+// needed this clamp - an unbounded-radius scan reached the 3000-item cap (3000 ITEM rows, 392 STR rows)
+// and produced zero non-finite fields. With it, a consumer has exactly one non-numeric token to expect.
+static string Num(double v, System.Globalization.CultureInfo inv) =>
+    double.IsFinite(v) ? v.ToString("0.###", inv) : "NaN";
 
 // MSVC x64 RTTI: [vtable-8] holds either an absolute CompleteObjectLocator pointer or a 32-bit RVA of
 // one (the /guard:rf form); the COL's +12 is a 32-bit RVA of the TypeDescriptor, whose +16 is the
