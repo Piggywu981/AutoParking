@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
@@ -36,8 +37,18 @@ namespace AutoParking;
 ///  Hard rules:
 ///    - no host, TruckLib or SCS types, no NuGet: this file is compiled into the plugin AND into
 ///      <c>Tools\PlannerHarness</c>, so it is BCL only and <see cref="ParseTsv"/> is pure.
-///    - one probe per cache window at a time, with a TTL-length back-off after a failed one, so a tick
-///      calling this 30 times a second cannot spawn 30 children.
+///    - probe walks are bounded TWO ways, and the second one is what survives a moving truck:
+///      <c>_refreshing</c> allows one walk per cache window (with a TTL-length back-off after a failed
+///      one), which stops a 30 Hz tick from spawning 30 children FOR THE SAME WINDOW — but the cache key
+///      flips whenever the centre crosses a whole metre, so while the truck follows a marker it keeps
+///      landing on cold windows, and each of those would otherwise get its own child.
+///      <c>MaxConcurrentProbes</c> caps walks across the WHOLE channel (see
+///      <see cref="KickRefreshLocked"/>); that pair, not the per-window rule alone, is the guarantee this
+///      class offers.
+///    - the cache is bounded too, and that is a contract rather than an accident: windows untouched for
+///      <c>CacheMaxAge</c> (8×TTL) are dropped, and the table is hard-capped at <c>MaxCacheEntries</c>
+///      entries oldest-first, pruned at the one place where it can grow. See the <c>_cache</c>
+///      declaration for the arithmetic and <see cref="PruneLocked"/> for the mechanism.
 ///    - <see cref="Dispose"/> kills the in-flight child instead of leaving an orphan holding a handle on
 ///      the game.
 ///
@@ -70,11 +81,50 @@ internal sealed class IdentityChannel : IDisposable
     ///  so 3 s is already 3.4× the slowest real sample and past that the child is hung, not slow.</summary>
     private const int ProcessTimeoutMs = 3000;
 
+    /// <summary>The most probe walks this channel lets run at the same time, counted across every cache
+    ///  window. Two is enough: the walk is ~0.9 s and a moving truck only needs the window it is in, so a
+    ///  third child would be sweeping memory the caller has already driven away from while adding another
+    ///  <c>ReadProcessMemory</c> load on the game and another threadpool thread parked in
+    ///  <c>reading.Wait(3000)</c>. A window refused here is retried on the next tick — nothing about it is
+    ///  stamped — so the cap throttles the rate, it never strands a window.</summary>
+    private const int MaxConcurrentProbes = 2;
+
+    /// <summary>A cache window untouched (never fetched, never attempted) for this long is dropped:
+    ///  eight TTL. A window the truck is still working is asked about again every TTL, so eight of them
+    ///  passing in silence means the maneuver has driven away — and the uids behind those records belong
+    ///  to a runtime list that has moved on anyway. See <c>_cache</c>.</summary>
+    private static readonly TimeSpan CacheMaxAge = TimeSpan.FromTicks(CacheTtl.Ticks * 8);
+
+    /// <summary>Hard ceiling on <c>_cache</c> entries, for the case the age rule cannot see (one big
+    ///  radius held for a whole session, or a caller that revisits far windows). 64 × the ~40 KB a
+    ///  90 m walk parses to is ~2.5 MB, which is the most an enhancement channel may hold for itself.</summary>
+    private const int MaxCacheEntries = 64;
+
+    /// <summary>Ceiling on how long the no-records path waits for the child's stderr to finish draining.
+    ///  Only reached after stdout hit EOF, which means the child exited and its stderr is already closed,
+    ///  so this is a guard against a pathological pipe, not a cost paid in the normal case.</summary>
+    private const int StderrTailWaitMs = 200;
+
+    /// <summary>How much stderr is carried into the error string: enough to tell the causes apart, short
+    ///  enough that one line of a foreign process' stack trace never buries the plugin log.</summary>
+    private const int StderrTailChars = 200;
+
     private readonly string _exePath;
     private readonly string _gameProcessName;
 
     private readonly object _gate = new();
+    /// <summary>One entry per visited rounded window. BOUNDED, not an append-only log: each entry holds
+    ///  the parsed records of a whole probe walk — measured on the 2026-10-20 capture, 64 KB of stdout =
+    ///  395 <see cref="ItemIdentity"/> plus their identity text, about 40 KB parsed per window — and the
+    ///  key flips every ~0.5 m of truck travel, so an unpruned table accretes by the kilometre across a
+    ///  session. <see cref="PruneLocked"/> runs wherever this dictionary can gain an entry
+    ///  (<see cref="KickRefreshLocked"/>): age out past <c>CacheMaxAge</c>, then cap at
+    ///  <c>MaxCacheEntries</c> oldest-first. The caller-visible consequence is only that an aged-out
+    ///  window is cold again — <see cref="TryGet"/> branch 3, never a wrong answer.</summary>
     private readonly Dictionary<CacheKey, CacheEntry> _cache = new();
+    /// <summary>Exactly the windows with a walk in flight: a key is added when the task is scheduled and
+    ///  removed in <see cref="Refresh"/>'s lock, so <c>Count</c> is the live child count and both guards
+    ///  in <see cref="KickRefreshLocked"/> read the same set.</summary>
     private readonly HashSet<CacheKey> _refreshing = new();
     private readonly List<Process> _children = new();
 
@@ -99,6 +149,10 @@ internal sealed class IdentityChannel : IDisposable
     ///  <paramref name="center"/>. Returns true with items whenever a result — fresh or stale — can be
     ///  served; false with an <paramref name="error"/> describing why the channel cannot answer yet.
     ///  Whatever it returns, it returns without touching a process on this thread.
+    ///  The list is a read-only snapshot published once at <see cref="Refresh"/> (a
+    ///  <see cref="System.Collections.ObjectModel.ReadOnlyCollection{T}"/> wrapper, not a copy), so a
+    ///  caller cannot write into the cache — including through an <c>as List&lt;&gt;</c> in some future
+    ///  helper, which is the reason it is not handed out as the live list it was parsed into.
     /// </summary>
     public bool TryGet(Vector2 center, double radiusM, out IReadOnlyList<ItemIdentity>? items, out string? error)
     {
@@ -145,6 +199,12 @@ internal sealed class IdentityChannel : IDisposable
             // --- Branch 3: no cached result at all (cold window, or every probe for it has failed) →
             // report "warming up" / the last failure, kick a refresh, and let the next tick get the real
             // thing. Degraded, not fatal: the caller falls back to geometry-only resolution.
+            // Deliberate, and kept after review: from the second call onward this hands back the probe's
+            // OWN failure text instead of the literal "warming up" the brief describes, because "process
+            // 'eurotrucks2' not running" tells the live test something "warming up" hides. Task 8 must
+            // therefore never string-match this value — it may log it verbatim and treat any return of
+            // false as "no identity yet, use geometry"; which branch it came from is told by that false,
+            // not by the wording.
             error = entry?.Error ?? "warming up";
             KickRefreshLocked(key);
             return false;
@@ -166,7 +226,14 @@ internal sealed class IdentityChannel : IDisposable
     ///  (a mutation that drops this line turns its ✗, so the trim is not decorative).
     ///  Anything that does not parse is skipped rather than thrown: a half-written stdout is a degraded
     ///  window, not a crash. An STR whose uid has no ITEM row is kept in the aggregation table and
-    ///  dropped from the result, since an identity with no geometry cannot be placed.
+    ///  dropped from the result, since an identity with no geometry cannot be placed. A non-finite float
+    ///  counts as "does not parse" too — see <see cref="TryNum"/> — so the probe's own <c>NaN</c> token
+    ///  drops its row rather than publishing geometry no distance test can pass or fail against.
+    ///  One output record per ITEM ROW, not per uid: the probe's dedupe key is the element pointer
+    ///  (<c>!seen.Add(elem)</c>), so a uid reached through two entries arrives twice — counted in the
+    ///  2026-10-20 capture: 14 repeated <c>(uid, run)</c> STR pairs and 0 repeated ITEM uids, i.e. the
+    ///  repeat is structural rather than observed in that particular window. Either way every row of one
+    ///  uid carries the same aggregated run list, duplicates preserved in arrival order.
     /// </summary>
     public static List<ItemIdentity> ParseTsv(string text)
     {
@@ -243,10 +310,25 @@ internal sealed class IdentityChannel : IDisposable
     }
 
     /// <summary>Launches nothing and waits on nothing: it only decides, under the lock, whether a
-    ///  background probe is allowed for this window right now. Called by branches 2 and 3.</summary>
+    ///  background probe is allowed right now — for this window (per-key guard and the TTL back-off) and
+    ///  in general (<see cref="MaxConcurrentProbes"/>). Called by branches 2 and 3.</summary>
     private void KickRefreshLocked(CacheKey key)
     {
         if (_disposed)
+            return;
+
+        // Global in-flight cap, checked BEFORE anything is registered or stamped, because the per-window
+        // guard below cannot bound this on its own: CacheKey.Of rounds the centre to whole metres, so a
+        // truck at 5 m/s enters a NEW key every 1 m of travel = every ~0.2 s, while one walk runs the
+        // measured ~0.9 s. Every one of those keys is cold, every cold key takes branch 3, and each would
+        // otherwise get ITS OWN child: 0.9 / 0.2 = four to five concurrent ReadProcessMemory sweeps of the
+        // same game process, and the same number of threadpool threads parked in reading.Wait(3000), inside
+        // a host that is rendering ImGui and driving plugins on the rest. That ratio is arithmetic on two
+        // measured numbers (the 0.88 s walk, the whole-metre key), not a count of children; and
+        // marker-following means the truck IS moving while Acquiring, so this is the normal case, not a
+        // corner. _refreshing holds exactly the walks in flight, so its Count IS that number — and this cap
+        // is what holds it at two.
+        if (_refreshing.Count >= MaxConcurrentProbes)
             return;
 
         if (!_refreshing.Add(key))
@@ -263,8 +345,63 @@ internal sealed class IdentityChannel : IDisposable
         }
 
         entry.AttemptedUtc = DateTime.UtcNow;
+
+        // The cache only grows on the path that reaches here, so pruning here is exactly sufficient: no
+        // timer thread, and it runs under the same lock as every reader. Placed after the stamp above on
+        // purpose — the window being launched right now is then the freshest entry in the table, so it
+        // cannot be evicted by its own scheduling.
+        PruneLocked();
+
         Task.Run(() => Refresh(key)); // the caller's thread stops here
     }
+
+    /// <summary>Keeps <see cref="_cache"/> inside the bound its declaration states. Two cheap deterministic
+    ///  rules, no timer and no LRU bookkeeping:
+    ///    - drop every window neither fetched nor attempted within <see cref="CacheMaxAge"/> (8×TTL);
+    ///    - if the table is still over <see cref="MaxCacheEntries"/>, evict oldest-first until it fits.
+    /// Both read <see cref="LastTouchedUtc"/>, so an entry that has never been fetched or attempted counts
+    /// as maximally old and cannot survive either rule. Cost is one pass over a table the size of the
+    /// neighbourhood (bounded at 64), on the thread that was going to schedule a task anyway.
+    /// A walk that finishes just after its entry was pruned re-adds its fresh result through
+    /// <see cref="Refresh"/>'s <see cref="GetOrAddLocked"/>, which is the right answer; the only thing
+    /// lost in that race is a failed walk's back-off stamp, for a window nobody has asked about in 40 s.
+    /// </summary>
+    private void PruneLocked()
+    {
+        DateTime now = DateTime.UtcNow;
+
+        List<CacheKey>? expired = null;
+        foreach (KeyValuePair<CacheKey, CacheEntry> pair in _cache)
+        {
+            if (now - LastTouchedUtc(pair.Value) >= CacheMaxAge)
+            {
+                expired ??= new List<CacheKey>();
+                expired.Add(pair.Key);
+            }
+        }
+
+        if (expired is not null)
+            foreach (CacheKey key in expired)
+                _cache.Remove(key);
+
+        int over = _cache.Count - MaxCacheEntries;
+        if (over <= 0)
+            return;
+
+        List<CacheKey> oldestFirst = new(_cache.Keys);
+        // Ascending by last touch: the SMALLER DateTime is the OLDER window, so index 0 is the one to
+        // drop. (Getting this backwards is not hypothetical — the inverted comparator was written first
+        // and the offline experiment caught it by evicting the just-launched window instead of the
+        // 30-second-old one, which is the opposite of what an oldest-first cap owes a moving truck.)
+        oldestFirst.Sort((a, b) => LastTouchedUtc(_cache[a]).CompareTo(LastTouchedUtc(_cache[b])));
+        for (int i = 0; i < over; i++)
+            _cache.Remove(oldestFirst[i]);
+    }
+
+    /// <summary>How old an entry is allowed to get: whichever of the fetch and the launch attempt landed
+    ///  last. DateTime.MinValue for both means "never touched", which the prune reads as ancient.</summary>
+    private static DateTime LastTouchedUtc(CacheEntry entry)
+        => entry.FetchedUtc > entry.AttemptedUtc ? entry.FetchedUtc : entry.AttemptedUtc;
 
     /// <summary>Background half: probe → parse → publish. Runs on a threadpool thread, never throws out
     ///  of itself, and leaves the previous cached result in place when it fails.</summary>
@@ -275,8 +412,11 @@ internal sealed class IdentityChannel : IDisposable
         try
         {
             items = Probe(key, out failure);
+            // Degraded, not fatal: an empty lot is a real answer, an empty probe is not. Probe names the
+            // cause itself now (exit code plus the head of stderr) on every path that hands back an empty
+            // list, so this line is only the safety net for a walk that answers nothing at all.
             if (items.Count == 0 && failure is null)
-                failure = "deep-tsv parsed no ITEM records"; // degraded: an empty lot is a real answer, an empty probe is not
+                failure = "deep-tsv parsed no ITEM records";
         }
         catch (Exception e)
         {
@@ -290,7 +430,10 @@ internal sealed class IdentityChannel : IDisposable
             CacheEntry entry = GetOrAddLocked(key);
             if (items is { Count: > 0 })
             {
-                entry.Items = items;
+                // Published behind a read-only wrapper ONCE, here, so no caller can reach the List this
+                // walk parsed into: TryGet hands the same object to every frame that asks, and one
+                // Sort/Add/Remove through an `as List<>` would corrupt every later frame of a maneuver.
+                entry.Items = new ReadOnlyCollection<ItemIdentity>(items);
                 entry.FetchedUtc = DateTime.UtcNow;
                 entry.Error = null;
             }
@@ -349,7 +492,11 @@ internal sealed class IdentityChannel : IDisposable
         try
         {
             Task<string> reading = process.StandardOutput.ReadToEndAsync();
-            _ = process.StandardError.ReadToEndAsync(); // drained and discarded — narration is not the product
+            // Still drained, because an unread stderr pipe fills its 4 KB buffer and blocks the child
+            // mid-walk — that part is unchanged. What is new is that the text is kept: when the walk
+            // prints no records it is the only thing saying WHY, and this is the one path allowed to wait
+            // for it (below), off the caller's thread and with a 200 ms ceiling.
+            Task<string> narration = process.StandardError.ReadToEndAsync();
 
             // One wait covers the deadline and the end of the data: stdout reaches EOF when the child
             // exits and flushes, so there is no separate "did it finish" poll, and no deadlock risk
@@ -363,15 +510,61 @@ internal sealed class IdentityChannel : IDisposable
 
             // If the stream closed, the walk is over: a child that died mid-write leaves the bytes up to
             // the cut, which ParseTsv reads as far as it can and reports as a short window. No exit-code
-            // gate here on purpose — the probe's own exceptions go to stderr, and the records we asked
-            // for are either complete enough to use or they are not.
-            return ParseTsv(reading.Result);
+            // gate here on purpose — a probe that exited nonzero but printed usable records gave the answer
+            // we asked for. When it printed NOTHING usable, though, the exit code and stderr are the
+            // diagnosis, so they go into the error text instead of being thrown away.
+            List<ItemIdentity> parsed = ParseTsv(reading.Result);
+            if (parsed.Count == 0)
+                error = NoRecordsMessage(narration, process);
+            return parsed;
         }
         finally
         {
             lock (_gate)
                 _children.Remove(process);
         }
+    }
+
+    /// <summary>Builds the text Task 8 logs and the live-test protocol reads when a walk yielded nothing.
+    ///  Before this, "wrong game process name", "pattern scan found nothing", "not in a driving state" and
+    ///  "empty lot" all collapsed into the single <c>deep-tsv parsed no ITEM records</c> that
+    ///  <see cref="Refresh"/> invents for them, because stderr was redirected (it has to be) and then
+    ///  discarded with the exit code. Both are already complete when this runs — stdout reached EOF, which
+    ///  is this file's exit signal (see the read order in <see cref="Probe"/>), and the child closing its
+    ///  handle closes stderr with it — so the wait is a formality bounded by
+    ///  <see cref="StderrTailWaitMs"/>, and it is paid on the refresh thread, never the caller's.
+    ///  The result is a description, never a control signal: see branch 3 of <see cref="TryGet"/>, whose
+    ///  caller must not string-match it.</summary>
+    private static string NoRecordsMessage(Task<string> stderr, Process process)
+    {
+        string text = string.Empty;
+        try
+        {
+            if (stderr.Wait(StderrTailWaitMs))
+                text = stderr.Result;
+        }
+        catch (Exception)
+        {
+            // The stderr pipe itself faulted; the exit code still separates "did not start" from "started
+            // and found nothing", which is most of the diagnosis.
+        }
+
+        text = text.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        if (text.Length > StderrTailChars)
+            text = text[..StderrTailChars] + " ...";
+
+        int exitCode;
+        try
+        {
+            exitCode = process.ExitCode;
+        }
+        catch (Exception)
+        {
+            exitCode = -1; // handle gone or never exited: better an unknown code than an exception here
+        }
+
+        return "deep-tsv printed no ITEM records (exit " + exitCode
+               + (text.Length > 0 ? ", stderr: " + text : string.Empty) + ")";
     }
 
     private bool ExeAvailableLocked()
@@ -423,8 +616,17 @@ internal sealed class IdentityChannel : IDisposable
         return uint.TryParse(text, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out value);
     }
 
+    /// <summary>A number, or nothing at all — a field that will not parse OR is not finite skips its whole
+    ///  row. The second half is what it looks like a detail: <see cref="NumberStyles.Float"/> accepts the
+    ///  probe's OWN deliberate non-finite token, because <c>Tools\MemoryProbe\Program.cs</c>'s
+    ///  <c>Num()</c> prints the literal <c>NaN</c> for any field that is not finite, and
+    ///  <c>float.TryParse("NaN")</c> returns true with <c>float.NaN</c> (both verified, not assumed). A
+    ///  record published with NaN position or extents would reach Task 8's distance math, where every
+    ///  comparison against NaN is false — the item silently stops being an obstacle instead of being
+    ///  dropped as the bad row it is. Skipping it here is the honest answer, and the harness pins it:
+    ///  dropping this clause turns its ✗ (see the checks file's NaN case).</summary>
     private static bool TryNum(string text, CultureInfo inv, out float value)
-        => float.TryParse(text, NumberStyles.Float, inv, out value);
+        => float.TryParse(text, NumberStyles.Float, inv, out value) && float.IsFinite(value);
 
     /// <summary>Cache window key: the centre rounded to whole metres and the radius to tenths, so that
     ///  the centimetre-per-frame jitter of the truck while it approaches cannot miss the cache and start
@@ -439,10 +641,12 @@ internal sealed class IdentityChannel : IDisposable
 
     /// <summary>One window's cached answer. Items staying null is what makes TryGet's third branch say
     ///  "warming up" rather than hand back an empty list, which would read as "this lot has no identity
-    ///  data" instead of "the sidecar has not answered yet".</summary>
+    ///  data" instead of "the sidecar has not answered yet". <c>Items</c> is the published
+    ///  read-only wrapper, never the list the walk parsed — the type is what stops
+    ///  <see cref="TryGet"/> from handing the mutable cache object to a frame.</summary>
     private sealed class CacheEntry
     {
-        public List<ItemIdentity>? Items;
+        public IReadOnlyList<ItemIdentity>? Items;
         public DateTime FetchedUtc;
         public DateTime AttemptedUtc = DateTime.MinValue;
         public string? Error;
