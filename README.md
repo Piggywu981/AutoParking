@@ -1,3 +1,10 @@
+> [!WARNING]
+> **Development of this plugin has stopped.** This project is no longer maintained. All code and
+> commit history are preserved on the
+> [`legacy` branch](https://github.com/Piggywu981/AutoParking/tree/legacy) and will receive no
+> further commits; the `main` branch has been reset to a clean slate. The documentation below is
+> kept only as a record of the state the project was in when development ended.
+
 # THIS IS 100% AI-GENERATED CODE. NOT ONE LINE WAS WRITTEN BY A HUMAN.
 
 - **No human has read and approved this code.** It was produced by AI coding agents over many
